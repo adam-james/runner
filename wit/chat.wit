@@ -1,11 +1,21 @@
 package local:agent@0.1.0;
 
 interface chat-api {
-    // Only `text` is populated today. This is a `variant`, not a bare
-    // `string`, so tool-use/image blocks can be added as new cases later
-    // without reshaping `message`, `chat-request`, or `chat-response`.
     variant content-block {
         text(string),
+        tool-use(tool-use-block),
+        tool-result(tool-result-block),
+    }
+
+    record tool-use-block {
+        id: string,
+        name: string,
+        input-json: string,
+    }
+
+    record tool-result-block {
+        tool-use-id: string,
+        content: string,
     }
 
     enum role {
@@ -46,6 +56,11 @@ interface chat-api {
     }
 
     chat: func(request: chat-request) -> result<chat-response, chat-error>;
+
+    // Generic dispatch to whatever tool the host has loaded under `name` --
+    // the agent never knows what a tool actually does, just that calling it
+    // by name with a JSON input string produces a JSON/text result string.
+    call-tool: func(name: string, input: string) -> result<string, string>;
 }
 
 world chat-guest {

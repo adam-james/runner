@@ -1,0 +1,7 @@
+agent = "target/wasm32-wasip2/release/agent.wasm"
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[[tools]]
+path = "target/wasm32-wasip2/release/weather.wasm"
+allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]

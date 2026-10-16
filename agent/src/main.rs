@@ -5,7 +5,7 @@ wit_bindgen::generate!({
     path: "../wit",
 });
 
-use local::agent::chat_api::{self, ChatRequest, ContentBlock, Message, Role};
+use local::agent::chat_api::{self, ChatRequest, ContentBlock, Message, Role, ToolResultBlock};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const MAX_TOKENS: u32 = 1024;
@@ -27,34 +27,67 @@ fn main() {
             break;
         }
 
+        let turn_start = history.len();
         history.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text(line.to_string())],
         });
 
+        if let Err(e) = run_turn(&mut history) {
+            eprintln!("chat error: {e:?}");
+            // Discard the whole turn (the user line plus any partial
+            // assistant/tool-result messages the loop below managed to
+            // push) rather than desyncing role alternation on the next call.
+            history.truncate(turn_start);
+        }
+
+        prompt();
+    }
+}
+
+/// Runs one human turn to completion: calls `chat`, and for as long as the
+/// response asks for tools, calls them via the generic `call-tool` import
+/// and feeds the results back, before printing the final text reply.
+fn run_turn(history: &mut Vec<Message>) -> Result<(), chat_api::ChatError> {
+    loop {
         let request = ChatRequest {
             system: Some(SYSTEM_PROMPT.to_string()),
             max_tokens: MAX_TOKENS,
             messages: history.clone(),
         };
 
-        match chat_api::chat(&request) {
-            Ok(response) => {
-                println!("{}", flatten_text(&response.content));
-                history.push(Message {
-                    role: Role::Assistant,
-                    content: response.content,
-                });
-            }
-            Err(e) => {
-                eprintln!("chat error: {e:?}");
-                // Don't keep the dangling user-only turn; it would desync
-                // role alternation on the next call.
-                history.pop();
-            }
+        let response = chat_api::chat(&request)?;
+
+        let tool_results: Vec<ContentBlock> = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tu) => {
+                    let result = chat_api::call_tool(&tu.name, &tu.input_json)
+                        .unwrap_or_else(|e| format!("error: {e}"));
+                    Some(ContentBlock::ToolResult(ToolResultBlock {
+                        tool_use_id: tu.id.clone(),
+                        content: result,
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+
+        history.push(Message {
+            role: Role::Assistant,
+            content: response.content.clone(),
+        });
+
+        if tool_results.is_empty() {
+            println!("{}", flatten_text(&response.content));
+            return Ok(());
         }
 
-        prompt();
+        history.push(Message {
+            role: Role::User,
+            content: tool_results,
+        });
     }
 }
 
@@ -66,8 +99,9 @@ fn prompt() {
 fn flatten_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
-        .map(|b| match b {
-            ContentBlock::Text(s) => s.as_str(),
+        .filter_map(|b| match b {
+            ContentBlock::Text(s) => Some(s.as_str()),
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("")

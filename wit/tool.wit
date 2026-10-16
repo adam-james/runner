@@ -1,0 +1,18 @@
+// Same package as chat.wit -- wit_bindgen::generate!'s directory scan
+// requires every .wit file in a given path to belong to one package.
+package local:agent@0.1.0;
+
+interface tool-api {
+    record tool-description {
+        name: string,
+        description: string,
+        input-schema-json: string,
+    }
+
+    describe: func() -> tool-description;
+    call: func(input-json: string) -> result<string, string>;
+}
+
+world tool-guest {
+    export tool-api;
+}
