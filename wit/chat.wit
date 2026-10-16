@@ -18,8 +18,11 @@ interface chat-api {
         content: list<content-block>,
     }
 
+    // Deliberately has no `provider`/`model` field: which provider and model
+    // actually serve a `chat` call is host configuration, not something the
+    // guest states or can override. Any guest component works unmodified
+    // against whatever provider the host is configured for.
     record chat-request {
-        model: string,
         system: option<string>,
         max-tokens: u32,
         messages: list<message>,

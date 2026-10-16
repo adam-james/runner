@@ -8,7 +8,6 @@ wit_bindgen::generate!({
 use local::agent::chat_api::{self, ChatRequest, ContentBlock, Message, Role};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const MODEL: &str = "claude-sonnet-5";
 const MAX_TOKENS: u32 = 1024;
 
 fn main() {
@@ -34,7 +33,6 @@ fn main() {
         });
 
         let request = ChatRequest {
-            model: MODEL.to_string(),
             system: Some(SYSTEM_PROMPT.to_string()),
             max_tokens: MAX_TOKENS,
             messages: history.clone(),
