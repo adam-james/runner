@@ -1,0 +1,50 @@
+package local:agent@0.1.0;
+
+interface chat-api {
+    // Only `text` is populated today. This is a `variant`, not a bare
+    // `string`, so tool-use/image blocks can be added as new cases later
+    // without reshaping `message`, `chat-request`, or `chat-response`.
+    variant content-block {
+        text(string),
+    }
+
+    enum role {
+        user,
+        assistant,
+    }
+
+    record message {
+        role: role,
+        content: list<content-block>,
+    }
+
+    record chat-request {
+        model: string,
+        system: option<string>,
+        max-tokens: u32,
+        messages: list<message>,
+    }
+
+    record chat-response {
+        content: list<content-block>,
+        stop-reason: option<string>,
+    }
+
+    record api-error-detail {
+        status: u16,
+        body: string,
+    }
+
+    variant chat-error {
+        invalid-request(string),
+        network(string),
+        api(api-error-detail),
+        internal(string),
+    }
+
+    chat: func(request: chat-request) -> result<chat-response, chat-error>;
+}
+
+world chat-guest {
+    import chat-api;
+}
