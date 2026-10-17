@@ -62,7 +62,8 @@ synchronous WASI 0.2 components. Everything still builds for the
   deltas as they arrive, and rebuilds the full response (including tool
   calls) from the server-sent events.
 - `tools/weather/` — the first tool. Geocodes a location name and fetches
-  current conditions from Open-Meteo (free, keyless).
+  current conditions from Open-Meteo (free, keyless), plus an hourly
+  forecast for up to the next 48 hours if asked for `hours`.
 - `tools/sports/` — the second tool. Scores and schedules for a league on a
   given day (NFL, NBA, MLB, NHL, EPL, …) from ESPN's public scoreboard API
   (keyless), optionally filtered to one team. Reads the wall clock
