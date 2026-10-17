@@ -1,9 +1,9 @@
 package local:agent@0.1.0;
 
 interface chat-api {
-    use types.{chat-request, chat-response, chat-error};
+    use types.{chat-request, chat-stream};
 
-    chat: func(request: chat-request) -> result<chat-response, chat-error>;
+    chat: async func(request: chat-request) -> chat-stream;
 
     // Generic dispatch to whatever tool the host has loaded under `name` --
     // the agent never knows what a tool actually does, just that calling it

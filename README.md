@@ -19,18 +19,30 @@ or decides which provider/model/tools are in use.
 Swapping provider, model, or tools is a config change; none of the
 components need recompiling.
 
+Replies stream: text is printed as the model generates it. That's built on
+WASI 0.3 (Component Model async): `chat` is an `async func` returning a
+`stream<string>` of text pieces plus a `future` of the complete response,
+both across the agent/host and host/provider boundaries. Tools are plain
+synchronous WASI 0.2 components. Everything still builds for the
+`wasm32-wasip2` Rust target; the async parts come from the `wasip3` crate.
+
 ## Layout
 
 - `wit/types.wit` — the conversation types (messages, content blocks,
-  `chat-request`/`chat-response`) shared by the agent and providers.
-- `wit/chat.wit` — the agent/host interface. `chat-request` has no
+  `chat-request`/`chat-response`, and `chat-stream`: a reply in progress)
+  shared by the agent and providers.
+- `wit/chat.wit` — the agent/host interface. `chat` is async and returns
+  a `chat-stream`. `chat-request` has no
   `provider`/`model`/`tools` field — the host supplies all of that. The
   agent only sees `tool-use` content blocks in responses and a generic
   `call-tool(name, input)` import to act on them; it never knows what a tool
   actually does.
-- `wit/provider.wit` — the provider/host interface. A provider exports
-  `chat(model, tools, request)`; the host fills in `model` and `tools` from
-  its config and passes the agent's request through unchanged.
+- `wit/provider.wit` — the provider/host interface. A provider exports an
+  async `chat(model, tools, request)` returning a `chat-stream`; the host
+  fills in `model` and `tools` from its config, passes the agent's request
+  through unchanged, and copies the stream back to the agent as it arrives
+  (each component has its own store, so streams can't be handed across
+  directly).
 - `wit/tool.wit` — the tool/host interface. A tool exports `describe()`
   (name, description, JSON input schema) and `call(input-json)`. The host
   calls `describe()` once at startup to learn what's available and to build
@@ -40,11 +52,15 @@ components need recompiling.
   `wasi:http` to its own allow-list, injects configured headers
   (credentials) into those requests, and runs the show under Wasmtime. It
   has no provider-specific code.
-- `agent/` — the guest. A REPL: reads a line, calls `chat`, and for as long
-  as the response asks for tools, calls them via `call-tool` and feeds the
-  results back, before printing the final reply.
+- `agent/` — the guest. A REPL: reads a line, calls `chat` and prints its
+  text as it streams in, and for as long as the response asks for tools,
+  calls them via `call-tool` and feeds the results back. Its entry point is
+  the async WASI 0.3 `wasi:cli/run` export, which streaming requires.
 - `providers/anthropic/`, `providers/openai/` — the provider components,
-  for the Messages API and Chat Completions API respectively.
+  for the Messages API and Chat Completions API respectively. Each sends a
+  streaming request over WASI 0.3's `wasi:http/client`, forwards text
+  deltas as they arrive, and rebuilds the full response (including tool
+  calls) from the server-sent events.
 - `tools/weather/` — the first tool. Geocodes a location name and fetches
   current conditions from Open-Meteo (free, keyless).
 - `tools/sports/` — the second tool. Scores and schedules for a league on a
@@ -159,15 +175,16 @@ wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/agen
 The agent's imports should be limited to `local:agent/chat-api` (and the
 type-only `local:agent/types`) plus the
 standard `wasi:cli`/`wasi:io`/`wasi:clocks` set — no `wasi:http`, no
-`wasi:sockets`, no way to read env vars.
+`wasi:sockets`, no way to read env vars. Its one export is
+`wasi:cli/run@0.3.0`.
 
 ```bash
 wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/weather.wasm"
 ```
 
-The weather tool's imports (and the providers') _should_ include
-`wasi:http/outgoing-handler` — that's expected, they're meant to reach the
-network. What the host restricts is which hosts those calls can actually
+The weather tool's imports _should_ include `wasi:http/outgoing-handler`,
+and the providers' `wasi:http/client@0.3.0` — that's expected, they're
+meant to reach the network. What the host restricts is which hosts those calls can actually
 reach: set a provider's or tool's `allowed_hosts` to `[]` in the config and
 its first request will be rejected before any network attempt, logged as
 `network access denied: <host>` on the host's stderr.

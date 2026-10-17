@@ -57,4 +57,13 @@ interface types {
         api(api-error-detail),
         internal(string),
     }
+
+    // A reply in progress. `text` yields pieces of the reply's text as the
+    // model generates them, for display only; `response` resolves once the
+    // reply is complete, with the whole thing (all text, tool calls, stop
+    // reason) or the error that cut it short.
+    record chat-stream {
+        text: stream<string>,
+        response: future<result<chat-response, chat-error>>,
+    }
 }

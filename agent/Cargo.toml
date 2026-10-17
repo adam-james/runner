@@ -3,5 +3,10 @@ name = "agent"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
-wit-bindgen = "=0.63.0"
+# Also supplies wit-bindgen (with its async runtime), so the agent's own
+# bindings and the `wasi:cli/run` export share one copy of it.
+wasip3 = { version = "=0.9.0", features = ["wit-bindgen-macros"] }

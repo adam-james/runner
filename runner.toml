@@ -1,10 +1,16 @@
 agent = "target/wasm32-wasip2/release/agent.wasm"
 
+# [provider]
+# path = "target/wasm32-wasip2/release/anthropic.wasm"
+# model = "claude-sonnet-5"
+# allowed_hosts = ["api.anthropic.com"]
+# headers = { x-api-key = "${ANTHROPIC_API_KEY}" }
+
 [provider]
-path = "target/wasm32-wasip2/release/anthropic.wasm"
-model = "claude-sonnet-5"
-allowed_hosts = ["api.anthropic.com"]
-headers = { x-api-key = "${ANTHROPIC_API_KEY}" }
+path = "target/wasm32-wasip2/release/openai.wasm"
+model = "gpt-5"
+allowed_hosts = ["api.openai.com"]
+headers = { authorization = "Bearer ${OPENAI_API_KEY}" }
 
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"

@@ -1,17 +1,36 @@
 use std::io::{self, BufRead, Write};
 
+use wasip3::wit_bindgen;
+
 wit_bindgen::generate!({
     world: "chat-guest",
     path: "../wit",
+    runtime_path: "wasip3::wit_bindgen::rt",
 });
 
 use local::agent::chat_api;
-use local::agent::types::{ChatRequest, ContentBlock, Message, Role, ToolResultBlock};
+use local::agent::types::{
+    ChatError, ChatRequest, ChatStream, ContentBlock, Message, Role, ToolResultBlock,
+};
+
+// The entry point is the async WASI 0.3 `wasi:cli/run` rather than a plain
+// `fn main`: awaiting the host's streaming `chat` from a synchronous
+// (WASI 0.2-style) `run` would trap.
+wasip3::cli::command::export!(Agent);
+
+struct Agent;
+
+impl wasip3::exports::cli::run::Guest for Agent {
+    async fn run() -> Result<(), ()> {
+        repl().await;
+        Ok(())
+    }
+}
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const MAX_TOKENS: u32 = 1024;
 
-fn main() {
+async fn repl() {
     let stdin = io::stdin();
     let mut history: Vec<Message> = Vec::new();
 
@@ -34,7 +53,7 @@ fn main() {
             content: vec![ContentBlock::Text(line.to_string())],
         });
 
-        if let Err(e) = run_turn(&mut history) {
+        if let Err(e) = run_turn(&mut history).await {
             eprintln!("chat error: {e:?}");
             // Discard the whole turn (the user line plus any partial
             // assistant/tool-result messages the loop below managed to
@@ -46,10 +65,10 @@ fn main() {
     }
 }
 
-/// Runs one human turn to completion: calls `chat`, and for as long as the
-/// response asks for tools, calls them via the generic `call-tool` import
-/// and feeds the results back, before printing the final text reply.
-fn run_turn(history: &mut Vec<Message>) -> Result<(), chat_api::ChatError> {
+/// Runs one human turn to completion: calls `chat`, printing its text as it
+/// streams in, and for as long as the response asks for tools, calls them
+/// via the generic `call-tool` import and feeds the results back.
+async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
     loop {
         let request = ChatRequest {
             system: Some(SYSTEM_PROMPT.to_string()),
@@ -57,7 +76,17 @@ fn run_turn(history: &mut Vec<Message>) -> Result<(), chat_api::ChatError> {
             messages: history.clone(),
         };
 
-        let response = chat_api::chat(&request)?;
+        let ChatStream { mut text, response } = chat_api::chat(request).await;
+        let mut printed = false;
+        while let Some(piece) = text.next().await {
+            print!("{piece}");
+            io::stdout().flush().ok();
+            printed = true;
+        }
+        if printed {
+            println!();
+        }
+        let response = response.await?;
 
         let tool_results: Vec<ContentBlock> = response
             .content
@@ -81,7 +110,6 @@ fn run_turn(history: &mut Vec<Message>) -> Result<(), chat_api::ChatError> {
         });
 
         if tool_results.is_empty() {
-            println!("{}", flatten_text(&response.content));
             return Ok(());
         }
 
@@ -95,15 +123,4 @@ fn run_turn(history: &mut Vec<Message>) -> Result<(), chat_api::ChatError> {
 fn prompt() {
     print!("> ");
     io::stdout().flush().ok();
-}
-
-fn flatten_text(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text(s) => Some(s.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }

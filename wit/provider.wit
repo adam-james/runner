@@ -1,7 +1,7 @@
 package local:agent@0.1.0;
 
 interface provider-api {
-    use types.{chat-request, chat-response, chat-error};
+    use types.{chat-request, chat-stream};
 
     record tool-definition {
         name: string,
@@ -13,11 +13,11 @@ interface provider-api {
     // back. `model` and `tools` come from the host's config, not the agent.
     // Credentials never cross this boundary: the host adds them as headers
     // to the provider's outbound requests (see `headers` in the config).
-    chat: func(
+    chat: async func(
         model: string,
         tools: list<tool-definition>,
         request: chat-request,
-    ) -> result<chat-response, chat-error>;
+    ) -> chat-stream;
 }
 
 world provider-guest {

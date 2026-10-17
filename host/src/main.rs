@@ -1,20 +1,30 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Error, Result, Store, bail};
-use wasmtime_wasi::p2::add_to_linker_sync;
-use wasmtime_wasi::p2::bindings::sync::Command;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use wasmtime::component::{
+    Accessor, Component, Destination, FutureConsumer, FutureReader, HasSelf, Lift, Linker,
+    ResourceTable, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+};
+use wasmtime::{Config, Engine, Error, Result, Store, StoreContextMut, bail};
+use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 wasmtime::component::bindgen!({
     world: "chat-guest",
     path: "../wit",
+    imports: {
+        // Calls into the tool's own store, which is async.
+        "local:agent/chat-api.call-tool": async,
+    },
 });
 
 use local::agent::chat_api;
-use local::agent::types::{ChatError, ChatRequest, ChatResponse};
+use local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
 
 // Scoped in their own modules so each world's generated types (also under
 // the `local:agent` package, since wit_bindgen requires one package per
@@ -23,6 +33,7 @@ mod tool_guest {
     wasmtime::component::bindgen!({
         world: "tool-guest",
         path: "../wit",
+        exports: { default: async },
     });
 }
 use tool_guest::exports::local::agent::tool_api::ToolDescription;
@@ -32,8 +43,8 @@ mod provider_guest {
         world: "provider-guest",
         path: "../wit",
         // Reuse the chat-guest bindings' types, so a `chat-request` from the
-        // agent can be handed straight to the provider and its
-        // `chat-response` straight back, with no conversion in between.
+        // agent can be handed straight to the provider, and the reply's
+        // pieces straight back, with no conversion in between.
         with: {
             "local:agent/types": crate::local::agent::types,
         },
@@ -196,8 +207,9 @@ impl WasiHttpView for SandboxState {
     }
 }
 
-/// Loads a provider or tool component, with WASI plus `wasi:http` linked in
-/// and its outbound requests restricted to its own allow-list.
+/// Loads a provider or tool component, with WASI plus `wasi:http` (both the
+/// 0.2 and 0.3 versions) linked in and its outbound requests restricted to
+/// its own allow-list.
 fn load_sandboxed(
     engine: &Engine,
     config: &ComponentConfig,
@@ -206,8 +218,10 @@ fn load_sandboxed(
         .map_err(|e| Error::msg(format!("loading component {}: {e}", config.path)))?;
 
     let mut linker = Linker::<SandboxState>::new(engine);
-    add_to_linker_sync(&mut linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_sync::<SandboxState>(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
 
     let state = SandboxState {
         wasi: WasiCtx::builder().build(),
@@ -224,13 +238,20 @@ struct ToolHandle {
     store: Store<SandboxState>,
 }
 
-fn load_tools(engine: &Engine, configs: &[ComponentConfig]) -> Result<HashMap<String, ToolHandle>> {
+async fn load_tools(
+    engine: &Engine,
+    configs: &[ComponentConfig],
+) -> Result<HashMap<String, ToolHandle>> {
     let mut tools = HashMap::new();
 
     for config in configs {
         let (component, linker, mut store) = load_sandboxed(engine, config)?;
-        let instance = tool_guest::ToolGuest::instantiate(&mut store, &component, &linker)?;
-        let description = instance.local_agent_tool_api().call_describe(&mut store)?;
+        let instance =
+            tool_guest::ToolGuest::instantiate_async(&mut store, &component, &linker).await?;
+        let description = instance
+            .local_agent_tool_api()
+            .call_describe(&mut store)
+            .await?;
 
         tools.insert(
             description.name.clone(),
@@ -251,9 +272,10 @@ struct ProviderHandle {
     store: Store<SandboxState>,
 }
 
-fn load_provider(engine: &Engine, config: &ProviderConfig) -> Result<ProviderHandle> {
+async fn load_provider(engine: &Engine, config: &ProviderConfig) -> Result<ProviderHandle> {
     let (component, linker, mut store) = load_sandboxed(engine, &config.component)?;
-    let instance = provider_guest::ProviderGuest::instantiate(&mut store, &component, &linker)?;
+    let instance =
+        provider_guest::ProviderGuest::instantiate_async(&mut store, &component, &linker).await?;
     Ok(ProviderHandle {
         model: config.model.clone(),
         instance,
@@ -264,7 +286,10 @@ fn load_provider(engine: &Engine, config: &ProviderConfig) -> Result<ProviderHan
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
-    provider: ProviderHandle,
+    // Shared with the task that runs each reply, which has to keep driving
+    // the provider's store while the agent's store reads what it produces.
+    provider: Arc<Mutex<ProviderHandle>>,
+    tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
 }
 
@@ -278,26 +303,7 @@ impl WasiView for HostState {
 }
 
 impl chat_api::Host for HostState {
-    fn chat(&mut self, request: ChatRequest) -> Result<ChatResponse, ChatError> {
-        let tools: Vec<ToolDefinition> = self
-            .tools
-            .values()
-            .map(|t| ToolDefinition {
-                name: t.description.name.clone(),
-                description: t.description.description.clone(),
-                input_schema_json: t.description.input_schema_json.clone(),
-            })
-            .collect();
-
-        let provider = &mut self.provider;
-        provider
-            .instance
-            .local_agent_provider_api()
-            .call_chat(&mut provider.store, &provider.model, &tools, &request)
-            .unwrap_or_else(|trap| Err(ChatError::Internal(format!("provider trapped: {trap}"))))
-    }
-
-    fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
+    async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
         let handle = self
             .tools
             .get_mut(&name)
@@ -306,11 +312,165 @@ impl chat_api::Host for HostState {
             .instance
             .local_agent_tool_api()
             .call_call(&mut handle.store, &input)
+            .await
             .map_err(|e| e.to_string())?
     }
 }
 
-fn main() -> Result<()> {
+impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
+    /// Streams belong to a single store, and the provider and agent each have
+    /// their own, so the host can't just hand the provider's stream to the
+    /// agent: it copies the reply across through channels, read on the
+    /// provider side by a background task and written on the agent side by
+    /// the stream/future returned here.
+    async fn chat(accessor: &Accessor<U, Self>, request: ChatRequest) -> ChatStream {
+        let (provider, tools) = accessor.with(|mut store| {
+            let state = store.get();
+            (state.provider.clone(), state.tool_definitions.clone())
+        });
+
+        let (text_tx, text_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let response = run_provider(&provider, tools, request, text_tx).await;
+            let _ = response_tx.send(response);
+        });
+
+        accessor.with(|mut store| ChatStream {
+            text: StreamReader::new(&mut store, ChannelProducer(text_rx))
+                .expect("concurrency support is enabled"),
+            response: FutureReader::new(&mut store, async move {
+                Ok::<_, Error>(response_rx.await.unwrap_or_else(|_| {
+                    Err(ChatError::Internal("provider task ended early".to_string()))
+                }))
+            })
+            .expect("concurrency support is enabled"),
+        })
+    }
+}
+
+/// Calls the provider's `chat` and forwards its reply: text pieces into
+/// `text_tx` as they arrive, then the whole response as the return value.
+async fn run_provider(
+    provider: &Mutex<ProviderHandle>,
+    tools: Vec<ToolDefinition>,
+    request: ChatRequest,
+    text_tx: mpsc::UnboundedSender<String>,
+) -> Result<ChatResponse, ChatError> {
+    let mut provider = provider.lock().await;
+    let ProviderHandle {
+        model,
+        instance,
+        store,
+    } = &mut *provider;
+    let (response_tx, response_rx) = oneshot::channel();
+
+    let outcome = store
+        .run_concurrent(async |accessor| -> Result<_> {
+            let ChatStream { text, response } = instance
+                .local_agent_provider_api()
+                .call_chat(accessor, model.clone(), tools, request)
+                .await?;
+            accessor.with(|mut store| -> Result<()> {
+                text.pipe(&mut store, ChannelConsumer(text_tx))?;
+                response.pipe(&mut store, OneshotConsumer(Some(response_tx)))
+            })?;
+            // Keeps the provider's store running until its reply is done.
+            Ok(response_rx.await)
+        })
+        .await;
+
+    match outcome {
+        Ok(Ok(Ok(response))) => response,
+        Ok(Ok(Err(_))) => Err(ChatError::Internal(
+            "provider dropped its response".to_string(),
+        )),
+        Ok(Err(trap)) | Err(trap) => Err(ChatError::Internal(format!(
+            "provider trapped: {trap:?}"
+        ))),
+    }
+}
+
+/// Feeds a stream returned to a guest from a channel.
+struct ChannelProducer<T>(mpsc::UnboundedReceiver<T>);
+
+impl<T: Send + Sync + 'static, D> StreamProducer<D> for ChannelProducer<T> {
+    type Item = T;
+    type Buffer = Option<T>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        mut destination: Destination<'a, T, Option<T>>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // A zero-length read is the guest checking for readiness; say yes
+        // rather than taking an item it might never collect.
+        if destination.remaining(store) == Some(0) {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        match self.get_mut().0.poll_recv(cx) {
+            Poll::Ready(Some(item)) => {
+                destination.set_buffer(Some(item));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Drains a stream a guest returned into a channel.
+struct ChannelConsumer<T>(mpsc::UnboundedSender<T>);
+
+impl<T: Lift + Send + Sync + 'static, D> StreamConsumer<D> for ChannelConsumer<T> {
+    type Item = T;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        mut source: Source<'_, T>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // `read` only fills up to the buffer's capacity.
+        let mut items = Vec::with_capacity(source.remaining(&mut store));
+        source.read(&mut store, &mut items)?;
+        for item in items {
+            if self.0.send(item).is_err() {
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+        }
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+/// Hands the value of a future a guest returned to a oneshot channel.
+struct OneshotConsumer<T>(Option<oneshot::Sender<T>>);
+
+impl<T: Lift + Send + Sync + 'static, D> FutureConsumer<D> for OneshotConsumer<T> {
+    type Item = T;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        mut source: Source<'_, T>,
+        _: bool,
+    ) -> Poll<Result<()>> {
+        let mut value = None;
+        source.read(&mut store, &mut value)?;
+        if let (Some(value), Some(tx)) = (value, self.get_mut().0.take()) {
+            let _ = tx.send(value);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "runner.toml".to_string());
@@ -318,16 +478,25 @@ fn main() -> Result<()> {
 
     let mut wasm_config = Config::new();
     wasm_config.wasm_component_model(true);
+    wasm_config.wasm_component_model_async(true);
     let engine = Engine::new(&wasm_config)?;
 
-    let provider = load_provider(&engine, &config.provider)?;
-    let tools = load_tools(&engine, &config.tools)?;
+    let provider = load_provider(&engine, &config.provider).await?;
+    let tools = load_tools(&engine, &config.tools).await?;
+    let tool_definitions = tools
+        .values()
+        .map(|t| ToolDefinition {
+            name: t.description.name.clone(),
+            description: t.description.description.clone(),
+            input_schema_json: t.description.input_schema_json.clone(),
+        })
+        .collect();
 
     let component = Component::from_file(&engine, &config.agent)
         .map_err(|e| Error::msg(format!("loading guest component at {}: {e}", config.agent)))?;
 
     let mut linker = Linker::<HostState>::new(&engine);
-    add_to_linker_sync(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
 
     let wasi = WasiCtx::builder()
@@ -341,13 +510,19 @@ fn main() -> Result<()> {
         HostState {
             wasi,
             table: ResourceTable::new(),
-            provider,
+            provider: Arc::new(Mutex::new(provider)),
+            tool_definitions,
             tools,
         },
     );
 
-    let command = Command::instantiate(&mut store, &component, &linker)?;
-    if command.wasi_cli_run().call_run(&mut store)?.is_err() {
+    // The agent exports the async WASI 0.3 `wasi:cli/run`, which is run
+    // inside the store's event loop so its streaming `chat` calls work.
+    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
+    let result = store
+        .run_concurrent(async |accessor| command.wasi_cli_run().call_run(accessor).await)
+        .await??;
+    if result.is_err() {
         bail!("guest exited with a non-zero result");
     }
     Ok(())
