@@ -35,6 +35,10 @@ it ever touches the network.
   results back, before printing the final reply.
 - `tools/weather/` — the first tool. Geocodes a location name and fetches
   current conditions from Open-Meteo (free, keyless).
+- `tools/sports/` — the second tool. Scores and schedules for a league on a
+  given day (NFL, NBA, MLB, NHL, EPL, …) from ESPN's public scoreboard API
+  (keyless), optionally filtered to one team. Reads the wall clock
+  (`wasi:clocks`) to resolve "today", "yesterday", etc. in US Eastern time.
 
 Only the key for the provider actually in use needs to be set. The host
 reads both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` opportunistically and
@@ -60,9 +64,13 @@ model = "claude-sonnet-5"
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
+
+[[tools]]
+path = "target/wasm32-wasip2/release/sports.wasm"
+allowed_hosts = ["site.api.espn.com"]
 ```
 
-All workspace members (`host`, `agent`, `tools/weather`) share a single
+All workspace members (`host`, `agent`, `tools/*`) share a single
 `target/` directory at the repo root — that's plain Cargo workspace
 behavior, not specific to this project — so every `.wasm` ends up under
 `target/wasm32-wasip2/release/`, never under e.g. `tools/weather/target/`.
@@ -74,9 +82,8 @@ is the kind of thing that ends up checked into source control.
 ## Build and run
 
 ```bash
-# Build the agent and the weather tool
-cargo build -p agent --release --target wasm32-wasip2
-cargo build -p weather --release --target wasm32-wasip2
+# Build the agent and the tools
+cargo build -p agent -p weather -p sports --release --target wasm32-wasip2
 
 # Run the host against a config (see runner.toml for a working example)
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -97,6 +104,8 @@ Sample session:
 Got it, Ada.
 > What's the weather in Seattle?
 Current weather in Seattle: 14.2°C, wind 9.1 km/h
+> Did the Seahawks win last night?
+Yes — the Seahawks beat the 49ers 24–17.
 > quit
 ```
 

@@ -5,3 +5,7 @@ model = "claude-sonnet-5"
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
+
+[[tools]]
+path = "target/wasm32-wasip2/release/sports.wasm"
+allowed_hosts = ["site.api.espn.com"]

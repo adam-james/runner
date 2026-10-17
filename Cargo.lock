@@ -1802,6 +1802,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sports"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.63.0",
+ "wstd",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
