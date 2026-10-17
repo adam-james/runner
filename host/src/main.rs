@@ -73,11 +73,21 @@ struct ComponentConfig {
     path: String,
     #[serde(default)]
     allowed_hosts: Vec<String>,
-    /// Headers the host adds to every outbound request this component makes,
+    /// Headers the host adds to this component's outbound HTTPS requests,
     /// e.g. credentials. Values may reference env vars as `${NAME}`, which
     /// are resolved by the host -- the component itself never sees them.
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, HeaderConfig>,
+}
+
+/// A header's value and the hosts it's sent to. `hosts` is required, even
+/// when it just repeats a single allowed host, so adding a host to
+/// `allowed_hosts` later never silently starts sending it credentials.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderConfig {
+    value: String,
+    hosts: Vec<String>,
 }
 
 fn load_config(path: &str) -> Result<RunnerConfig> {
@@ -105,31 +115,71 @@ fn expand_env(template: &str) -> Result<String> {
     Ok(out)
 }
 
+struct InjectedHeader {
+    name: http::HeaderName,
+    value: http::HeaderValue,
+    hosts: HashSet<String>,
+}
+
 /// Rejects any outbound request whose host isn't on this component's own
 /// allow-list, before it ever reaches the real network, and adds its
 /// configured headers (credentials) to the ones that are allowed.
 struct SandboxHooks {
     allowed_hosts: HashSet<String>,
-    headers: http::HeaderMap,
+    headers: Vec<InjectedHeader>,
 }
 
 impl SandboxHooks {
     fn new(config: &ComponentConfig) -> Result<Self> {
-        let mut headers = http::HeaderMap::new();
-        for (name, template) in &config.headers {
+        let allowed_hosts: HashSet<String> =
+            config.allowed_hosts.iter().map(|h| h.to_lowercase()).collect();
+
+        let mut headers = Vec::new();
+        for (name, header) in &config.headers {
             let context = |e: &dyn std::fmt::Display| {
                 Error::msg(format!("header '{name}' for {}: {e}", config.path))
             };
+            let hosts: HashSet<String> = header.hosts.iter().map(|h| h.to_lowercase()).collect();
+            // Either would silently mean the header is never sent.
+            if hosts.is_empty() {
+                return Err(context(&"`hosts` is empty"));
+            }
+            if let Some(host) = hosts.iter().find(|h| !allowed_hosts.contains(*h)) {
+                return Err(context(&format!("host '{host}' is not in allowed_hosts")));
+            }
             let name = http::HeaderName::try_from(name.as_str()).map_err(|e| context(&e))?;
-            let value = expand_env(template).map_err(|e| context(&e))?;
+            let value = expand_env(&header.value).map_err(|e| context(&e))?;
             let mut value = http::HeaderValue::try_from(value).map_err(|e| context(&e))?;
             value.set_sensitive(true);
-            headers.insert(name, value);
+            headers.push(InjectedHeader { name, value, hosts });
         }
+
         Ok(Self {
-            allowed_hosts: config.allowed_hosts.iter().cloned().collect(),
+            allowed_hosts,
             headers,
         })
+    }
+
+    /// Adds the configured headers that apply to `request`, which must
+    /// already have passed the allow-list check. Overwrites any same-named
+    /// header the guest set itself, so a component can't substitute its own
+    /// credentials for the host's.
+    fn add_headers<B>(&self, request: &mut http::Request<B>, host: &str) {
+        // Never put credentials on a plain-text request, even to an allowed
+        // host -- the component doesn't get to downgrade the connection.
+        let https = request.uri().scheme() == Some(&http::uri::Scheme::HTTPS);
+        for header in &self.headers {
+            if !header.hosts.contains(host) {
+                continue;
+            }
+            if !https {
+                eprintln!("not sending header '{}' over plain http to {host}", header.name);
+                continue;
+            }
+            request
+                .headers_mut()
+                .insert(header.name.clone(), header.value.clone());
+        }
     }
 }
 
@@ -153,23 +203,15 @@ impl WasiHttpHooks for SandboxHooks {
                 >,
             > + Send,
     > {
-        let host = request.uri().host().map(str::to_lowercase);
-        let allowed = host
-            .as_deref()
-            .is_some_and(|h| self.allowed_hosts.contains(h));
-        if !allowed {
+        let host = request.uri().host().map(str::to_lowercase).unwrap_or_default();
+        if !self.allowed_hosts.contains(&host) {
             drop(fut);
-            let denied_host = host.unwrap_or_default();
             return Box::new(async move {
-                eprintln!("network access denied: {denied_host}");
+                eprintln!("network access denied: {host}");
                 Err(wasmtime_wasi_http::Error::HttpRequestDenied)
             });
         }
-        // Overwrites any same-named header the guest set itself, so a
-        // component can't substitute its own credentials for the host's.
-        for (name, value) in &self.headers {
-            request.headers_mut().insert(name, value.clone());
-        }
+        self.add_headers(&mut request, &host);
         Box::new(async move {
             use http_body_util::BodyExt;
             let (res, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
@@ -526,4 +568,99 @@ async fn main() -> Result<()> {
         bail!("guest exited with a non-zero result");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hooks(toml: &str) -> Result<SandboxHooks> {
+        let config: ComponentConfig = toml::from_str(toml).unwrap();
+        SandboxHooks::new(&config)
+    }
+
+    /// The headers `hooks` would add to a GET of `url`.
+    fn sent(hooks: &SandboxHooks, url: &str) -> Vec<(String, String)> {
+        let mut request = http::Request::get(url).body(()).unwrap();
+        let host = request.uri().host().unwrap().to_lowercase();
+        hooks.add_headers(&mut request, &host);
+        request
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+            .collect()
+    }
+
+    const CONFIG: &str = r#"
+        path = "tool.wasm"
+        allowed_hosts = ["api.example.com", "CDN.example.com"]
+        headers = { authorization = { value = "Bearer secret", hosts = ["api.example.com"] }, x-client = { value = "runner", hosts = ["api.example.com", "cdn.example.com"] } }
+    "#;
+
+    #[test]
+    fn header_only_goes_to_its_hosts() {
+        let hooks = hooks(CONFIG).unwrap();
+        assert_eq!(
+            sent(&hooks, "https://api.example.com/search"),
+            [
+                ("authorization".to_string(), "Bearer secret".to_string()),
+                ("x-client".to_string(), "runner".to_string()),
+            ]
+        );
+        assert_eq!(
+            sent(&hooks, "https://cdn.example.com/x"),
+            [("x-client".to_string(), "runner".to_string())]
+        );
+    }
+
+    #[test]
+    fn no_headers_over_plain_http() {
+        let hooks = hooks(CONFIG).unwrap();
+        assert!(sent(&hooks, "http://api.example.com/search").is_empty());
+    }
+
+    #[test]
+    fn allowed_hosts_are_case_insensitive() {
+        assert!(hooks(CONFIG).unwrap().allowed_hosts.contains("cdn.example.com"));
+    }
+
+    #[test]
+    fn scoped_host_must_be_allowed() {
+        let err = hooks(
+            r#"
+            path = "tool.wasm"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = { value = "x", hosts = ["api.exmaple.com"] } }
+        "#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("'api.exmaple.com' is not in allowed_hosts"));
+    }
+
+    #[test]
+    fn hosts_must_not_be_empty() {
+        let err = hooks(
+            r#"
+            path = "tool.wasm"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = { value = "x", hosts = [] } }
+        "#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("`hosts` is empty"));
+    }
+
+    #[test]
+    fn plain_string_header_is_rejected() {
+        let config = toml::from_str::<ComponentConfig>(
+            r#"
+            path = "tool.wasm"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = "Bearer x" }
+        "#,
+        );
+        assert!(config.is_err());
+    }
 }

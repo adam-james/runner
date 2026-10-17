@@ -93,7 +93,7 @@ agent = "target/wasm32-wasip2/release/agent.wasm"
 path = "target/wasm32-wasip2/release/anthropic.wasm"
 model = "claude-sonnet-5"
 allowed_hosts = ["api.anthropic.com"]
-headers = { x-api-key = "${ANTHROPIC_API_KEY}" }
+headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = ["api.anthropic.com"] } }
 
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"
@@ -106,7 +106,7 @@ allowed_hosts = ["site.api.espn.com"]
 [[tools]]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
-headers = { authorization = "Bearer ${TAVILY_API_KEY}" }
+headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
 ```
 
 All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single
@@ -114,12 +114,23 @@ All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single
 behavior, not specific to this project — so every `.wasm` ends up under
 `target/wasm32-wasip2/release/`, never under e.g. `tools/weather/target/`.
 
-`headers` (on the provider or any tool) are added by the host to every
-request that component sends, overwriting any same-named header the
-component set itself. `${NAME}` in a value is replaced with env var `NAME`
-when the host starts. That's how credentials stay out of both the
-components and this file — a config file like this is the kind of thing
-that ends up checked into source control.
+`headers` (on the provider or any tool) are added by the host to that
+component's HTTPS requests, overwriting any same-named header the component
+set itself. `${NAME}` in a value is replaced with env var `NAME` when the
+host starts. That's how credentials stay out of both the components and
+this file — a config file like this is the kind of thing that ends up
+checked into source control.
+
+Two rules keep a header from going further than intended:
+
+- **Explicit hosts.** Every header names the hosts it's sent to, which must
+  also be in `allowed_hosts` — even when that just repeats the entry's one
+  allowed host. Adding a host to `allowed_hosts` later never starts sending
+  it credentials by itself.
+- **HTTPS only.** A plain-`http://` request to an allowed host still goes
+  through, but without the configured headers (the host logs `not sending
+  header ... over plain http`), so a component can't send a credential in
+  the clear.
 
 ## Build and run
 
@@ -165,7 +176,7 @@ agent = "target/wasm32-wasip2/release/agent.wasm"
 path = "target/wasm32-wasip2/release/openai.wasm"
 model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
-headers = { authorization = "Bearer ${OPENAI_API_KEY}" }
+headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.openai.com"] } }
 
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"
