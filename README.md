@@ -207,6 +207,7 @@ saved after each turn, and can be picked up again later:
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"
 dir = "${HOME}/.runner/sessions"
+dir_writable = true
 ```
 
 ```bash
@@ -221,9 +222,13 @@ an id that isn't saved yet starts a session under that name, so
 `--session trip` works too. Ids are letters, digits, `-`, `_` and `.`.
 
 The store is a sandboxed component like any other. `dir` gives it one
-directory on the host (created if missing), mounted as its `/`, and it
-can't see anything outside it. `dir` works the same on a provider or tool,
-and expands `${NAME}` like header values do. A store backed by something
+directory on the host, mounted as its `/`, and it can't see anything
+outside it. `dir` works the same on a provider or tool, and expands
+`${NAME}` like header values do. A `dir` is read-only unless
+`dir_writable = true` is set, as it is for the store: without that, the
+component can read the directory but not change, add or delete anything
+in it, and the directory has to exist already (a writable one is created
+if missing). A store backed by something
 else, such as a database behind an HTTP API, would use `allowed_hosts` and
 `headers` instead; the agent can't tell the difference. Without a
 `[session_store]`, nothing is saved.
@@ -257,7 +262,20 @@ fresh_per_call = true  # a new instance for every call
   instance is cheap: componentize-py snapshots the interpreter after
   start-up.
 
-No network, files or env vars: it has no `allowed_hosts` or `dir`, gets
+Files, if you want them: give it a `dir`, and scripts can read what's in
+it (as `/`, so `open("data.csv")` works) but can't write, create, delete
+or rename anything there. Add `dir_writable = true` to let them write too;
+what they write stays there for later calls, and nothing limits how much
+they write, so point it at a scratch directory rather than your work.
+Symlinks and `..` can't reach outside it either way, and the directory is
+opened fresh for every call, so scripts always see its current contents.
+
+The tool can't know any of this itself, as it's host config, so the host
+adds a sentence to the description of any tool with a `dir`, saying
+whether it's read-only or writable. That way the model knows what it can
+do there.
+
+Otherwise, no network, files or env vars: it has no `allowed_hosts`, gets
 no env vars, and Python's `socket`, `http`, `subprocess` and `threading`
 modules aren't even in the build. componentize-py bundles only the
 standard library modules imported while it builds, which is why `app.py`

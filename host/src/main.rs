@@ -100,10 +100,14 @@ struct ComponentConfig {
     /// are resolved by the host -- the component itself never sees them.
     #[serde(default)]
     headers: BTreeMap<String, HeaderConfig>,
-    /// A directory on the host the component can read and write, mounted
-    /// as its `/`. Created if it doesn't exist. May reference env vars like
-    /// `headers` values can.
+    /// A directory on the host the component can read, mounted as its `/`.
+    /// Read-only, and must already exist, unless `dir_writable` is set. May
+    /// reference env vars like `headers` values can.
     dir: Option<String>,
+    /// Let the component change, add and delete things in `dir` too, which
+    /// is created if it doesn't exist.
+    #[serde(default)]
+    dir_writable: bool,
     /// Tools only: how long one call may run, in seconds, before it's cut
     /// off and the model gets a "timed out" error. Without one, a call can
     /// run forever.
@@ -343,17 +347,51 @@ fn load_sandboxed(
     Ok((component, linker, sandbox_store(engine, config)?))
 }
 
+/// The host directory `config` mounts as the component's `/`, if any, and
+/// with what access. A writable one is created if it doesn't exist yet; a
+/// read-only one has to exist already, as an empty one would be no use.
+fn mounted_dir(config: &ComponentConfig) -> Result<Option<(String, FsPerms)>> {
+    let context = |e: &dyn std::fmt::Display| Error::msg(format!("dir for {}: {e}", config.path));
+    let Some(dir) = &config.dir else {
+        if config.dir_writable {
+            return Err(context(&"dir_writable is set, but there's no dir"));
+        }
+        return Ok(None);
+    };
+    let dir = expand_env(dir).map_err(|e| context(&e))?;
+    if config.dir_writable {
+        std::fs::create_dir_all(&dir).map_err(|e| context(&format!("creating {dir}: {e}")))?;
+        return Ok(Some((dir, FsPerms::ReadWrite)));
+    }
+    if !std::path::Path::new(&dir).is_dir() {
+        return Err(context(&format!(
+            "{dir} doesn't exist (a read-only dir isn't created; set dir_writable = true \
+             if the component should be able to write to it)"
+        )));
+    }
+    Ok(Some((dir, FsPerms::ReadOnly)))
+}
+
+/// What a tool's description should say about its `dir`, which the tool
+/// can't describe itself: whether it has one and can write to it is host
+/// config, not something the tool knows.
+fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
+    config.dir.as_ref()?;
+    Some(if config.dir_writable {
+        "Files under / can be read and written, and stay there between calls."
+    } else {
+        "Files under / can be read, but nothing there can be written, changed or \
+         deleted."
+    })
+}
+
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
 fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
     let mut wasi = WasiCtx::builder();
-    if let Some(dir) = &config.dir {
-        let context =
-            |e: &dyn std::fmt::Display| Error::msg(format!("dir for {}: {e}", config.path));
-        let dir = expand_env(dir).map_err(|e| context(&e))?;
-        std::fs::create_dir_all(&dir).map_err(|e| context(&format!("creating {dir}: {e}")))?;
-        wasi.preopened_dir(&dir, "/", FsPerms::ReadWrite)
-            .map_err(|e| context(&format!("opening {dir}: {e}")))?;
+    if let Some((dir, perms)) = mounted_dir(config)? {
+        wasi.preopened_dir(&dir, "/", perms)
+            .map_err(|e| Error::msg(format!("dir for {}: opening {dir}: {e}", config.path)))?;
     }
 
     let mut limits = StoreLimitsBuilder::new();
@@ -441,10 +479,13 @@ async fn load_tools(
         let (component, linker, mut store) = load_sandboxed(engine, config)?;
         let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
         let instance = pre.instantiate_async(&mut store).await?;
-        let description = instance
+        let mut description = instance
             .local_agent_tool_api()
             .call_describe(&mut store)
             .await?;
+        if let Some(note) = dir_note(config) {
+            description.description = format!("{} {note}", description.description);
+        }
 
         tools.insert(
             description.name.clone(),
@@ -1038,6 +1079,55 @@ mod tests {
         assert!(args(&["--session", "a", "--sessions"]).is_err());
         assert!(args(&["--verbose"]).is_err());
         assert!(args(&["a.toml", "b.toml"]).is_err());
+    }
+
+    #[test]
+    fn dirs_are_read_only_unless_writable() {
+        let config = |toml: &str| toml::from_str::<ComponentConfig>(toml).unwrap();
+
+        let none = config(r#"path = "tool.wasm""#);
+        assert!(!none.dir_writable);
+        assert!(mounted_dir(&none).unwrap().is_none());
+
+        let existing = env::temp_dir().to_string_lossy().into_owned();
+        let ro = config(&format!("path = \"python.wasm\"\ndir = {existing:?}"));
+        let (dir, perms) = mounted_dir(&ro).unwrap().unwrap();
+        assert_eq!(dir, existing);
+        assert!(perms.write_not_permitted());
+
+        // A read-only dir isn't created, so a missing one is an error...
+        let missing = env::temp_dir().join(format!("runner-test-{}", std::process::id()));
+        let missing = missing.to_string_lossy().into_owned();
+        let ro_missing = config(&format!("path = \"python.wasm\"\ndir = {missing:?}"));
+        let err = mounted_dir(&ro_missing).unwrap_err().to_string();
+        assert!(err.contains("doesn't exist"), "{err}");
+
+        // ...while a writable one is created.
+        let rw = config(&format!(
+            "path = \"store.wasm\"\ndir = {missing:?}\ndir_writable = true"
+        ));
+        let (_, perms) = mounted_dir(&rw).unwrap().unwrap();
+        assert!(!perms.write_not_permitted());
+        assert!(std::path::Path::new(&missing).is_dir());
+        std::fs::remove_dir(&missing).unwrap();
+
+        let no_dir = config("path = \"tool.wasm\"\ndir_writable = true");
+        assert!(mounted_dir(&no_dir).is_err());
+    }
+
+    #[test]
+    fn dir_note_matches_access() {
+        let config = |toml: &str| toml::from_str::<ComponentConfig>(toml).unwrap();
+        assert_eq!(dir_note(&config(r#"path = "tool.wasm""#)), None);
+
+        let ro = dir_note(&config("path = \"python.wasm\"\ndir = \".\"")).unwrap();
+        assert!(ro.contains("nothing there can be written"), "{ro}");
+
+        let rw = dir_note(&config(
+            "path = \"python.wasm\"\ndir = \".\"\ndir_writable = true",
+        ))
+        .unwrap();
+        assert!(rw.contains("read and written"), "{rw}");
     }
 
     #[test]

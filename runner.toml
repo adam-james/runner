@@ -32,7 +32,21 @@ path = "target/wasm32-wasip2/release/python.wasm"
 timeout_secs = 10
 max_memory_mb = 256
 fresh_per_call = true
+#
+# No files by default. To give scripts a directory, seen as their `/`, use a
+# dedicated one, not your repo or home directory: scripts see everything in
+# it, and with dir_writable can change or delete any of it.
+#
+# Read-only, e.g. data for the model to analyze. The directory must exist:
+#   mkdir -p ~/.runner/python && cp sales.csv ~/.runner/python/
+# dir = "${HOME}/.runner/python"
+#
+# Or writable too, e.g. a scratch space for results that outlive the call.
+# Created if missing. Nothing limits how much scripts write:
+# dir = "${HOME}/.runner/python-scratch"
+# dir_writable = true
 
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"
 dir = "${HOME}/.runner/sessions"
+dir_writable = true

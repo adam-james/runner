@@ -35,7 +35,8 @@ class ToolApi(exports.ToolApi):
             description=(
                 "Run a self-contained Python 3 script in a sandbox and get back what it "
                 "prints (stdout and stderr). Standard library only, no network access, and "
-                "nothing carries over between calls. Use print() to return results."
+                "no variables or imports carry over between calls. Use print() to return "
+                "results."
             ),
             input_schema_json=json.dumps({
                 "type": "object",
