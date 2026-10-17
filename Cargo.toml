@@ -8,4 +8,5 @@ members = [
     "tools/weather",
     "tools/sports",
     "tools/search",
+    "stores/fs",
 ]

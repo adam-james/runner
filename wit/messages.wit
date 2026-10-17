@@ -1,0 +1,34 @@
+package local:agent@0.1.0;
+
+// The conversation itself: what's said, and by whom. Kept apart from
+// `types` (which adds the request/response/streaming types around a `chat`
+// call) so a session store can use these without pulling in streams and
+// futures.
+interface messages {
+    variant content-block {
+        text(string),
+        tool-use(tool-use-block),
+        tool-result(tool-result-block),
+    }
+
+    record tool-use-block {
+        id: string,
+        name: string,
+        input-json: string,
+    }
+
+    record tool-result-block {
+        tool-use-id: string,
+        content: string,
+    }
+
+    enum role {
+        user,
+        assistant,
+    }
+
+    record message {
+        role: role,
+        content: list<content-block>,
+    }
+}

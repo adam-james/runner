@@ -1,0 +1,28 @@
+package local:agent@0.1.0;
+
+// The agent's view of its session: the conversation saved under it, if
+// any. Which session that is, and where it's stored, is up to the host --
+// the agent never names a session or sees how it's kept.
+interface session {
+    use messages.{message};
+
+    load: func() -> result<option<list<message>>, string>;
+    save: func(messages: list<message>) -> result<_, string>;
+}
+
+// Implemented by a session store component (files, a database, ...). The
+// host calls it on the agent's behalf, with the session id it picked.
+interface session-store {
+    use messages.{message};
+
+    // `none` if nothing is saved under `id` yet.
+    load: func(id: string) -> result<option<list<message>>, string>;
+    // Replaces whatever was saved under `id`.
+    save: func(id: string, messages: list<message>) -> result<_, string>;
+    // Every saved session's id.
+    ids: func() -> result<list<string>, string>;
+}
+
+world session-store-guest {
+    export session-store;
+}

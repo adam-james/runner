@@ -6,6 +6,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
+use crate::local::agent::messages::{ContentBlock, Message, Role};
 use crate::local::agent::types::ChatError;
 
 const BOLD: &str = "\x1b[1m";
@@ -40,6 +41,34 @@ impl Ui {
             self.style(BOLD, "runner"),
             self.style(DIM, " · type exit or quit, or Ctrl-D, to leave")
         );
+    }
+
+    /// Says a saved conversation was picked up, and where it left off.
+    pub fn resumed(&self, history: &[Message]) {
+        let turns = history
+            .iter()
+            .filter(|m| m.role == Role::User && is_human(m))
+            .count();
+        println!(
+            "{}",
+            self.style(
+                DIM,
+                &format!(
+                    "resumed session · {turns} earlier {}",
+                    plural(turns, "turn")
+                )
+            )
+        );
+        let last_reply = history.iter().rev().find_map(|m| match m.role {
+            Role::Assistant => text_of(m),
+            Role::User => None,
+        });
+        if let Some(reply) = last_reply {
+            println!(
+                "{}",
+                self.style(DIM, &format!("last reply: {}", truncate(&reply, 80)))
+            );
+        }
     }
 
     /// Shows the prompt. In a terminal, what the user types after it is
@@ -117,7 +146,7 @@ impl Ui {
         self.error(&describe(error));
     }
 
-    fn error(&self, message: &str) {
+    pub fn error(&self, message: &str) {
         if self.stderr_tty {
             eprintln!("{RED}{message}{RESET}");
         } else {
@@ -131,6 +160,41 @@ impl Ui {
         } else {
             text.to_string()
         }
+    }
+}
+
+/// Whether `message` is something the user typed, rather than tool
+/// results sent back on their behalf.
+fn is_human(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text(_)))
+}
+
+/// A message's text, on one line, if it has any.
+fn text_of(message: &Message) -> Option<String> {
+    let text: Vec<&str> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let text = text
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
     }
 }
 

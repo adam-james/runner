@@ -1,35 +1,10 @@
 package local:agent@0.1.0;
 
-// Conversation types shared by the agent (via `chat-api`) and providers (via
-// `provider-api`). Kept in their own type-only interface so a provider can
-// use them without also importing `chat-api`'s functions.
+// The types of a `chat` call, shared by the agent (via `chat-api`) and
+// providers (via `provider-api`). Kept in their own type-only interface so a
+// provider can use them without also importing `chat-api`'s functions.
 interface types {
-    variant content-block {
-        text(string),
-        tool-use(tool-use-block),
-        tool-result(tool-result-block),
-    }
-
-    record tool-use-block {
-        id: string,
-        name: string,
-        input-json: string,
-    }
-
-    record tool-result-block {
-        tool-use-id: string,
-        content: string,
-    }
-
-    enum role {
-        user,
-        assistant,
-    }
-
-    record message {
-        role: role,
-        content: list<content-block>,
-    }
+    use messages.{message, content-block};
 
     // Deliberately has no `provider`/`model` field: which provider and model
     // actually serve a `chat` call is host configuration, not something the

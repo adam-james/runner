@@ -10,10 +10,8 @@ wit_bindgen::generate!({
 });
 
 use exports::local::agent::provider_api::{Guest, ToolDefinition};
-use local::agent::types::{
-    ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream, ContentBlock, Role,
-    ToolUseBlock,
-};
+use local::agent::messages::{ContentBlock, Role, ToolUseBlock};
+use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream};
 
 struct Anthropic;
 

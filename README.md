@@ -28,9 +28,12 @@ synchronous WASI 0.2 components. Everything still builds for the
 
 ## Layout
 
-- `wit/types.wit` — the conversation types (messages, content blocks,
-  `chat-request`/`chat-response`, and `chat-stream`: a reply in progress)
-  shared by the agent and providers.
+- `wit/messages.wit` — the conversation itself (messages and their content
+  blocks: text, tool uses, tool results), shared by the agent, providers,
+  and session stores.
+- `wit/types.wit` — the types around a `chat` call (`chat-request`/
+  `chat-response`, errors, and `chat-stream`: a reply in progress) shared
+  by the agent and providers.
 - `wit/chat.wit` — the agent/host interface. `chat` is async and returns
   a `chat-stream`. `chat-request` has no
   `provider`/`model`/`tools` field — the host supplies all of that. The
@@ -47,6 +50,10 @@ synchronous WASI 0.2 components. Everything still builds for the
   (name, description, JSON input schema) and `call(input-json)`. The host
   calls `describe()` once at startup to learn what's available and to build
   the provider's native tool-calling schema; `call()` runs it.
+- `wit/session.wit` — sessions. The agent imports `session` (`load()` and
+  `save(messages)`, with no session id: the host decides which session
+  this run is); a session store exports `session-store` (`load`/`save` by
+  id, plus `ids()`), and the host passes the agent's calls through to it.
 - `host/` — native binary. Loads the agent, the provider, and every tool
   from a TOML config file, restricts each provider/tool's outbound
   `wasi:http` to its own allow-list, injects configured headers
@@ -56,6 +63,7 @@ synchronous WASI 0.2 components. Everything still builds for the
   text as it streams in, and for as long as the response asks for tools,
   calls them via `call-tool` and feeds the results back. Its entry point is
   the async WASI 0.3 `wasi:cli/run` export, which streaming requires.
+  Loads its session at startup and saves it after every turn.
 - `providers/anthropic/`, `providers/openai/` — the provider components,
   for the Messages API and Chat Completions API respectively. Each sends a
   streaming request over WASI 0.3's `wasi:http/client`, forwards text
@@ -71,6 +79,8 @@ synchronous WASI 0.2 components. Everything still builds for the
 - `tools/search/` — web search via Tavily. The first tool that needs an
   API key; like the providers, it never sees it — the host injects the
   `authorization` header from the config's `headers`.
+- `stores/fs/` — a session store that keeps each session as a JSON file
+  in the one directory its config gives it.
 
 Only the keys the config actually uses need to be set — the provider's,
 plus `TAVILY_API_KEY` if the search tool is configured. The host only reads
@@ -85,7 +95,7 @@ rustup target add wasm32-wasip2
 
 ## Configuration
 
-The host takes a single positional argument: a TOML config file.
+The host takes a TOML config file as its argument (default `runner.toml`).
 
 ```toml
 agent = "target/wasm32-wasip2/release/agent.wasm"
@@ -138,7 +148,7 @@ Two rules keep a header from going further than intended:
 ```bash
 # Build the agent, providers, and tools
 cargo build -p agent -p anthropic -p openai -p weather -p sports -p search \
-    --release --target wasm32-wasip2
+    -p fs-store --release --target wasm32-wasip2
 
 # Run the host against a config (see runner.toml for a working example)
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -177,6 +187,36 @@ short), how long it took, and the size of its result. In a terminal the
 REPL also uses color and shows `…` while waiting for a reply; piped
 output stays plain text.
 
+## Sessions
+
+With a `[session_store]` in the config, every run is a session that's
+saved after each turn, and can be picked up again later:
+
+```toml
+[session_store]
+path = "target/wasm32-wasip2/release/fs_store.wasm"
+dir = "${HOME}/.runner/sessions"
+```
+
+```bash
+cargo run -p host --release -- runner.toml                    # a new session
+cargo run -p host --release -- runner.toml --sessions         # list saved ones
+cargo run -p host --release -- runner.toml --session 20261017-081500   # resume
+```
+
+A new session is named after when it started (UTC), and the host prints
+`session saved; resume with --session <id>` on exit. `--session <id>` with
+an id that isn't saved yet starts a session under that name, so
+`--session trip` works too. Ids are letters, digits, `-`, `_` and `.`.
+
+The store is a sandboxed component like any other. `dir` gives it one
+directory on the host (created if missing), mounted as its `/`, and it
+can't see anything outside it. `dir` works the same on a provider or tool,
+and expands `${NAME}` like header values do. A store backed by something
+else, such as a database behind an HTTP API, would use `allowed_hosts` and
+`headers` instead; the agent can't tell the difference. Without a
+`[session_store]`, nothing is saved.
+
 ## Switching provider or adding tools
 
 Edit the TOML, no recompiling needed — the same agent and tool binaries work
@@ -206,8 +246,9 @@ new component exporting `provider-api` — the host's code never changes.
 wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/agent.wasm"
 ```
 
-The agent's imports should be limited to `local:agent/chat-api` (and the
-type-only `local:agent/types`) plus the
+The agent's imports should be limited to `local:agent/chat-api` and
+`local:agent/session` (and the type-only `local:agent/messages` and
+`local:agent/types`) plus the
 standard `wasi:cli`/`wasi:io`/`wasi:clocks` set — no `wasi:http`, no
 `wasi:sockets`, no way to read env vars. Its one export is
 `wasi:cli/run@0.3.0`.

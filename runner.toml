@@ -24,3 +24,7 @@ allowed_hosts = ["site.api.espn.com"]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
 headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+
+[session_store]
+path = "target/wasm32-wasip2/release/fs_store.wasm"
+dir = "${HOME}/.runner/sessions"

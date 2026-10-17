@@ -12,10 +12,9 @@ wit_bindgen::generate!({
     runtime_path: "wasip3::wit_bindgen::rt",
 });
 
-use local::agent::chat_api;
-use local::agent::types::{
-    ChatError, ChatRequest, ChatStream, ContentBlock, Message, Role, ToolResultBlock,
-};
+use local::agent::messages::{ContentBlock, Message, Role, ToolResultBlock};
+use local::agent::types::{ChatError, ChatRequest, ChatStream};
+use local::agent::{chat_api, session};
 
 // The entry point is the async WASI 0.3 `wasi:cli/run` rather than a plain
 // `fn main`: awaiting the host's streaming `chat` from a synchronous
@@ -37,9 +36,21 @@ const MAX_TOKENS: u32 = 1024;
 async fn repl() {
     let ui = Ui::new();
     let stdin = io::stdin();
-    let mut history: Vec<Message> = Vec::new();
-
     ui.banner();
+    let mut history = match session::load() {
+        Ok(Some(history)) => {
+            ui.resumed(&history);
+            history
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            // Starting over beats refusing to start, but saving would then
+            // overwrite what couldn't be read, so stop here instead.
+            ui.error(&format!("couldn't load session: {e}"));
+            return;
+        }
+    };
+
     ui.prompt();
     for line in stdin.lock().lines() {
         ui.end_input();
@@ -60,12 +71,20 @@ async fn repl() {
             content: vec![ContentBlock::Text(line.to_string())],
         });
 
-        if let Err(e) = run_turn(&ui, &mut history).await {
-            ui.chat_error(&e);
-            // Discard the whole turn (the user line plus any partial
-            // assistant/tool-result messages the loop below managed to
-            // push) rather than desyncing role alternation on the next call.
-            history.truncate(turn_start);
+        match run_turn(&ui, &mut history).await {
+            Ok(()) => {
+                if let Err(e) = session::save(&history) {
+                    ui.error(&format!("couldn't save session: {e}"));
+                }
+            }
+            Err(e) => {
+                ui.chat_error(&e);
+                // Discard the whole turn (the user line plus any partial
+                // assistant/tool-result messages the loop below managed to
+                // push) rather than desyncing role alternation on the next
+                // call.
+                history.truncate(turn_start);
+            }
         }
 
         ui.prompt();

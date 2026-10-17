@@ -13,4 +13,5 @@ interface chat-api {
 
 world chat-guest {
     import chat-api;
+    import session;
 }
