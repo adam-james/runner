@@ -2,9 +2,9 @@
 
 ## Near term
 
-- search tool - tavily
-- sessions and session storage (resume)
+- log tool calls
 - make agent look better
+- sessions and session storage (resume)
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now
 

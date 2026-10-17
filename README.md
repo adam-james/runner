@@ -67,10 +67,14 @@ synchronous WASI 0.2 components. Everything still builds for the
   given day (NFL, NBA, MLB, NHL, EPL, …) from ESPN's public scoreboard API
   (keyless), optionally filtered to one team. Reads the wall clock
   (`wasi:clocks`) to resolve "today", "yesterday", etc. in US Eastern time.
+- `tools/search/` — web search via Tavily. The first tool that needs an
+  API key; like the providers, it never sees it — the host injects the
+  `authorization` header from the config's `headers`.
 
-Only the key for the provider actually in use needs to be set — the host
-only reads the env vars the config's `headers` reference, and fails at
-startup with `environment variable ... is not set` if one is missing.
+Only the keys the config actually uses need to be set — the provider's,
+plus `TAVILY_API_KEY` if the search tool is configured. The host only reads
+the env vars the config's `headers` reference, and fails at startup with
+`environment variable ... is not set` if one is missing.
 
 ## Setup
 
@@ -98,6 +102,11 @@ allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
 [[tools]]
 path = "target/wasm32-wasip2/release/sports.wasm"
 allowed_hosts = ["site.api.espn.com"]
+
+[[tools]]
+path = "target/wasm32-wasip2/release/search.wasm"
+allowed_hosts = ["api.tavily.com"]
+headers = { authorization = "Bearer ${TAVILY_API_KEY}" }
 ```
 
 All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single
@@ -116,11 +125,12 @@ that ends up checked into source control.
 
 ```bash
 # Build the agent, providers, and tools
-cargo build -p agent -p anthropic -p openai -p weather -p sports \
+cargo build -p agent -p anthropic -p openai -p weather -p sports -p search \
     --release --target wasm32-wasip2
 
 # Run the host against a config (see runner.toml for a working example)
 export ANTHROPIC_API_KEY=sk-ant-...
+export TAVILY_API_KEY=tvly-...   # for the search tool
 cargo run -p host --release -- runner.toml
 ```
 

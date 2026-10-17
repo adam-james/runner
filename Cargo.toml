@@ -7,4 +7,5 @@ members = [
     "providers/openai",
     "tools/weather",
     "tools/sports",
+    "tools/search",
 ]
