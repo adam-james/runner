@@ -93,8 +93,12 @@ async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse(tu) => {
-                    let result = chat_api::call_tool(&tu.name, &tu.input_json)
-                        .unwrap_or_else(|e| format!("error: {e}"));
+                    println!("[tool] {} {}", tu.name, tu.input_json);
+                    let result =
+                        chat_api::call_tool(&tu.name, &tu.input_json).unwrap_or_else(|e| {
+                            println!("[tool] {} failed: {e}", tu.name);
+                            format!("error: {e}")
+                        });
                     Some(ContentBlock::ToolResult(ToolResultBlock {
                         tool_use_id: tu.id.clone(),
                         content: result,

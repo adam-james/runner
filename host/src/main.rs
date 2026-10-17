@@ -131,8 +131,11 @@ struct SandboxHooks {
 
 impl SandboxHooks {
     fn new(config: &ComponentConfig) -> Result<Self> {
-        let allowed_hosts: HashSet<String> =
-            config.allowed_hosts.iter().map(|h| h.to_lowercase()).collect();
+        let allowed_hosts: HashSet<String> = config
+            .allowed_hosts
+            .iter()
+            .map(|h| h.to_lowercase())
+            .collect();
 
         let mut headers = Vec::new();
         for (name, header) in &config.headers {
@@ -173,7 +176,10 @@ impl SandboxHooks {
                 continue;
             }
             if !https {
-                eprintln!("not sending header '{}' over plain http to {host}", header.name);
+                eprintln!(
+                    "not sending header '{}' over plain http to {host}",
+                    header.name
+                );
                 continue;
             }
             request
@@ -203,7 +209,11 @@ impl WasiHttpHooks for SandboxHooks {
                 >,
             > + Send,
     > {
-        let host = request.uri().host().map(str::to_lowercase).unwrap_or_default();
+        let host = request
+            .uri()
+            .host()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
         if !self.allowed_hosts.contains(&host) {
             drop(fut);
             return Box::new(async move {
@@ -427,9 +437,9 @@ async fn run_provider(
         Ok(Ok(Err(_))) => Err(ChatError::Internal(
             "provider dropped its response".to_string(),
         )),
-        Ok(Err(trap)) | Err(trap) => Err(ChatError::Internal(format!(
-            "provider trapped: {trap:?}"
-        ))),
+        Ok(Err(trap)) | Err(trap) => {
+            Err(ChatError::Internal(format!("provider trapped: {trap:?}")))
+        }
     }
 }
 
@@ -621,7 +631,12 @@ mod tests {
 
     #[test]
     fn allowed_hosts_are_case_insensitive() {
-        assert!(hooks(CONFIG).unwrap().allowed_hosts.contains("cdn.example.com"));
+        assert!(
+            hooks(CONFIG)
+                .unwrap()
+                .allowed_hosts
+                .contains("cdn.example.com")
+        );
     }
 
     #[test]
@@ -635,7 +650,10 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(err.to_string().contains("'api.exmaple.com' is not in allowed_hosts"));
+        assert!(
+            err.to_string()
+                .contains("'api.exmaple.com' is not in allowed_hosts")
+        );
     }
 
     #[test]
