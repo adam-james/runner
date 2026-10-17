@@ -3,14 +3,17 @@ use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use wasmtime::component::{
     Accessor, Component, Destination, FutureConsumer, FutureReader, HasSelf, Lift, Linker,
     ResourceTable, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
 };
-use wasmtime::{Config, Engine, Error, Result, Store, StoreContextMut, bail};
+use wasmtime::{
+    Cache, Config, Engine, Error, Result, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
+    Trap, bail,
+};
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
@@ -87,7 +90,7 @@ struct ProviderConfig {
 }
 
 /// A sandboxed component with network access: a provider or a tool.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct ComponentConfig {
     path: String,
     #[serde(default)]
@@ -101,12 +104,23 @@ struct ComponentConfig {
     /// as its `/`. Created if it doesn't exist. May reference env vars like
     /// `headers` values can.
     dir: Option<String>,
+    /// Tools only: how long one call may run, in seconds, before it's cut
+    /// off and the model gets a "timed out" error. Without one, a call can
+    /// run forever.
+    timeout_secs: Option<u64>,
+    /// Cap on the component's memory, in MiB. Past it, growing memory fails
+    /// inside the component (e.g. Python's `MemoryError`).
+    max_memory_mb: Option<u64>,
+    /// Tools only: give every call a new instance, so nothing carries over
+    /// between calls and a call that's cut off doesn't break the tool.
+    #[serde(default)]
+    fresh_per_call: bool,
 }
 
 /// A header's value and the hosts it's sent to. `hosts` is required, even
 /// when it just repeats a single allowed host, so adding a host to
 /// `allowed_hosts` later never silently starts sending it credentials.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HeaderConfig {
     value: String,
@@ -136,6 +150,33 @@ fn expand_env(template: &str) -> Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// How often the engine's epoch advances; the precision of `timeout_secs`.
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// The epoch deadline of a store that has none: never reached, but small
+/// enough not to overflow when added to the current epoch.
+const NO_DEADLINE: u64 = u64::MAX / 2;
+
+/// The most of a tool's result (or error) passed on to the model, in bytes.
+/// Enforced here rather than in the tool, so a tool running untrusted code
+/// (like the python one) can't get around it to flood the model's context.
+const MAX_TOOL_OUTPUT: usize = 64 * 1024;
+
+/// `output`, cut to at most `MAX_TOOL_OUTPUT` bytes plus a note saying so.
+fn cap_tool_output(mut output: String) -> String {
+    if output.len() <= MAX_TOOL_OUTPUT {
+        return output;
+    }
+    let total = output.len();
+    let mut end = MAX_TOOL_OUTPUT;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str(&format!("\n... [cut by host: {} more bytes]", total - end));
+    output
 }
 
 struct InjectedHeader {
@@ -261,6 +302,7 @@ struct SandboxState {
     http_ctx: WasiHttpCtx,
     table: ResourceTable,
     hooks: SandboxHooks,
+    limits: StoreLimits,
 }
 
 impl WasiView for SandboxState {
@@ -298,6 +340,12 @@ fn load_sandboxed(
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
 
+    Ok((component, linker, sandbox_store(engine, config)?))
+}
+
+/// A new store for a provider or tool from `config`: its own WASI context,
+/// `wasi:http` allow-list and memory cap.
+fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
     let mut wasi = WasiCtx::builder();
     if let Some(dir) = &config.dir {
         let context =
@@ -308,19 +356,79 @@ fn load_sandboxed(
             .map_err(|e| context(&format!("opening {dir}: {e}")))?;
     }
 
+    let mut limits = StoreLimitsBuilder::new();
+    if let Some(mb) = config.max_memory_mb {
+        limits = limits.memory_size(mb as usize * 1024 * 1024);
+    }
+
     let state = SandboxState {
         wasi: wasi.build(),
         http_ctx: WasiHttpCtx::new(),
         table: ResourceTable::new(),
         hooks: SandboxHooks::new(config)?,
+        limits: limits.build(),
     };
-    Ok((component, linker, Store::new(engine, state)))
+    let mut store = Store::new(engine, state);
+    store.limiter(|s| &mut s.limits);
+    // Only a tool call with a `timeout_secs` sets a real deadline.
+    store.set_epoch_deadline(NO_DEADLINE);
+    Ok(store)
 }
 
 struct ToolHandle {
     description: ToolDescription,
+    config: ComponentConfig,
+    // For making a new instance on every call, if `fresh_per_call` is set.
+    pre: tool_guest::ToolGuestPre<SandboxState>,
     instance: tool_guest::ToolGuest,
     store: Store<SandboxState>,
+}
+
+impl ToolHandle {
+    async fn call(&mut self, input: &str) -> Result<String, String> {
+        self.call_uncapped(input)
+            .await
+            .map(cap_tool_output)
+            .map_err(cap_tool_output)
+    }
+
+    async fn call_uncapped(&mut self, input: &str) -> Result<String, String> {
+        if self.config.fresh_per_call {
+            let mut store =
+                sandbox_store(self.store.engine(), &self.config).map_err(|e| e.to_string())?;
+            self.instance = self
+                .pre
+                .instantiate_async(&mut store)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.store = store;
+        }
+
+        let Some(timeout) = self.config.timeout_secs.map(Duration::from_secs) else {
+            return self
+                .instance
+                .local_agent_tool_api()
+                .call_call(&mut self.store, input)
+                .await
+                .map_err(|e| e.to_string())?;
+        };
+        let timed_out = || format!("timed out after {}s", timeout.as_secs());
+        // Two limits, as neither covers both cases alone: the epoch deadline
+        // interrupts code that's busy computing (which never gives the
+        // `tokio` timer a chance to fire), and the timer catches a call
+        // that's stuck waiting on the host, e.g. sleeping or on the network.
+        self.store
+            .set_epoch_deadline(timeout.as_millis() as u64 / EPOCH_TICK.as_millis() as u64);
+        let call = self
+            .instance
+            .local_agent_tool_api()
+            .call_call(&mut self.store, input);
+        match tokio::time::timeout(timeout, call).await {
+            Err(_) => Err(timed_out()),
+            Ok(Err(e)) if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) => Err(timed_out()),
+            Ok(result) => result.map_err(|e| e.to_string())?,
+        }
+    }
 }
 
 async fn load_tools(
@@ -331,8 +439,8 @@ async fn load_tools(
 
     for config in configs {
         let (component, linker, mut store) = load_sandboxed(engine, config)?;
-        let instance =
-            tool_guest::ToolGuest::instantiate_async(&mut store, &component, &linker).await?;
+        let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
+        let instance = pre.instantiate_async(&mut store).await?;
         let description = instance
             .local_agent_tool_api()
             .call_describe(&mut store)
@@ -342,6 +450,8 @@ async fn load_tools(
             description.name.clone(),
             ToolHandle {
                 description,
+                config: config.clone(),
+                pre,
                 instance,
                 store,
             },
@@ -453,16 +563,11 @@ impl WasiView for HostState {
 
 impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
-        let handle = self
-            .tools
+        self.tools
             .get_mut(&name)
-            .ok_or_else(|| format!("no such tool: {name}"))?;
-        handle
-            .instance
-            .local_agent_tool_api()
-            .call_call(&mut handle.store, &input)
+            .ok_or_else(|| format!("no such tool: {name}"))?
+            .call(&input)
             .await
-            .map_err(|e| e.to_string())?
     }
 }
 
@@ -693,7 +798,21 @@ async fn main() -> Result<()> {
     let mut wasm_config = Config::new();
     wasm_config.wasm_component_model(true);
     wasm_config.wasm_component_model_async(true);
+    wasm_config.epoch_interruption(true);
+    // Compiled components are cached on disk, so a big one (like the
+    // Python interpreter) is only compiled once, not on every start.
+    wasm_config.cache(Some(Cache::from_file(None)?));
     let engine = Engine::new(&wasm_config)?;
+
+    // Drives `timeout_secs`: every store's epoch advances once per tick,
+    // and a tool call past its deadline is interrupted.
+    let ticker = engine.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(EPOCH_TICK);
+            ticker.increment_epoch();
+        }
+    });
 
     let mut session = match &config.session_store {
         Some(store_config) => Some(load_session_store(&engine, store_config).await?),
@@ -759,6 +878,7 @@ async fn main() -> Result<()> {
             session,
         },
     );
+    store.set_epoch_deadline(NO_DEADLINE);
 
     // The agent exports the async WASI 0.3 `wasi:cli/run`, which is run
     // inside the store's event loop so its streaming `chat` calls work.
@@ -918,6 +1038,45 @@ mod tests {
         assert!(args(&["--session", "a", "--sessions"]).is_err());
         assert!(args(&["--verbose"]).is_err());
         assert!(args(&["a.toml", "b.toml"]).is_err());
+    }
+
+    #[test]
+    fn tool_output_is_capped() {
+        let short = "ok".to_string();
+        assert_eq!(cap_tool_output(short.clone()), short);
+
+        let exact = "x".repeat(MAX_TOOL_OUTPUT);
+        assert_eq!(cap_tool_output(exact.clone()), exact);
+
+        let capped = cap_tool_output("x".repeat(MAX_TOOL_OUTPUT + 10));
+        assert!(capped.starts_with(&"x".repeat(MAX_TOOL_OUTPUT)));
+        assert!(capped.ends_with("[cut by host: 10 more bytes]"));
+
+        // Never cuts a multi-byte character in half.
+        let capped = cap_tool_output(format!("{}é", "x".repeat(MAX_TOOL_OUTPUT - 1)));
+        assert!(capped.starts_with(&"x".repeat(MAX_TOOL_OUTPUT - 1)));
+        assert!(capped.ends_with("[cut by host: 2 more bytes]"));
+    }
+
+    #[test]
+    fn sandbox_limits_parse() {
+        let config = toml::from_str::<ComponentConfig>(
+            r#"
+            path = "python.wasm"
+            timeout_secs = 10
+            max_memory_mb = 256
+            fresh_per_call = true
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.timeout_secs, Some(10));
+        assert_eq!(config.max_memory_mb, Some(256));
+        assert!(config.fresh_per_call);
+
+        let config = toml::from_str::<ComponentConfig>(r#"path = "tool.wasm""#).unwrap();
+        assert_eq!(config.timeout_secs, None);
+        assert_eq!(config.max_memory_mb, None);
+        assert!(!config.fresh_per_call);
     }
 
     #[test]

@@ -17,5 +17,5 @@
 - migrate tools to WASI 0.3 http (off wstd) - wait for a p3 wstd or a need for streaming tool output / parallel tool calls
 - wasm shell
 - memory
-- run python script in wasm
 - schedule tasks
+- investigate bug where output gets cut off

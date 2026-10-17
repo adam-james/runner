@@ -1,0 +1,10 @@
+[package]
+name = "build-python"
+version = "0.1.0"
+edition = "2024"
+
+# Not a tool component itself: a native program that builds one, wrapping
+# CPython plus app.py into `python.wasm` via componentize-py's library.
+[dependencies]
+componentize-py = "=0.25.1"
+anyhow = "1"

@@ -79,6 +79,14 @@ synchronous WASI 0.2 components. Everything still builds for the
 - `tools/search/` — web search via Tavily. The first tool that needs an
   API key; like the providers, it never sees it — the host injects the
   `authorization` header from the config's `headers`.
+- `tools/python/` — runs Python the model writes. The component is
+  CPython plus `app.py`, built into a `tool-api` component by
+  [componentize-py](https://github.com/bytecodealliance/componentize-py).
+  The crate here (`build-python`) is the native program that does that
+  build, using componentize-py as a library, so it needs no Python
+  install. Python can't be compiled to WASM by itself, so
+  this is one interpreter component that takes each script as its input,
+  rather than a new component per script. See [Python](#python).
 - `stores/fs/` — a session store that keeps each session as a JSON file
   in the one directory its config gives it.
 
@@ -150,6 +158,9 @@ Two rules keep a header from going further than intended:
 cargo build -p agent -p anthropic -p openai -p weather -p sports -p search \
     -p fs-store --release --target wasm32-wasip2
 
+# Build the python tool (a native program, so no --target)
+cargo run -p build-python --release
+
 # Run the host against a config (see runner.toml for a working example)
 export ANTHROPIC_API_KEY=sk-ant-...
 export TAVILY_API_KEY=tvly-...   # for the search tool
@@ -217,6 +228,51 @@ else, such as a database behind an HTTP API, would use `allowed_hosts` and
 `headers` instead; the agent can't tell the difference. Without a
 `[session_store]`, nothing is saved.
 
+## Python
+
+The `run_python` tool runs a script the model writes and returns what it
+printed, or the traceback if it failed. The code comes from the model, not
+from us, so its config entry uses three settings no other tool needs (any
+tool can use them):
+
+```toml
+[[tools]]
+path = "target/wasm32-wasip2/release/python.wasm"
+timeout_secs = 10      # a call that runs longer is cut off: "timed out after 10s"
+max_memory_mb = 256    # past this, the script gets a MemoryError
+fresh_per_call = true  # a new instance for every call
+```
+
+- `timeout_secs` covers both a script busy computing (`while True: pass`,
+  interrupted by Wasmtime's epoch deadline) and one stuck waiting
+  (`time.sleep(1000)`, cut off by a timer). Either way the model just
+  gets an error back, and the REPL carries on.
+- Every tool's result (or error) is cut to 64 KB by the host before the
+  model sees it. `app.py` cuts printed output shorter itself, but a script
+  runs in the same interpreter and could undo that, so the host's cap is
+  the one that holds.
+- `fresh_per_call` means one script can't leave anything behind for the
+  next one, and a call that was cut off can't break the tool, since an
+  instance that's been interrupted can't be used again. Starting an
+  instance is cheap: componentize-py snapshots the interpreter after
+  start-up.
+
+No network, files or env vars: it has no `allowed_hosts` or `dir`, gets
+no env vars, and Python's `socket`, `http`, `subprocess` and `threading`
+modules aren't even in the build. componentize-py bundles only the
+standard library modules imported while it builds, which is why `app.py`
+imports a list of useful ones (`datetime`, `statistics`, `csv`, `re`, …)
+it doesn't use itself. To make another one available, add it there and
+rebuild. Packages with C extensions (numpy etc.) aren't supported.
+
+The component is about 20 MB. The host keeps Wasmtime's on-disk compile
+cache turned on, so it's only compiled on the first run. The cache lives in
+`~/Library/Caches/BytecodeAlliance.wasmtime` on macOS and
+`~/.cache/wasmtime` on Linux, and is safe to delete. Its location and size
+limits can be changed in the `[cache]` section of Wasmtime's
+`config.toml`: `~/Library/Application Support/BytecodeAlliance.wasmtime/`
+on macOS, `~/.config/wasmtime/` on Linux.
+
 ## Switching provider or adding tools
 
 Edit the TOML, no recompiling needed — the same agent and tool binaries work
@@ -263,3 +319,11 @@ meant to reach the network. What the host restricts is which hosts those calls c
 reach: set a provider's or tool's `allowed_hosts` to `[]` in the config and
 its first request will be rejected before any network attempt, logged as
 `network access denied: <host>` on the host's stderr.
+
+```bash
+wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/python.wasm"
+```
+
+The python tool imports no `wasi:http` at all. It does import
+`wasi:sockets`, as every componentize-py component does, but the host
+grants no socket permissions, so any connection attempt is denied.

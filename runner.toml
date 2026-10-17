@@ -25,6 +25,14 @@ path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
 headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
 
+# Runs Python the model writes, so it's boxed in more tightly than the rest.
+# Built by `cargo run -p build-python --release`.
+[[tools]]
+path = "target/wasm32-wasip2/release/python.wasm"
+timeout_secs = 10
+max_memory_mb = 256
+fresh_per_call = true
+
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"
 dir = "${HOME}/.runner/sessions"
