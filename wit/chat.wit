@@ -1,59 +1,7 @@
 package local:agent@0.1.0;
 
 interface chat-api {
-    variant content-block {
-        text(string),
-        tool-use(tool-use-block),
-        tool-result(tool-result-block),
-    }
-
-    record tool-use-block {
-        id: string,
-        name: string,
-        input-json: string,
-    }
-
-    record tool-result-block {
-        tool-use-id: string,
-        content: string,
-    }
-
-    enum role {
-        user,
-        assistant,
-    }
-
-    record message {
-        role: role,
-        content: list<content-block>,
-    }
-
-    // Deliberately has no `provider`/`model` field: which provider and model
-    // actually serve a `chat` call is host configuration, not something the
-    // guest states or can override. Any guest component works unmodified
-    // against whatever provider the host is configured for.
-    record chat-request {
-        system: option<string>,
-        max-tokens: u32,
-        messages: list<message>,
-    }
-
-    record chat-response {
-        content: list<content-block>,
-        stop-reason: option<string>,
-    }
-
-    record api-error-detail {
-        status: u16,
-        body: string,
-    }
-
-    variant chat-error {
-        invalid-request(string),
-        network(string),
-        api(api-error-detail),
-        internal(string),
-    }
+    use types.{chat-request, chat-response, chat-error};
 
     chat: func(request: chat-request) -> result<chat-response, chat-error>;
 

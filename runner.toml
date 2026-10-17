@@ -1,6 +1,10 @@
 agent = "target/wasm32-wasip2/release/agent.wasm"
-provider = "anthropic"
+
+[provider]
+path = "target/wasm32-wasip2/release/anthropic.wasm"
 model = "claude-sonnet-5"
+allowed_hosts = ["api.anthropic.com"]
+headers = { x-api-key = "${ANTHROPIC_API_KEY}" }
 
 [[tools]]
 path = "target/wasm32-wasip2/release/weather.wasm"

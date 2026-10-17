@@ -5,7 +5,8 @@ wit_bindgen::generate!({
     path: "../wit",
 });
 
-use local::agent::chat_api::{self, ChatRequest, ContentBlock, Message, Role, ToolResultBlock};
+use local::agent::chat_api;
+use local::agent::types::{ChatRequest, ContentBlock, Message, Role, ToolResultBlock};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const MAX_TOKENS: u32 = 1024;

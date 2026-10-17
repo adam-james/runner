@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["host", "agent", "tools/weather", "tools/sports"]
+members = [
+    "host",
+    "agent",
+    "providers/anthropic",
+    "providers/openai",
+    "tools/weather",
+    "tools/sports",
+]

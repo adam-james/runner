@@ -2,7 +2,6 @@
 
 ## Near term
 
-- remove providers from host - these should be pluggable too
 - streaming responses
 - search tool - tavily
 - sessions and session storage (resume)
