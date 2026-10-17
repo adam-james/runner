@@ -155,14 +155,26 @@ adjust the paths in your TOML config to match.
 Sample session:
 
 ```
+runner · type exit or quit, or Ctrl-D, to leave
+
 > My name is Ada, remember it.
 Got it, Ada.
+
 > What's the weather in Seattle?
+⚙ weather(location: "Seattle") ✓ 0.8s · 52 B
 Current weather in Seattle: 14.2°C, wind 9.1 km/h
+
 > Did the Seahawks win last night?
+⚙ sports(league: "nfl", days_from_today: -1, team: "Seahawks") ✓ 0.4s · 1.2 KB
 Yes — the Seahawks beat the 49ers 24–17.
+
 > quit
 ```
+
+Each tool call is shown as it runs, with its arguments (long ones cut
+short), how long it took, and the size of its result. In a terminal the
+REPL also uses color and shows `…` while waiting for a reply; piped
+output stays plain text.
 
 ## Switching provider or adding tools
 

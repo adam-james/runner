@@ -1,6 +1,10 @@
 use std::io::{self, BufRead, Write};
+use std::time::Instant;
 
 use wasip3::wit_bindgen;
+
+mod ui;
+use ui::Ui;
 
 wit_bindgen::generate!({
     world: "chat-guest",
@@ -31,16 +35,19 @@ const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const MAX_TOKENS: u32 = 1024;
 
 async fn repl() {
+    let ui = Ui::new();
     let stdin = io::stdin();
     let mut history: Vec<Message> = Vec::new();
 
-    prompt();
+    ui.banner();
+    ui.prompt();
     for line in stdin.lock().lines() {
+        ui.end_input();
         let Ok(line) = line else { break };
         let line = line.trim();
 
         if line.is_empty() {
-            prompt();
+            ui.prompt();
             continue;
         }
         if line == "exit" || line == "quit" {
@@ -53,22 +60,25 @@ async fn repl() {
             content: vec![ContentBlock::Text(line.to_string())],
         });
 
-        if let Err(e) = run_turn(&mut history).await {
-            eprintln!("chat error: {e:?}");
+        if let Err(e) = run_turn(&ui, &mut history).await {
+            ui.chat_error(&e);
             // Discard the whole turn (the user line plus any partial
             // assistant/tool-result messages the loop below managed to
             // push) rather than desyncing role alternation on the next call.
             history.truncate(turn_start);
         }
 
-        prompt();
+        ui.prompt();
     }
+    // Leaves the user's shell prompt on a line of its own after Ctrl-D.
+    ui.end_input();
+    println!();
 }
 
 /// Runs one human turn to completion: calls `chat`, printing its text as it
 /// streams in, and for as long as the response asks for tools, calls them
 /// via the generic `call-tool` import and feeds the results back.
-async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
+async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), ChatError> {
     loop {
         let request = ChatRequest {
             system: Some(SYSTEM_PROMPT.to_string()),
@@ -76,15 +86,21 @@ async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
             messages: history.clone(),
         };
 
+        ui.thinking();
         let ChatStream { mut text, response } = chat_api::chat(request).await;
         let mut printed = false;
         while let Some(piece) = text.next().await {
+            if !printed {
+                ui.stop_thinking();
+                printed = true;
+            }
             print!("{piece}");
             io::stdout().flush().ok();
-            printed = true;
         }
         if printed {
             println!();
+        } else {
+            ui.stop_thinking();
         }
         let response = response.await?;
 
@@ -93,15 +109,13 @@ async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse(tu) => {
-                    println!("[tool] {} {}", tu.name, tu.input_json);
-                    let result =
-                        chat_api::call_tool(&tu.name, &tu.input_json).unwrap_or_else(|e| {
-                            println!("[tool] {} failed: {e}", tu.name);
-                            format!("error: {e}")
-                        });
+                    ui.tool_start(&tu.name, &tu.input_json);
+                    let start = Instant::now();
+                    let result = chat_api::call_tool(&tu.name, &tu.input_json);
+                    ui.tool_done(&tu.name, &tu.input_json, &result, start.elapsed());
                     Some(ContentBlock::ToolResult(ToolResultBlock {
                         tool_use_id: tu.id.clone(),
-                        content: result,
+                        content: result.unwrap_or_else(|e| format!("error: {e}")),
                     }))
                 }
                 _ => None,
@@ -122,9 +136,4 @@ async fn run_turn(history: &mut Vec<Message>) -> Result<(), ChatError> {
             content: tool_results,
         });
     }
-}
-
-fn prompt() {
-    print!("> ");
-    io::stdout().flush().ok();
 }

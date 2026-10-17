@@ -2,7 +2,6 @@
 
 ## Near term
 
-- make agent look better
 - sessions and session storage (resume)
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now
