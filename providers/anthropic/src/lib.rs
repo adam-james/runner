@@ -106,6 +106,7 @@ fn build_request(request: &ChatRequest, model: &str, tools: &[ToolDefinition]) -
         "model": model,
         "max_tokens": request.max_tokens,
         "messages": messages,
+        "cache_control": { "type": "ephemeral" },
     });
     if let Some(system) = &request.system {
         body["system"] = serde_json::Value::String(system.clone());
@@ -345,6 +346,20 @@ export!(Anthropic);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_ephemeral_prompt_caching() {
+        let request = ChatRequest {
+            system: None,
+            max_tokens: 1024,
+            messages: Vec::new(),
+        };
+        let body = build_request(&request, "claude-test", &[]);
+        assert_eq!(
+            body["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+    }
 
     /// Feeds a recorded Messages API stream through the same parsing as
     /// `stream_chat`, delivered in awkward chunk sizes.
