@@ -82,6 +82,9 @@ synchronous WASI 0.2 components. Everything still builds for the
 - `tools/files/` — `read_file`: reads a text file with numbered lines, a
   page at a time for long ones, or lists a directory. It sees only its
   config's `dir`, read-only, mounted as `/`. See [Files](#files).
+- `tools/rustdocs/` — `rust_docs`: a crate's docs, or one item's, from
+  docs.rs (doc.rust-lang.org for `std`, `core` and `alloc`), as text. See
+  [Rust docs](#rust-docs).
 - `tools/python/` — runs Python the model writes. The component is
   CPython plus `app.py`, built into a `tool-api` component by
   [componentize-py](https://github.com/bytecodealliance/componentize-py).
@@ -159,7 +162,7 @@ Two rules keep a header from going further than intended:
 ```bash
 # Build the agent, providers, and tools
 cargo build -p agent -p anthropic -p openai -p weather -p sports -p search -p files \
-    -p fs-store --release --target wasm32-wasip2
+    -p rustdocs -p fs-store --release --target wasm32-wasip2
 
 # Build the python tool (a native program, so no --target)
 cargo run -p build-python --release
@@ -315,6 +318,33 @@ It never writes: the tool has no code that writes, and the directory is
 mounted read-only anyway, without `dir_writable`. The WASI sandbox keeps it
 inside `dir`, so `..` and symlinks can't reach anything outside. With no
 `dir` at all, every call fails, as there's nothing mounted to read.
+
+## Rust docs
+
+The `rust_docs` tool looks up Rust documentation, so the model can check
+an API rather than go from memory:
+
+```toml
+[[tools]]
+path = "target/wasm32-wasip2/release/rustdocs.wasm"
+allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
+```
+
+The model names a crate and, optionally, a path in it and a version
+(`latest` by default; for `std`, a Rust version, `beta` or `nightly`):
+
+- no path: the crate's front page, its docs and what's in it;
+- `sync::Mutex`: that item's page, with its signature, docs, methods, and
+  the traits it implements (headers only; blanket impls are left out);
+- `sync`: a module's page;
+- `sync::Mutex::lock`: just that method, field or variant.
+
+It finds an item by its path in the crate's `all.html` index, so a path
+that's wrong, such as `HashMap` for `collections::HashMap`, gets the close
+matches back instead, and a member that doesn't exist gets the list of the
+ones that do. Pages are converted to markdown-style text, with code
+fenced, and come back 400 lines at a time by default, with an `offset` to
+read on: `Iterator`'s page alone runs to over 4000 lines.
 
 ## Switching provider or adding tools
 

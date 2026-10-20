@@ -10,7 +10,9 @@ agent = "target/wasm32-wasip2/release/agent.wasm"
 path = "target/wasm32-wasip2/release/openai.wasm"
 model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
-headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.openai.com"] } }
+headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = [
+    "api.openai.com",
+] } }
 
 # [[tools]]
 # path = "target/wasm32-wasip2/release/weather.wasm"
@@ -24,6 +26,10 @@ headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.
 # path = "target/wasm32-wasip2/release/search.wasm"
 # allowed_hosts = ["api.tavily.com"]
 # headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+
+[[tools]]
+path = "target/wasm32-wasip2/release/rustdocs.wasm"
+allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
 
 # Runs Python the model writes, so it's boxed in more tightly than the rest.
 # Built by `cargo run -p build-python --release`.

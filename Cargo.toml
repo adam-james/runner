@@ -9,6 +9,7 @@ members = [
     "tools/sports",
     "tools/search",
     "tools/files",
+    "tools/rustdocs",
     "tools/python",
     "stores/fs",
 ]

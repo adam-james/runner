@@ -2,15 +2,13 @@
 
 ## Near term
 
-- rust docs tool
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now
 
 ## Long term
 
-- OAuth/login
-- skills
 - MCP
+- skills
 - wasm inspector - turn to s-expression and have llm read it - inspect agents and tools
 - orchestrator - run more than one agent at a time
 - background logging in the host - tool calls, network access (allowed and denied) - a trusted record the agent can't hide or fake
@@ -20,3 +18,4 @@
 - memory
 - schedule tasks
 - investigate bug where output gets cut off
+- OAuth/login
