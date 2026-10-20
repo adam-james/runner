@@ -11,11 +11,15 @@ interface provider-api {
 
     // Translates one `chat-request` into this provider's native API call and
     // back. `model` and `tools` come from the host's config, not the agent.
+    // `session-id` is the host-picked session this run loads/saves under,
+    // if any; a provider may send it back to the API as a cache-affinity
+    // hint (e.g. OpenAI's `prompt_cache_key`), or ignore it.
     // Credentials never cross this boundary: the host adds them as headers
     // to the provider's outbound requests (see `headers` in the config).
     chat: async func(
         model: string,
         tools: list<tool-definition>,
+        session-id: option<string>,
         request: chat-request,
     ) -> chat-stream;
 }

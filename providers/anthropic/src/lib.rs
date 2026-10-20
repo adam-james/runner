@@ -16,7 +16,14 @@ use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, 
 struct Anthropic;
 
 impl Guest for Anthropic {
-    async fn chat(model: String, tools: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
+    async fn chat(
+        model: String,
+        tools: Vec<ToolDefinition>,
+        // Anthropic has no equivalent to OpenAI's `prompt_cache_key`; its
+        // prompt cache keys off request content plus `cache_control`.
+        _session_id: Option<String>,
+        request: ChatRequest,
+    ) -> ChatStream {
         let (mut text_tx, text_rx) = wit_stream::new::<String>();
         let (response_tx, response_rx) = wit_future::new(|| {
             Err(ChatError::Internal("provider dropped the response".to_string()))

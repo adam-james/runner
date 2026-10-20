@@ -651,15 +651,19 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
     /// provider side by a background task and written on the agent side by
     /// the stream/future returned here.
     async fn chat(accessor: &Accessor<U, Self>, request: ChatRequest) -> ChatStream {
-        let (provider, tools) = accessor.with(|mut store| {
+        let (provider, tools, session_id) = accessor.with(|mut store| {
             let state = store.get();
-            (state.provider.clone(), state.tool_definitions.clone())
+            (
+                state.provider.clone(),
+                state.tool_definitions.clone(),
+                state.session.as_ref().map(|handle| handle.id.clone()),
+            )
         });
 
         let (text_tx, text_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let response = run_provider(&provider, tools, request, text_tx).await;
+            let response = run_provider(&provider, tools, session_id, request, text_tx).await;
             let _ = response_tx.send(response);
         });
 
@@ -681,6 +685,7 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
 async fn run_provider(
     provider: &Mutex<ProviderHandle>,
     tools: Vec<ToolDefinition>,
+    session_id: Option<String>,
     request: ChatRequest,
     text_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ChatResponse, ChatError> {
@@ -696,7 +701,7 @@ async fn run_provider(
         .run_concurrent(async |accessor| -> Result<_> {
             let ChatStream { text, response } = instance
                 .local_agent_provider_api()
-                .call_chat(accessor, model.clone(), tools, request)
+                .call_chat(accessor, model.clone(), tools, session_id, request)
                 .await?;
             accessor.with(|mut store| -> Result<()> {
                 text.pipe(&mut store, ChannelConsumer(text_tx))?;

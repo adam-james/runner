@@ -16,7 +16,12 @@ use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, 
 struct Openai;
 
 impl Guest for Openai {
-    async fn chat(model: String, tools: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
+    async fn chat(
+        model: String,
+        tools: Vec<ToolDefinition>,
+        session_id: Option<String>,
+        request: ChatRequest,
+    ) -> ChatStream {
         let (mut text_tx, text_rx) = wit_stream::new::<String>();
         let (response_tx, response_rx) = wit_future::new(|| {
             Err(ChatError::Internal("provider dropped the response".to_string()))
@@ -25,7 +30,7 @@ impl Guest for Openai {
         // Keeps running after `chat` returns the stream, feeding it as
         // events arrive, then resolves `response` with the whole reply.
         wit_bindgen::spawn_local(async move {
-            let result = stream_chat(&model, &tools, &request, &mut text_tx).await;
+            let result = stream_chat(&model, &tools, session_id.as_deref(), &request, &mut text_tx).await;
             drop(text_tx);
             let _ = response_tx.write(result).await;
         });
@@ -40,10 +45,11 @@ impl Guest for Openai {
 async fn stream_chat(
     model: &str,
     tools: &[ToolDefinition],
+    session_id: Option<&str>,
     request: &ChatRequest,
     text_tx: &mut wit_bindgen::StreamWriter<String>,
 ) -> Result<ChatResponse, ChatError> {
-    let mut body = build_request(request, model, tools);
+    let mut body = build_request(request, model, tools, session_id);
     body["stream"] = serde_json::Value::Bool(true);
 
     let (status, mut events) = post_sse("api.openai.com", "/v1/chat/completions", body).await?;
@@ -81,7 +87,12 @@ fn content_block_text(content: &[ContentBlock]) -> String {
         .join("")
 }
 
-fn build_request(request: &ChatRequest, model: &str, tools: &[ToolDefinition]) -> serde_json::Value {
+fn build_request(
+    request: &ChatRequest,
+    model: &str,
+    tools: &[ToolDefinition],
+    session_id: Option<&str>,
+) -> serde_json::Value {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(system) = &request.system {
         messages.push(serde_json::json!({ "role": "system", "content": system }));
@@ -143,6 +154,12 @@ fn build_request(request: &ChatRequest, model: &str, tools: &[ToolDefinition]) -
         // Adds a last chunk with token counts, for `reasoning_tokens`.
         "stream_options": { "include_usage": true },
     });
+    // A stable hint OpenAI uses to prefer routing a session's requests to
+    // the same cache-holding machine, improving cache hit odds. Anthropic
+    // has no equivalent, so only this provider sets it.
+    if let Some(session_id) = session_id {
+        body["prompt_cache_key"] = serde_json::Value::String(session_id.to_string());
+    }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(
             tools
@@ -428,5 +445,25 @@ data: [DONE]\n\n";
     fn stream_error_chunk_fails() {
         let error = serde_json::json!({"error": {"message": "server overloaded"}});
         assert!(Accumulator::default().apply(&error).is_err());
+    }
+
+    fn empty_request() -> ChatRequest {
+        ChatRequest {
+            system: None,
+            max_tokens: 1024,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sends_prompt_cache_key_when_session_id_given() {
+        let body = build_request(&empty_request(), "gpt-5", &[], Some("20261017-081500"));
+        assert_eq!(body["prompt_cache_key"], "20261017-081500");
+    }
+
+    #[test]
+    fn omits_prompt_cache_key_without_a_session() {
+        let body = build_request(&empty_request(), "gpt-5", &[], None);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }

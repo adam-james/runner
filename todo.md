@@ -2,7 +2,6 @@
 
 ## Near term
 
-- send `prompt_cache_key` (session id) to openai - better cache hit odds (anthropic has no equivalent)
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now
 
