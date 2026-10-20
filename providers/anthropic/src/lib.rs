@@ -9,21 +9,18 @@ wit_bindgen::generate!({
     runtime_path: "wasip3::wit_bindgen::rt",
 });
 
-use exports::local::agent::provider_api::{Guest, ToolDefinition};
+use exports::local::agent::provider_api::{ChatContext, Guest, ToolDefinition};
 use local::agent::messages::{ContentBlock, Role, ToolUseBlock};
 use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream};
 
 struct Anthropic;
 
 impl Guest for Anthropic {
-    async fn chat(
-        model: String,
-        tools: Vec<ToolDefinition>,
-        // Anthropic has no equivalent to OpenAI's `prompt_cache_key`; its
-        // prompt cache keys off request content plus `cache_control`.
-        _session_id: Option<String>,
-        request: ChatRequest,
-    ) -> ChatStream {
+    async fn chat(context: ChatContext, request: ChatRequest) -> ChatStream {
+        // No use for `session_id`: Anthropic has no equivalent to OpenAI's
+        // `prompt_cache_key`, since its prompt cache keys off request
+        // content plus `cache_control`.
+        let ChatContext { model, tools, .. } = context;
         let (mut text_tx, text_rx) = wit_stream::new::<String>();
         let (response_tx, response_rx) = wit_future::new(|| {
             Err(ChatError::Internal("provider dropped the response".to_string()))

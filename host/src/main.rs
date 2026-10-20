@@ -58,7 +58,7 @@ mod provider_guest {
         },
     });
 }
-use provider_guest::exports::local::agent::provider_api::ToolDefinition;
+use provider_guest::exports::local::agent::provider_api::{ChatContext, ToolDefinition};
 
 mod session_store_guest {
     wasmtime::component::bindgen!({
@@ -697,11 +697,16 @@ async fn run_provider(
     } = &mut *provider;
     let (response_tx, response_rx) = oneshot::channel();
 
+    let context = ChatContext {
+        model: model.clone(),
+        tools,
+        session_id,
+    };
     let outcome = store
         .run_concurrent(async |accessor| -> Result<_> {
             let ChatStream { text, response } = instance
                 .local_agent_provider_api()
-                .call_chat(accessor, model.clone(), tools, session_id, request)
+                .call_chat(accessor, context, request)
                 .await?;
             accessor.with(|mut store| -> Result<()> {
                 text.pipe(&mut store, ChannelConsumer(text_tx))?;

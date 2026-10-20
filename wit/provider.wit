@@ -9,19 +9,27 @@ interface provider-api {
         input-schema-json: string,
     }
 
-    // Translates one `chat-request` into this provider's native API call and
-    // back. `model` and `tools` come from the host's config, not the agent.
-    // `session-id` is the host-picked session this run loads/saves under,
-    // if any; a provider may send it back to the API as a cache-affinity
-    // hint (e.g. OpenAI's `prompt_cache_key`), or ignore it.
-    // Credentials never cross this boundary: the host adds them as headers
-    // to the provider's outbound requests (see `headers` in the config).
-    chat: async func(
+    // Everything about a `chat` call that comes from the host's config or
+    // its own bookkeeping, not from the agent. Grouped into one record so a
+    // provider that doesn't care about a given field (e.g. Anthropic has no
+    // use for `session-id`) can destructure just the fields it wants and
+    // ignore the rest, rather than having `chat`'s own parameter list grow
+    // -- and every provider's signature along with it -- each time the host
+    // has another hint to offer.
+    record chat-context {
         model: string,
         tools: list<tool-definition>,
+        // The session this run loads/saves under, if any. A provider may
+        // send it back to its API as a cache-affinity hint (e.g. OpenAI's
+        // `prompt_cache_key`), or ignore it.
         session-id: option<string>,
-        request: chat-request,
-    ) -> chat-stream;
+    }
+
+    // Translates one `chat-request` into this provider's native API call
+    // and back. Credentials never cross this boundary: the host adds them
+    // as headers to the provider's outbound requests (see `headers` in the
+    // config).
+    chat: async func(context: chat-context, request: chat-request) -> chat-stream;
 }
 
 world provider-guest {

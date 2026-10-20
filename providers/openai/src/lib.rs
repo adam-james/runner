@@ -9,19 +9,19 @@ wit_bindgen::generate!({
     runtime_path: "wasip3::wit_bindgen::rt",
 });
 
-use exports::local::agent::provider_api::{Guest, ToolDefinition};
+use exports::local::agent::provider_api::{ChatContext, Guest, ToolDefinition};
 use local::agent::messages::{ContentBlock, Role, ToolResultBlock, ToolUseBlock};
 use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream};
 
 struct Openai;
 
 impl Guest for Openai {
-    async fn chat(
-        model: String,
-        tools: Vec<ToolDefinition>,
-        session_id: Option<String>,
-        request: ChatRequest,
-    ) -> ChatStream {
+    async fn chat(context: ChatContext, request: ChatRequest) -> ChatStream {
+        let ChatContext {
+            model,
+            tools,
+            session_id,
+        } = context;
         let (mut text_tx, text_rx) = wit_stream::new::<String>();
         let (response_tx, response_rx) = wit_future::new(|| {
             Err(ChatError::Internal("provider dropped the response".to_string()))
