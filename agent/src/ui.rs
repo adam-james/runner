@@ -3,8 +3,12 @@
 //! Styling (ANSI colors, and the indicators that redraw a line in place)
 //! only happens when the output is a terminal, so piped output stays plain.
 
+use std::cell::Cell;
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use wasip3::clocks::monotonic_clock;
 
 use crate::local::agent::messages::{ContentBlock, Message, Role};
 use crate::local::agent::types::ChatError;
@@ -21,6 +25,16 @@ const CLEAR_LINE: &str = "\r\x1b[K";
 /// argument within them.
 const ARGS_LIMIT: usize = 60;
 const STRING_ARG_LIMIT: usize = 30;
+
+/// How often the "Thinking…" timer redraws.
+const THINKING_TICK: Duration = Duration::from_millis(100);
+
+/// A "Thinking…" indicator in progress, from `Ui::thinking`.
+pub struct Thinking {
+    start: Instant,
+    /// Tells the task redrawing the timer to stop.
+    done: Rc<Cell<bool>>,
+}
 
 pub struct Ui {
     stdout_tty: bool,
@@ -90,19 +104,39 @@ impl Ui {
         }
     }
 
-    /// Shows that a reply is on its way. Cleared by `stop_thinking`.
-    pub fn thinking(&self) {
+    /// Shows `Thinking… 1.2s`, counting up, while a reply is on its way.
+    /// Finished by `stop_thinking`.
+    pub fn thinking(&self) -> Thinking {
+        let thinking = Thinking {
+            start: Instant::now(),
+            done: Rc::new(Cell::new(false)),
+        };
         if self.stdout_tty {
-            print!("{DIM}…{RESET}");
+            print!("{DIM}{}{RESET}", thinking_line(Duration::ZERO));
             flush();
+            let (start, done) = (thinking.start, thinking.done.clone());
+            wasip3::spawn_local(async move {
+                loop {
+                    monotonic_clock::wait_for(THINKING_TICK.as_nanos() as u64).await;
+                    if done.get() {
+                        break;
+                    }
+                    print!("{CLEAR_LINE}{DIM}{}{RESET}", thinking_line(start.elapsed()));
+                    flush();
+                }
+            });
         }
+        thinking
     }
 
-    pub fn stop_thinking(&self) {
+    /// Replaces the indicator with how long the wait took.
+    pub fn stop_thinking(&self, thinking: Thinking) {
+        thinking.done.set(true);
         if self.stdout_tty {
             print!("{CLEAR_LINE}");
-            flush();
         }
+        let secs = thinking.start.elapsed().as_secs_f32();
+        println!("{}", self.style(DIM, &format!("Thought for {secs:.1}s")));
     }
 
     /// Shows a tool call as `⚙ name(args)` while it runs. Finished by
@@ -251,6 +285,10 @@ fn describe(error: &ChatError) -> String {
 fn api_error_message(body: &str) -> Option<String> {
     let body: serde_json::Value = serde_json::from_str(body).ok()?;
     Some(body["error"]["message"].as_str()?.to_string())
+}
+
+fn thinking_line(elapsed: Duration) -> String {
+    format!("Thinking… {:.1}s", elapsed.as_secs_f32())
 }
 
 fn size(bytes: usize) -> String {

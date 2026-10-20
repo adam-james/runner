@@ -105,21 +105,18 @@ async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), ChatError> 
             messages: history.clone(),
         };
 
-        ui.thinking();
+        let mut thinking = Some(ui.thinking());
         let ChatStream { mut text, response } = chat_api::chat(request).await;
-        let mut printed = false;
         while let Some(piece) = text.next().await {
-            if !printed {
-                ui.stop_thinking();
-                printed = true;
+            if let Some(thinking) = thinking.take() {
+                ui.stop_thinking(thinking);
             }
             print!("{piece}");
             io::stdout().flush().ok();
         }
-        if printed {
-            println!();
-        } else {
-            ui.stop_thinking();
+        match thinking {
+            Some(thinking) => ui.stop_thinking(thinking),
+            None => println!(),
         }
         let response = response.await?;
 

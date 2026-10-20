@@ -899,6 +899,9 @@ async fn main() -> Result<()> {
 
     let mut linker = Linker::<HostState>::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    // Only the 0.3 clocks, for the async timer behind the agent's
+    // "Thinking…" indicator; nothing else of WASI 0.3 is needed.
+    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
     chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
     session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
 
