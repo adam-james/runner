@@ -593,6 +593,10 @@ struct HostState {
     session: Option<SessionHandle>,
 }
 
+fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
+    definitions.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+}
+
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -885,7 +889,7 @@ async fn main() -> Result<()> {
 
     let provider = load_provider(&engine, &config.provider).await?;
     let tools = load_tools(&engine, &config.tools).await?;
-    let tool_definitions = tools
+    let mut tool_definitions: Vec<_> = tools
         .values()
         .map(|t| ToolDefinition {
             name: t.description.name.clone(),
@@ -893,6 +897,7 @@ async fn main() -> Result<()> {
             input_schema_json: t.description.input_schema_json.clone(),
         })
         .collect();
+    sort_tool_definitions(&mut tool_definitions);
 
     let component = Component::from_file(&engine, &config.agent)
         .map_err(|e| Error::msg(format!("loading guest component at {}: {e}", config.agent)))?;
@@ -1082,6 +1087,30 @@ mod tests {
         assert!(args(&["--session", "a", "--sessions"]).is_err());
         assert!(args(&["--verbose"]).is_err());
         assert!(args(&["a.toml", "b.toml"]).is_err());
+    }
+
+    #[test]
+    fn tool_definitions_are_sorted_by_name() {
+        let definition = |name: &str| ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema_json: "{}".to_string(),
+        };
+        let mut definitions = vec![
+            definition("weather"),
+            definition("files"),
+            definition("sports"),
+        ];
+
+        sort_tool_definitions(&mut definitions);
+
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["files", "sports", "weather"]
+        );
     }
 
     #[test]
