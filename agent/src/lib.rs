@@ -137,9 +137,13 @@ async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), TurnError> 
             None => println!(),
         }
         let response = response.await?;
-        if let Some(tokens) = response.reasoning_tokens {
-            ui.reasoning_tokens(tokens, MAX_TOKENS);
-        }
+        ui.token_usage(
+            response.reasoning_tokens,
+            MAX_TOKENS,
+            response.prompt_tokens,
+            response.cache_read_tokens,
+            response.cache_creation_tokens,
+        );
         // A cut-off reply may end mid-sentence or mid-tool-call, and keeping
         // it would only confuse the next turn. OpenAI reports "length",
         // Anthropic "max_tokens".

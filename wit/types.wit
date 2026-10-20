@@ -23,6 +23,12 @@ interface types {
         // toward `max-tokens` but aren't in `content`. None if the provider
         // doesn't report it.
         reasoning-tokens: option<u32>,
+        // Total tokens in the prompt, including tokens read from or written
+        // to a prompt cache. None if the provider doesn't report usage.
+        prompt-tokens: option<u32>,
+        // Prompt tokens served from a cache and newly written to one.
+        cache-read-tokens: option<u32>,
+        cache-creation-tokens: option<u32>,
     }
 
     record api-error-detail {

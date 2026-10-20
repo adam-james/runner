@@ -139,10 +139,24 @@ impl Ui {
         println!("{}", self.style(DIM, &format!("Thought for {secs:.1}s")));
     }
 
-    /// Shows how much of the reply's token limit went on reasoning, which
-    /// leaves that much less for the reply itself.
-    pub fn reasoning_tokens(&self, tokens: u32, max_tokens: u32) {
-        println!("{}", self.style(DIM, &reasoning_line(tokens, max_tokens)));
+    /// Shows reasoning and prompt-cache usage reported for a model call.
+    pub fn token_usage(
+        &self,
+        reasoning_tokens: Option<u32>,
+        max_tokens: u32,
+        prompt_tokens: Option<u32>,
+        cache_read_tokens: Option<u32>,
+        cache_creation_tokens: Option<u32>,
+    ) {
+        if let Some(line) = token_usage_line(
+            reasoning_tokens,
+            max_tokens,
+            prompt_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        ) {
+            println!("{}", self.style(DIM, &line));
+        }
     }
 
     /// Shows a tool call as `⚙ name(args)` while it runs. Finished by
@@ -304,6 +318,35 @@ fn reasoning_line(tokens: u32, max_tokens: u32) -> String {
     format!("{tokens} / {max_tokens} max tokens on reasoning ({percent}%)")
 }
 
+fn token_usage_line(
+    reasoning_tokens: Option<u32>,
+    max_tokens: u32,
+    prompt_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_creation_tokens: Option<u32>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(tokens) = reasoning_tokens {
+        parts.push(reasoning_line(tokens, max_tokens));
+    }
+    if let Some(tokens) = prompt_tokens {
+        let mut cache = Vec::new();
+        if let Some(read) = cache_read_tokens {
+            cache.push(format!("{read} cached"));
+        }
+        if let Some(created) = cache_creation_tokens {
+            cache.push(format!("{created} cache write"));
+        }
+        let details = if cache.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", cache.join(", "))
+        };
+        parts.push(format!("{tokens} prompt tokens{details}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn thinking_line(elapsed: Duration) -> String {
     format!("Thinking… {:.1}s", elapsed.as_secs_f32())
 }
@@ -368,6 +411,19 @@ mod tests {
             reasoning_line(0, 1024),
             "0 / 1024 max tokens on reasoning (0%)"
         );
+    }
+
+    #[test]
+    fn token_usage_line_puts_prompt_cache_next_to_reasoning() {
+        assert_eq!(
+            token_usage_line(Some(980), 1024, Some(1200), Some(1000), None).as_deref(),
+            Some("980 / 1024 max tokens on reasoning (95%) · 1200 prompt tokens (1000 cached)")
+        );
+        assert_eq!(
+            token_usage_line(None, 1024, Some(1000), Some(700), Some(100)).as_deref(),
+            Some("1000 prompt tokens (700 cached, 100 cache write)")
+        );
+        assert_eq!(token_usage_line(None, 1024, None, None, None), None);
     }
 
     #[test]

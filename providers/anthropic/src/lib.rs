@@ -142,6 +142,9 @@ struct Accumulator {
     blocks: BTreeMap<u64, Block>,
     stop_reason: Option<String>,
     done: bool,
+    input_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_creation_tokens: Option<u32>,
 }
 
 impl Accumulator {
@@ -149,6 +152,16 @@ impl Accumulator {
     fn apply(&mut self, event: &serde_json::Value) -> Result<Option<String>, ChatError> {
         let index = event["index"].as_u64().unwrap_or_default();
         match event["type"].as_str() {
+            Some("message_start") => {
+                let usage = &event["message"]["usage"];
+                self.input_tokens = usage["input_tokens"].as_u64().map(|n| n as u32);
+                self.cache_read_tokens = usage["cache_read_input_tokens"]
+                    .as_u64()
+                    .map(|n| n as u32);
+                self.cache_creation_tokens = usage["cache_creation_input_tokens"]
+                    .as_u64()
+                    .map(|n| n as u32);
+            }
             Some("content_block_start") => {
                 let block = &event["content_block"];
                 let block = match block["type"].as_str() {
@@ -218,6 +231,13 @@ impl Accumulator {
             stop_reason: self.stop_reason,
             // Only reported as part of `output_tokens`, and thinking is off.
             reasoning_tokens: None,
+            prompt_tokens: self.input_tokens.map(|tokens| {
+                tokens
+                    .saturating_add(self.cache_read_tokens.unwrap_or_default())
+                    .saturating_add(self.cache_creation_tokens.unwrap_or_default())
+            }),
+            cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
         }
     }
 }
@@ -345,7 +365,7 @@ mod tests {
     }
 
     const STREAM: &str = "event: message_start\r\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\r\n\r\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[],\"usage\":{\"input_tokens\":200,\"cache_read_input_tokens\":700,\"cache_creation_input_tokens\":100}}}\r\n\r\n\
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 : keep-alive\n\n\
@@ -374,6 +394,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             let (pieces, response) = replay(STREAM, chunk_size);
             assert_eq!(pieces, ["Let me ", "check."]);
             assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+            assert_eq!(response.prompt_tokens, Some(1000));
+            assert_eq!(response.cache_read_tokens, Some(700));
+            assert_eq!(response.cache_creation_tokens, Some(100));
             let [ContentBlock::Text(text), ContentBlock::ToolUse(tool)] = &response.content[..] else {
                 panic!("unexpected content: {:?}", response.content);
             };
