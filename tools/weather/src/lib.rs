@@ -33,6 +33,11 @@ impl Guest for Weather {
                         "description": "Hours of hourly forecast to include, starting with the \
                                         current hour. Omit for current conditions only.",
                     },
+                    "units": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature units. Defaults to celsius.",
+                    },
                 },
                 "required": ["location"],
             })
@@ -57,6 +62,14 @@ async fn run(input_json: String) -> anyhow::Result<String> {
             _ => anyhow::bail!("'hours' must be a whole number from 1 to {MAX_HOURS}"),
         },
     };
+    let unit = match &input["units"] {
+        serde_json::Value::Null => Unit::Celsius,
+        value => match value.as_str() {
+            Some("celsius") => Unit::Celsius,
+            Some("fahrenheit") => Unit::Fahrenheit,
+            _ => anyhow::bail!("'units' must be \"celsius\" or \"fahrenheit\""),
+        },
+    };
 
     let geo_url = format!(
         "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1",
@@ -71,7 +84,8 @@ async fn run(input_json: String) -> anyhow::Result<String> {
     let name = result["name"].as_str().unwrap_or(location);
 
     let mut weather_url = format!(
-        "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&temperature_unit={}",
+        unit.param()
     );
     if let Some(hours) = hours {
         weather_url.push_str(&format!(
@@ -86,13 +100,38 @@ async fn run(input_json: String) -> anyhow::Result<String> {
         .as_u64()
         .map_or("unknown conditions", describe_code);
 
-    let mut out =
-        format!("Current weather in {name}: {temp}\u{b0}C, {conditions}, wind {wind} km/h");
+    let mut out = format!(
+        "Current weather in {name}: {temp}{}, {conditions}, wind {wind} km/h",
+        unit.symbol()
+    );
     if hours.is_some() {
         out.push_str("\n\n");
-        out.push_str(&format_hourly(&weather["hourly"])?);
+        out.push_str(&format_hourly(&weather["hourly"], unit)?);
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum Unit {
+    Celsius,
+    Fahrenheit,
+}
+
+impl Unit {
+    /// Open-Meteo's `temperature_unit` value.
+    fn param(self) -> &'static str {
+        match self {
+            Unit::Celsius => "celsius",
+            Unit::Fahrenheit => "fahrenheit",
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Unit::Celsius => "\u{b0}C",
+            Unit::Fahrenheit => "\u{b0}F",
+        }
+    }
 }
 
 const HOURLY_FIELDS: &str = "temperature_2m,weather_code,precipitation_probability,wind_speed_10m";
@@ -100,7 +139,7 @@ const HOURLY_FIELDS: &str = "temperature_2m,weather_code,precipitation_probabili
 /// One line per hour from Open-Meteo's `hourly` block, which holds a `time`
 /// array (local, since the request asks for `timezone=auto`) and one
 /// parallel array per field.
-fn format_hourly(hourly: &serde_json::Value) -> anyhow::Result<String> {
+fn format_hourly(hourly: &serde_json::Value, unit: Unit) -> anyhow::Result<String> {
     let times = hourly["time"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("forecast is missing hourly data"))?;
@@ -109,7 +148,8 @@ fn format_hourly(hourly: &serde_json::Value) -> anyhow::Result<String> {
     let mut out = String::from("Hourly forecast (local time):");
     for (i, time) in times.iter().enumerate() {
         let time = time.as_str().unwrap_or("?").replace('T', " ");
-        let temp = field("temperature_2m", i).map_or("?".to_string(), |t| format!("{t}\u{b0}C"));
+        let temp =
+            field("temperature_2m", i).map_or("?".to_string(), |t| format!("{t}{}", unit.symbol()));
         let conditions = hourly["weather_code"][i]
             .as_u64()
             .map_or("unknown conditions", describe_code);
@@ -173,7 +213,7 @@ mod tests {
             "wind_speed_10m": [10.1, 12.4],
         });
         assert_eq!(
-            format_hourly(&hourly).unwrap(),
+            format_hourly(&hourly, Unit::Celsius).unwrap(),
             "Hourly forecast (local time):\n\
              2026-10-17 14:00: 14.5\u{b0}C, overcast, 20% chance of precipitation, wind 10.1 km/h\n\
              2026-10-17 15:00: 13.9\u{b0}C, light rain, 65% chance of precipitation, wind 12.4 km/h"
@@ -191,14 +231,30 @@ mod tests {
             "wind_speed_10m": [5.0],
         });
         assert!(
-            format_hourly(&hourly)
+            format_hourly(&hourly, Unit::Celsius)
                 .unwrap()
                 .contains("? chance of precipitation")
         );
     }
 
     #[test]
+    fn hourly_uses_requested_unit() {
+        let hourly = serde_json::json!({
+            "time": ["2026-10-17T14:00"],
+            "temperature_2m": [58.1],
+            "weather_code": [0],
+            "precipitation_probability": [0],
+            "wind_speed_10m": [5.0],
+        });
+        assert!(
+            format_hourly(&hourly, Unit::Fahrenheit)
+                .unwrap()
+                .contains("58.1\u{b0}F, clear sky")
+        );
+    }
+
+    #[test]
     fn hourly_requires_times() {
-        assert!(format_hourly(&serde_json::json!({})).is_err());
+        assert!(format_hourly(&serde_json::json!({}), Unit::Celsius).is_err());
     }
 }
