@@ -2,6 +2,10 @@
 
 ## Near term
 
+- show prompt caching per turn - openai: `prompt_tokens` + `prompt_tokens_details.cached_tokens`; anthropic: `cache_read_input_tokens` / `cache_creation_input_tokens` / `input_tokens` - show next to the reasoning line
+- sort tool definitions by name - host builds them from a `HashMap`, so their order changes every run and a resumed session misses the cache (both providers)
+- send `prompt_cache_key` (session id) to openai - better cache hit odds (anthropic has no equivalent)
+- turn on anthropic prompt caching - it's opt-in and the provider sends no `cache_control`, so nothing is cached now; add top-level `"cache_control": {"type": "ephemeral"}`
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now
 
