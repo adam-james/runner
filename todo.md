@@ -2,7 +2,6 @@
 
 ## Near term
 
-- read files tool
 - rust docs tool
 - have different agents
 - non-streaming chat option - providers always send `"stream": true` now

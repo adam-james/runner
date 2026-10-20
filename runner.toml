@@ -12,26 +12,26 @@ model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
 headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.openai.com"] } }
 
-[[tools]]
-path = "target/wasm32-wasip2/release/weather.wasm"
-allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
-
-[[tools]]
-path = "target/wasm32-wasip2/release/sports.wasm"
-allowed_hosts = ["site.api.espn.com"]
-
-[[tools]]
-path = "target/wasm32-wasip2/release/search.wasm"
-allowed_hosts = ["api.tavily.com"]
-headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+# [[tools]]
+# path = "target/wasm32-wasip2/release/weather.wasm"
+# allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
+#
+# [[tools]]
+# path = "target/wasm32-wasip2/release/sports.wasm"
+# allowed_hosts = ["site.api.espn.com"]
+#
+# [[tools]]
+# path = "target/wasm32-wasip2/release/search.wasm"
+# allowed_hosts = ["api.tavily.com"]
+# headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
 
 # Runs Python the model writes, so it's boxed in more tightly than the rest.
 # Built by `cargo run -p build-python --release`.
-[[tools]]
-path = "target/wasm32-wasip2/release/python.wasm"
-timeout_secs = 10
-max_memory_mb = 256
-fresh_per_call = true
+# [[tools]]
+# path = "target/wasm32-wasip2/release/python.wasm"
+# timeout_secs = 10
+# max_memory_mb = 256
+# fresh_per_call = true
 #
 # No files by default. To give scripts a directory, seen as their `/`, use a
 # dedicated one, not your repo or home directory: scripts see everything in
@@ -45,6 +45,12 @@ fresh_per_call = true
 # Created if missing. Nothing limits how much scripts write:
 # dir = "${HOME}/.runner/python-scratch"
 # dir_writable = true
+
+# Lets the model read files and list directories, under `dir` only, which
+# it sees as `/`. Read-only; the directory must exist.
+[[tools]]
+path = "target/wasm32-wasip2/release/files.wasm"
+dir = "."
 
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"

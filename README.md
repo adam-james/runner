@@ -79,6 +79,9 @@ synchronous WASI 0.2 components. Everything still builds for the
 - `tools/search/` — web search via Tavily. The first tool that needs an
   API key; like the providers, it never sees it — the host injects the
   `authorization` header from the config's `headers`.
+- `tools/files/` — `read_file`: reads a text file with numbered lines, a
+  page at a time for long ones, or lists a directory. It sees only its
+  config's `dir`, read-only, mounted as `/`. See [Files](#files).
 - `tools/python/` — runs Python the model writes. The component is
   CPython plus `app.py`, built into a `tool-api` component by
   [componentize-py](https://github.com/bytecodealliance/componentize-py).
@@ -155,7 +158,7 @@ Two rules keep a header from going further than intended:
 
 ```bash
 # Build the agent, providers, and tools
-cargo build -p agent -p anthropic -p openai -p weather -p sports -p search \
+cargo build -p agent -p anthropic -p openai -p weather -p sports -p search -p files \
     -p fs-store --release --target wasm32-wasip2
 
 # Build the python tool (a native program, so no --target)
@@ -290,6 +293,28 @@ cache turned on, so it's only compiled on the first run. The cache lives in
 limits can be changed in the `[cache]` section of Wasmtime's
 `config.toml`: `~/Library/Application Support/BytecodeAlliance.wasmtime/`
 on macOS, `~/.config/wasmtime/` on Linux.
+
+## Files
+
+The `read_file` tool lets the model read files in one directory you
+choose:
+
+```toml
+[[tools]]
+path = "target/wasm32-wasip2/release/files.wasm"
+dir = "${HOME}/notes"   # must exist; the model sees it as /
+```
+
+Given a directory, it lists what's there, with file sizes. Given a file,
+it returns the lines numbered, at most 500 at a time by default (the model
+can ask for up to 2000), and says which `offset` to read on from. Lines
+over 1000 characters are cut, and a file that isn't UTF-8 text is refused
+rather than dumped. As with every tool, the host caps a result at 64 KB.
+
+It never writes: the tool has no code that writes, and the directory is
+mounted read-only anyway, without `dir_writable`. The WASI sandbox keeps it
+inside `dir`, so `..` and symlinks can't reach anything outside. With no
+`dir` at all, every call fails, as there's nothing mounted to read.
 
 ## Switching provider or adding tools
 
