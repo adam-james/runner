@@ -19,6 +19,10 @@ interface types {
     record chat-response {
         content: list<content-block>,
         stop-reason: option<string>,
+        // Tokens the model spent reasoning before replying, which count
+        // toward `max-tokens` but aren't in `content`. None if the provider
+        // doesn't report it.
+        reasoning-tokens: option<u32>,
     }
 
     record api-error-detail {

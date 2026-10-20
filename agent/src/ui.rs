@@ -139,6 +139,12 @@ impl Ui {
         println!("{}", self.style(DIM, &format!("Thought for {secs:.1}s")));
     }
 
+    /// Shows how much of the reply's token limit went on reasoning, which
+    /// leaves that much less for the reply itself.
+    pub fn reasoning_tokens(&self, tokens: u32, max_tokens: u32) {
+        println!("{}", self.style(DIM, &reasoning_line(tokens, max_tokens)));
+    }
+
     /// Shows a tool call as `⚙ name(args)` while it runs. Finished by
     /// `tool_done`.
     pub fn tool_start(&self, name: &str, input_json: &str) {
@@ -174,6 +180,12 @@ impl Ui {
                 self.style(RED, &format!(" ✗ {}", truncate(e, ARGS_LIMIT)))
             ),
         }
+    }
+
+    pub fn token_limit(&self, max_tokens: u32) {
+        self.error(&format!(
+            "reply cut off: hit the {max_tokens} token limit, so this turn wasn't saved"
+        ));
     }
 
     pub fn chat_error(&self, error: &ChatError) {
@@ -287,6 +299,11 @@ fn api_error_message(body: &str) -> Option<String> {
     Some(body["error"]["message"].as_str()?.to_string())
 }
 
+fn reasoning_line(tokens: u32, max_tokens: u32) -> String {
+    let percent = u64::from(tokens) * 100 / u64::from(max_tokens.max(1));
+    format!("{tokens} / {max_tokens} max tokens on reasoning ({percent}%)")
+}
+
 fn thinking_line(elapsed: Duration) -> String {
     format!("Thinking… {:.1}s", elapsed.as_secs_f32())
 }
@@ -339,6 +356,18 @@ mod tests {
             Some("invalid x-api-key")
         );
         assert_eq!(api_error_message("<html>Bad Gateway</html>"), None);
+    }
+
+    #[test]
+    fn reasoning_line_shows_share_of_max() {
+        assert_eq!(
+            reasoning_line(980, 1024),
+            "980 / 1024 max tokens on reasoning (95%)"
+        );
+        assert_eq!(
+            reasoning_line(0, 1024),
+            "0 / 1024 max tokens on reasoning (0%)"
+        );
     }
 
     #[test]

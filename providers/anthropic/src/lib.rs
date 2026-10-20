@@ -216,6 +216,8 @@ impl Accumulator {
         ChatResponse {
             content,
             stop_reason: self.stop_reason,
+            // Only reported as part of `output_tokens`, and thinking is off.
+            reasoning_tokens: None,
         }
     }
 }

@@ -140,6 +140,8 @@ fn build_request(request: &ChatRequest, model: &str, tools: &[ToolDefinition]) -
         // `max_completion_tokens`.
         "max_completion_tokens": request.max_tokens,
         "messages": messages,
+        // Adds a last chunk with token counts, for `reasoning_tokens`.
+        "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(
@@ -177,6 +179,7 @@ struct Accumulator {
     /// in its first chunk and its arguments are split across later ones.
     tool_calls: BTreeMap<u64, ToolCall>,
     finish_reason: Option<String>,
+    reasoning_tokens: Option<u32>,
 }
 
 impl Accumulator {
@@ -184,6 +187,10 @@ impl Accumulator {
     fn apply(&mut self, chunk: &serde_json::Value) -> Result<Option<String>, ChatError> {
         if !chunk["error"].is_null() {
             return Err(ChatError::Internal(format!("stream error: {}", chunk["error"])));
+        }
+        let usage = &chunk["usage"]["completion_tokens_details"];
+        if let Some(tokens) = usage["reasoning_tokens"].as_u64() {
+            self.reasoning_tokens = Some(tokens as u32);
         }
         let choice = &chunk["choices"][0];
         if let Some(reason) = choice["finish_reason"].as_str() {
@@ -233,6 +240,7 @@ impl Accumulator {
         ChatResponse {
             content,
             stop_reason: self.finish_reason,
+            reasoning_tokens: self.reasoning_tokens,
         }
     }
 }
@@ -370,6 +378,18 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":
 data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ion\\\":\\\"Seattle\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
+
+    #[test]
+    fn reads_reasoning_tokens_from_usage_chunk() {
+        // With `include_usage`, a last chunk with no choices carries the counts.
+        let stream = "\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"completion_tokens\":1024,\"completion_tokens_details\":{\"reasoning_tokens\":980}}}\n\n\
+data: [DONE]\n\n";
+        let (_, response) = replay(stream, 16);
+        assert_eq!(response.reasoning_tokens, Some(980));
+        assert_eq!(replay(STREAM, 16).1.reasoning_tokens, None);
+    }
 
     #[test]
     fn rebuilds_text_and_interleaved_tool_calls() {

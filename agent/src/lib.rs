@@ -31,7 +31,22 @@ impl wasip3::exports::cli::run::Guest for Agent {
 }
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const MAX_TOKENS: u32 = 1024;
+/// Per request, and it covers a reasoning model's hidden reasoning as well
+/// as the reply, so it needs headroom. Only tokens actually used are billed.
+const MAX_TOKENS: u32 = 16384;
+
+/// Why a turn was abandoned.
+enum TurnError {
+    Chat(ChatError),
+    /// A reply hit `MAX_TOKENS` and was cut off.
+    TokenLimit,
+}
+
+impl From<ChatError> for TurnError {
+    fn from(e: ChatError) -> Self {
+        TurnError::Chat(e)
+    }
+}
 
 async fn repl() {
     let ui = Ui::new();
@@ -78,7 +93,10 @@ async fn repl() {
                 }
             }
             Err(e) => {
-                ui.chat_error(&e);
+                match e {
+                    TurnError::Chat(e) => ui.chat_error(&e),
+                    TurnError::TokenLimit => ui.token_limit(MAX_TOKENS),
+                }
                 // Discard the whole turn (the user line plus any partial
                 // assistant/tool-result messages the loop below managed to
                 // push) rather than desyncing role alternation on the next
@@ -97,7 +115,7 @@ async fn repl() {
 /// Runs one human turn to completion: calls `chat`, printing its text as it
 /// streams in, and for as long as the response asks for tools, calls them
 /// via the generic `call-tool` import and feeds the results back.
-async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), ChatError> {
+async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), TurnError> {
     loop {
         let request = ChatRequest {
             system: Some(SYSTEM_PROMPT.to_string()),
@@ -119,6 +137,18 @@ async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), ChatError> 
             None => println!(),
         }
         let response = response.await?;
+        if let Some(tokens) = response.reasoning_tokens {
+            ui.reasoning_tokens(tokens, MAX_TOKENS);
+        }
+        // A cut-off reply may end mid-sentence or mid-tool-call, and keeping
+        // it would only confuse the next turn. OpenAI reports "length",
+        // Anthropic "max_tokens".
+        if matches!(
+            response.stop_reason.as_deref(),
+            Some("length" | "max_tokens")
+        ) {
+            return Err(TurnError::TokenLimit);
+        }
 
         let tool_results: Vec<ContentBlock> = response
             .content
