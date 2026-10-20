@@ -180,6 +180,8 @@ struct Accumulator {
     tool_calls: BTreeMap<u64, ToolCall>,
     finish_reason: Option<String>,
     reasoning_tokens: Option<u32>,
+    prompt_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
 }
 
 impl Accumulator {
@@ -188,9 +190,15 @@ impl Accumulator {
         if !chunk["error"].is_null() {
             return Err(ChatError::Internal(format!("stream error: {}", chunk["error"])));
         }
-        let usage = &chunk["usage"]["completion_tokens_details"];
-        if let Some(tokens) = usage["reasoning_tokens"].as_u64() {
+        let usage = &chunk["usage"];
+        if let Some(tokens) = usage["completion_tokens_details"]["reasoning_tokens"].as_u64() {
             self.reasoning_tokens = Some(tokens as u32);
+        }
+        if let Some(tokens) = usage["prompt_tokens"].as_u64() {
+            self.prompt_tokens = Some(tokens as u32);
+        }
+        if let Some(tokens) = usage["prompt_tokens_details"]["cached_tokens"].as_u64() {
+            self.cache_read_tokens = Some(tokens as u32);
         }
         let choice = &chunk["choices"][0];
         if let Some(reason) = choice["finish_reason"].as_str() {
@@ -241,6 +249,9 @@ impl Accumulator {
             content,
             stop_reason: self.finish_reason,
             reasoning_tokens: self.reasoning_tokens,
+            prompt_tokens: self.prompt_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: None,
         }
     }
 }
@@ -380,14 +391,17 @@ data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]
 data: [DONE]\n\n";
 
     #[test]
-    fn reads_reasoning_tokens_from_usage_chunk() {
+    fn reads_token_usage_from_usage_chunk() {
         // With `include_usage`, a last chunk with no choices carries the counts.
         let stream = "\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n\
-data: {\"choices\":[],\"usage\":{\"completion_tokens\":1024,\"completion_tokens_details\":{\"reasoning_tokens\":980}}}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"prompt_tokens_details\":{\"cached_tokens\":1000},\"completion_tokens\":1024,\"completion_tokens_details\":{\"reasoning_tokens\":980}}}\n\n\
 data: [DONE]\n\n";
         let (_, response) = replay(stream, 16);
         assert_eq!(response.reasoning_tokens, Some(980));
+        assert_eq!(response.prompt_tokens, Some(1200));
+        assert_eq!(response.cache_read_tokens, Some(1000));
+        assert_eq!(response.cache_creation_tokens, None);
         assert_eq!(replay(STREAM, 16).1.reasoning_tokens, None);
     }
 
