@@ -397,9 +397,10 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
         &["--session", "trip"],
         "hello\ntool:probe\nfail\nagain\n",
     );
-    // Piped input isn't echoed, so the live prompts are bare.
+    assert!(first.contains("turn 1: hello"), "{first}");
+    // Ending a chat says how to resume it, with the whole session ID.
     assert!(
-        first.contains("trip > ") && first.contains("turn 1: hello"),
+        first.ends_with("session trip · resume with: runner chat --session trip\n"),
         "{first}"
     );
     let resumed = chat(&data, &["--session", "trip"], "");
@@ -407,16 +408,16 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
         .split_once("resumed session · 3 earlier turns\n")
         .unwrap_or_else(|| panic!("{resumed}"))
         .1;
-    // Every saved turn in order, each prompt led by the session; no live timings.
-    let hello = history.find("trip > hello\nturn 1: hello").unwrap();
-    let probe = history.find("trip > tool:probe\n").unwrap();
+    // Every saved turn in order, with its prompt; no live timings.
+    let hello = history.find("> hello\nturn 1: hello").unwrap();
+    let probe = history.find("> tool:probe\n").unwrap();
     let tool = history.find("⚙ fixture(probe) ✓").unwrap();
-    let again = history.find("trip > again\nturn 3: again").unwrap();
+    let again = history.find("> again\nturn 3: again").unwrap();
     assert!(hello < probe && probe < tool && tool < again, "{history}");
     // The failed turn was never saved, so the model doesn't remember it either.
     assert!(!history.contains("fail"), "{history}");
     assert!(!history.contains("Thought for"), "{history}");
-    // Generated session IDs are shortened at the prompt, but whole in the banner.
+    // A generated session ID is printed whole on exit too.
     let fresh = chat(&data, &[], "hi\n");
     let id = fresh
         .split(" · session ")
@@ -426,8 +427,10 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
         .next()
         .unwrap();
     assert_eq!(id.len(), 36, "{fresh}");
-    let short = format!("\n{}…{} > ", &id[..4], &id[32..]);
-    assert!(fresh.contains(&short), "{fresh}");
+    assert!(
+        fresh.ends_with(&format!("resume with: runner chat --session {id}\n")),
+        "{fresh}"
+    );
 }
 
 #[tokio::test]

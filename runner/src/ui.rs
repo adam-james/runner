@@ -242,24 +242,38 @@ pub fn resumed(turns: usize) {
     );
 }
 
-/// Shows the prompt, led by the session's ID. In a terminal, what the user
-/// types after it is bold, until `end_input`.
-pub fn prompt(session: &str) {
+/// Shows the prompt. In a terminal, what the user types after it is bold,
+/// until `end_input`.
+pub fn prompt() {
     println!();
-    let session = short_session(session);
     if io::stdout().is_terminal() {
-        print!("{DIM}{session}{RESET} {BOLD}{CYAN}>{RESET} {BOLD}");
+        print!("{BOLD}{CYAN}>{RESET} {BOLD}");
     } else {
-        print!("{session} > ");
+        print!("> ");
     }
     flush();
 }
 
 /// An earlier turn's prompt, shown as it looked when it was typed.
-pub fn past_prompt(session: &str, text: &str) {
-    prompt(session);
+pub fn past_prompt(text: &str) {
+    prompt();
     println!("{text}");
     end_input();
+}
+
+/// Says how to pick the conversation back up, as `chat` ends.
+pub fn goodbye(session: &str) {
+    end_input();
+    let tty = io::stdout().is_terminal();
+    println!();
+    println!(
+        "{}",
+        style(
+            tty,
+            DIM,
+            &format!("session {session} · resume with: runner chat --session {session}")
+        )
+    );
 }
 
 /// The session a `run` or `runs watch` belongs to. On stderr, so stdout
@@ -270,18 +284,6 @@ pub fn session(session: &str) {
     } else {
         eprintln!("session: {session}");
     }
-}
-
-/// Generated (UUID) session IDs cut to their ends, which are enough to tell
-/// sessions apart at a glance; the banner shows the whole ID.
-fn short_session(session: &str) -> String {
-    let chars: Vec<char> = session.chars().collect();
-    if chars.len() <= 16 {
-        return session.to_string();
-    }
-    let head: String = chars[..4].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{head}…{tail}")
 }
 
 pub fn end_input() {
@@ -460,16 +462,6 @@ mod tests {
             token_usage_line(&json!({"reasoning_tokens":null, "max_tokens":1024,
                 "prompt_tokens":null, "cache_read_tokens":null, "cache_creation_tokens":null})),
             None
-        );
-    }
-
-    #[test]
-    fn short_session_keeps_names_and_cuts_uuids() {
-        assert_eq!(short_session("trip"), "trip");
-        assert_eq!(short_session("sixteen-chars-ok"), "sixteen-chars-ok");
-        assert_eq!(
-            short_session("3f2a8b1c-0d4e-4f5a-9b6c-7d8e9f0ac91e"),
-            "3f2a…c91e"
         );
     }
 

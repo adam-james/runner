@@ -154,33 +154,10 @@ async fn main() -> Result<()> {
             if existing {
                 resumed(&client, &session).await?;
             }
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                ui::prompt(&session);
-                let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
-                ui::end_input();
-                let Some(line) = line else {
-                    break;
-                };
-                let prompt = line.trim();
-                if matches!(prompt, "exit" | "quit") {
-                    break;
-                }
-                if prompt.is_empty() {
-                    continue;
-                }
-                let run = client
-                    .submit(
-                        Some(session.clone()),
-                        agent.clone(),
-                        prompt.to_string(),
-                        deadline_secs,
-                    )
-                    .await?;
-                if let Err(error) = attach(&client, &run.id, 0, false).await {
-                    ui::error(&error.to_string());
-                }
-            }
+            let result = chat(&client, &session, agent, deadline_secs).await;
+            // However chat ends, even on an error, say how to come back to it.
+            ui::goodbye(&session);
+            result?;
         }
         Command::Runs { command } => match command {
             Runs::List => println!(
@@ -216,6 +193,43 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Takes prompts until the user leaves, running each as a turn in `session`.
+async fn chat(
+    client: &Client,
+    session: &str,
+    agent: Option<String>,
+    deadline_secs: u64,
+) -> Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        ui::prompt();
+        let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
+        ui::end_input();
+        let Some(line) = line else {
+            break;
+        };
+        let prompt = line.trim();
+        if matches!(prompt, "exit" | "quit") {
+            break;
+        }
+        if prompt.is_empty() {
+            continue;
+        }
+        let run = client
+            .submit(
+                Some(session.to_string()),
+                agent.clone(),
+                prompt.to_string(),
+                deadline_secs,
+            )
+            .await?;
+        if let Err(error) = attach(client, &run.id, 0, false).await {
+            ui::error(&error.to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Replays a picked-up session's conversation: each completed turn's prompt
 /// and output. Other turns weren't saved, so the model doesn't remember them.
 async fn resumed(client: &Client, session: &str) -> Result<()> {
@@ -230,7 +244,7 @@ async fn resumed(client: &Client, session: &str) -> Result<()> {
     }
     ui::resumed(turns.len());
     for turn in turns {
-        ui::past_prompt(session, &turn.prompt);
+        ui::past_prompt(&turn.prompt);
         let mut ui = Ui::replay();
         for event in client.events(&turn.id).await? {
             ui.event(&event.data);
