@@ -529,3 +529,32 @@ async fn cancellation_before_execution_is_remembered_in_memory() {
     db.cancel(&run.id).unwrap();
     assert!(db.cancellation(&run.id).is_cancelled());
 }
+
+#[cfg(unix)]
+#[test]
+fn database_files_are_private_in_a_shared_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let mode = |suffix: &str| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        std::fs::metadata(file).unwrap().permissions().mode() & 0o777
+    };
+    // A database and a leftover sidecar from before permissions were enforced.
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let stale_shm = dir.path().join("state.sqlite3-shm");
+    std::fs::write(&stale_shm, b"").unwrap();
+    std::fs::set_permissions(&stale_shm, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let db = Database::open(&path).unwrap();
+    db.submit(None, "secret".into(), 60).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        assert_eq!(mode(suffix), 0o600, "state.sqlite3{suffix}");
+    }
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}

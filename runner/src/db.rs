@@ -89,6 +89,41 @@ fn append_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
     Ok(())
 }
 
+/// SQLite gives the WAL and SHM files the database file's mode, so a private
+/// database keeps its sidecars private regardless of the umask or directory.
+/// Sidecars left by an older version are tightened too.
+#[cfg(unix)]
+fn make_private(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = std::path::Path::new(&file);
+        match std::fs::metadata(file) {
+            Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("making {} private", file.display()))?;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", file.display())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 impl Database {
     /// Keep SQLite locks, busy waits and durable commits off the async runtime.
     pub async fn blocking<T: Send + 'static>(
@@ -131,6 +166,7 @@ impl Database {
     }
 
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        make_private(path)?;
         Self::from_connection(Connection::open(path)?)
     }
 

@@ -162,6 +162,10 @@ Fixtures are test components and should not be included in normal configs.
 - `tools/files/` — `read_file`: reads a text file with numbered lines, a
   page at a time for long ones, or lists a directory. It sees only its
   config's `dir`, read-only, mounted as `/`. See [Files](#files).
+- `tools/write-file/`, `tools/edit-file/` — `write_file` writes a whole
+  text file (creating parent directories), and `edit_file` replaces an
+  exact piece of one. Both need a `dir` with `dir_writable`. See
+  [Files](#files).
 - `tools/rustdocs/` — `rust_docs`: a crate's docs, or one item's, from
   docs.rs (doc.rust-lang.org for `std`, `core` and `alloc`), as text. See
   [Rust docs](#rust-docs).
@@ -243,7 +247,7 @@ Two rules keep a header from going further than intended:
 ```bash
 # Build the agent, providers, and tools
 cargo build -p agent -p anthropic -p openai -p weather -p sports -p search -p files \
-    -p rustdocs -p fs-store --release --target wasm32-wasip2
+    -p write-file -p edit-file -p rustdocs -p fs-store --release --target wasm32-wasip2
 
 # Build the python tool (a native program, so no --target)
 cargo run -p build-python --release
@@ -403,6 +407,38 @@ It never writes: the tool has no code that writes, and the directory is
 mounted read-only anyway, without `dir_writable`. The WASI sandbox keeps it
 inside `dir`, so `..` and symlinks can't reach anything outside. With no
 `dir` at all, every call fails, as there's nothing mounted to read.
+
+### Writing and editing
+
+Two more tools let the model change files, as separate components so
+granting reads never grants writes:
+
+```toml
+[[tools]]
+path = "target/wasm32-wasip2/release/write_file.wasm"
+dir = "${HOME}/notes"
+dir_writable = true
+
+[[tools]]
+path = "target/wasm32-wasip2/release/edit_file.wasm"
+dir = "${HOME}/notes"
+dir_writable = true
+```
+
+- `write_file` takes a `path` and the file's whole `content`, creates any
+  missing parent directories, and says whether it created the file or
+  overwrote one. It won't replace a directory.
+- `edit_file` replaces `old_string` with `new_string`. `old_string` must
+  match the file exactly and appear in it only once, unless `replace_all`
+  is set, so an edit can't land somewhere the model didn't mean; it's
+  refused otherwise, with a reason the model can act on. The reply gives
+  the line each replacement was made at.
+
+Without `dir_writable` the directory is mounted read-only and every write
+fails. Either tool can change or overwrite anything in `dir`, and nothing
+limits how much is written, so point them at a directory you'd be fine
+with the model rewriting, not your home directory. `..` and symlinks still
+can't reach outside it.
 
 ## Rust docs
 
