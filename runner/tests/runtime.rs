@@ -60,7 +60,7 @@ path = {}
 model = "fixture"
 allowed_hosts = ["fixture.invalid"]
 headers = {{ x-api-key = {{ value = "host-only-fixture-key", hosts = ["fixture.invalid"] }} }}
-[[tools]]
+[tools.fixture]
 path = {}
 dir = {}
 timeout_secs = {tool_timeout}
@@ -587,4 +587,72 @@ async fn interrupted_components_are_recreated_before_reuse() {
         "1"
     );
     assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "1");
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn configured_tool_names_control_model_definitions_dispatch_and_events() {
+    let fixture = Fixture::new();
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    let tool_block = config
+        .split_once("[tools.fixture]")
+        .unwrap()
+        .1
+        .split_once("[session_store]")
+        .unwrap()
+        .0;
+    let tool = tool_block.replace("fresh_per_call = true", "fresh_per_call = false");
+    let second_dir = fixture.dir.path().join("second-tool");
+    std::fs::create_dir(&second_dir).unwrap();
+    std::fs::write(second_dir.join("allowed.txt"), "second").unwrap();
+    let second = tool.replace(
+        &serde_json::to_string(fixture.dir.path().join("tools").to_str().unwrap()).unwrap(),
+        &serde_json::to_string(second_dir.to_str().unwrap()).unwrap(),
+    );
+    let config = config
+        .replace(
+            &format!("[tools.fixture]{tool_block}"),
+            &format!("[tools.counter_a]{tool}[tools.counter_b]{second}"),
+        )
+        .replace(
+            "tools = [\"fixture\"]",
+            "tools = [\"counter_a\", \"counter_b\"]",
+        );
+    std::fs::write(&fixture.config, config).unwrap();
+    let runtime = fixture.runtime().await;
+    // Both components still describe themselves as "fixture"; config keys win.
+    assert_eq!(
+        turn_output(&runtime, "aliases", "tool-names").await,
+        "counter_a,counter_b"
+    );
+    for (prompt, expected) in [
+        ("named-tool:counter_a:counter", "1"),
+        ("named-tool:counter_a:counter", "2"),
+        ("named-tool:counter_b:counter", "1"),
+        ("named-tool:counter_a:read-allowed", "allowed"),
+        ("named-tool:counter_b:read-allowed", "second"),
+    ] {
+        assert_eq!(turn_output(&runtime, "aliases", prompt).await, expected);
+    }
+    assert!(
+        turn_output(&runtime, "aliases", "tool:counter")
+            .await
+            .contains("no such tool: fixture")
+    );
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = events.clone();
+    runtime
+        .run_turn(
+            "default",
+            "aliases",
+            "named-tool:counter_b:counter",
+            Arc::new(move |event| captured.lock().unwrap().push(event)),
+        )
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    for kind in ["tool_started", "tool_finished"] {
+        let event = events.iter().find(|event| event["kind"] == kind).unwrap();
+        assert_eq!(event["name"], "counter_b");
+    }
 }

@@ -4,6 +4,7 @@ package local:agent@0.1.0;
 
 interface tool-api {
     record tool-description {
+        // Legacy component metadata; the host uses the configured tool table key.
         name: string,
         description: string,
         input-schema-json: string,

@@ -19,6 +19,7 @@ impl Guest for Tool {
                 Ok((CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).to_string())
             }
             "trap" => panic!("fixture tool trap"),
+            "read-allowed" => std::fs::read_to_string("/allowed.txt").map_err(|e| e.to_string()),
             "spin" => loop {
                 std::hint::black_box(42);
             },
