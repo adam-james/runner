@@ -268,6 +268,31 @@ async fn a_panicking_job_fails_alone_and_the_worker_keeps_running() {
     h.close().await;
 }
 
+#[tokio::test]
+async fn failed_terminal_writes_are_retried_and_release_the_session() {
+    let h = Harness::new(2).await;
+    // Fail every terminal-status write, including the worker's fallback.
+    let sqlite = rusqlite::Connection::open(h._dir.path().join("state.sqlite3")).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TRIGGER fail_finish BEFORE UPDATE OF status ON runs
+             WHEN NEW.status <> 'running' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let session = h.db.create_session(Some("stuck".into())).unwrap();
+    let broken = h.submit(Some(&session.id), "hello", 5).await;
+    let later = h.submit(Some(&session.id), "later", 5).await;
+    h.wait_status(&broken.id, "running").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.db.run(&broken.id).unwrap().unwrap().status, "running");
+    assert_eq!(h.db.run(&later.id).unwrap().unwrap().status, "queued");
+    sqlite.execute_batch("DROP TRIGGER fail_finish").unwrap();
+    let run = h.wait_status(&broken.id, "failed").await;
+    assert_eq!(run.error.as_deref(), Some("internal error"));
+    h.wait_status(&later.id, "completed").await;
+    h.close().await;
+}
+
 #[test]
 fn a_late_cancel_does_not_hide_a_completed_turn() {
     let dir = tempfile::tempdir().unwrap();

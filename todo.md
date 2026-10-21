@@ -1,9 +1,5 @@
 # TODO
 
-### From the PR #7 review (local agent service)
-
-- retry failed terminal-state writes - `contain` (runner/src/service.rs) forgets a finished job even if its fallback `db.finish` fails, leaving the run `running` and blocking later turns in that session until restart; retain pending terminal updates and retry them
-
 ## Long term
 
 - named agent definitions and explicit delegation (the local service now runs concurrent tasks)
