@@ -502,15 +502,18 @@ pub async fn worker(
     }
     let mut jobs = JoinSet::new();
     let mut runs = HashMap::new();
+    // Runs whose terminal status could not be written; each holds its session until it is.
+    let mut unfinished = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
             Some(completed) = jobs.join_next_with_id(), if !jobs.is_empty() => {
-                contain(&db, &mut runs, completed).await;
+                unfinished.extend(contain(&db, &mut runs, completed).await);
             }
             _ = tick.tick() => {
+                retry_unfinished(&db, &mut unfinished).await;
                 while jobs.len() < concurrency {
                     let run = match db.blocking(|db| db.claim()).await {
                         Ok(Some(run)) => run,
@@ -529,37 +532,52 @@ pub async fn worker(
         }
     }
     while let Some(completed) = jobs.join_next_with_id().await {
-        contain(&db, &mut runs, completed).await;
+        unfinished.extend(contain(&db, &mut runs, completed).await);
     }
+    // Anything still unfinished is marked interrupted by `recover` on the next start.
+    retry_unfinished(&db, &mut unfinished).await;
     Ok(())
 }
 
+async fn mark_failed(db: &Database, run: &str) -> Result<()> {
+    let run = run.to_string();
+    // No-op if execute already published a terminal status.
+    db.blocking(move |db| db.finish(&run, "failed", Some("internal error")))
+        .await
+}
+
+async fn retry_unfinished(db: &Database, unfinished: &mut Vec<String>) {
+    let mut remaining = Vec::new();
+    for run in unfinished.drain(..) {
+        if mark_failed(db, &run).await.is_err() {
+            remaining.push(run);
+        }
+    }
+    *unfinished = remaining;
+}
+
 /// One job's error or panic must not stop the daemon or abort its sibling runs.
+/// Returns the run if its terminal status still needs to be written.
 async fn contain(
     db: &Database,
     runs: &mut HashMap<tokio::task::Id, String>,
     completed: Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
-) {
+) -> Option<String> {
     let (id, error) = match completed {
         Ok((id, Ok(()))) => {
             runs.remove(&id);
-            return;
+            return None;
         }
         Ok((id, Err(error))) => (id, format!("{error:#}")),
         Err(error) => (error.id(), error.to_string()),
     };
-    let Some(run) = runs.remove(&id) else { return };
+    let run = runs.remove(&id)?;
     eprintln!("run {run} failed internally: {error}");
-    // No-op if execute already published a terminal status.
-    if let Err(error) = db
-        .blocking({
-            let run = run.clone();
-            move |db| db.finish(&run, "failed", Some("internal error"))
-        })
-        .await
-    {
-        eprintln!("could not mark run {run} failed: {error:#}");
+    if let Err(error) = mark_failed(db, &run).await {
+        eprintln!("could not mark run {run} failed, will retry: {error:#}");
+        return Some(run);
     }
+    None
 }
 
 pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<()> {
