@@ -170,3 +170,30 @@ so they are stored inside the private service directory.
 
 Remote serving, multi-user authorization, automatic retries, durable stack
 checkpoints, and distributed workers are outside this milestone.
+
+## Host activity logs
+
+`runner serve` writes timestamped, readable diagnostic logs to stderr. The default
+filter is `warn,host=info,runner=info`; set `RUST_LOG` to change it. Terminal output
+uses color. Client and chat commands do not install a logging subscriber.
+
+Run spans identify the run, session, and agent. Tool records identify the configured
+tool name and call ID, outcome, elapsed time, and result byte count. Provider and
+session-store spans identify the component. Outbound HTTP records identify the
+component, request ID, method, scheme, host, port, and allow/deny decision. Allowed
+requests report status and time to response headers, a transport-error category, or
+interruption before headers. They do not measure response body completion. API
+requests log method, matched route template, status, and time to headers, including
+authentication rejections; unmatched routes use a fixed label.
+
+These host-generated records omit prompts, tool arguments/results, raw errors,
+headers, bodies, URL paths, and query strings. Existing SQLite events still serve
+chat replay and may contain tool arguments and errors. Guest stdout/stderr is not
+an activity log. Extra dependency diagnostics enabled through `RUST_LOG` have their
+own content policies.
+
+A bounded background writer (4096 queued lines) keeps slow stderr off Tokio
+threads. Delivery is best effort: overload drops logs, and a crash can lose queued
+records. Normal shutdown retains the writer guard to drain queued output. These
+logs are diagnostic, not a durable audit trail; there are no log files, rotation,
+or log-viewing command.

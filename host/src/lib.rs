@@ -1,3 +1,5 @@
+mod activity;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
@@ -7,6 +9,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use wasmtime::component::{
@@ -342,6 +345,7 @@ struct InjectedHeader {
 /// allow-list, before it ever reaches the real network, and adds its
 /// configured headers (credentials) to the ones that are allowed.
 struct SandboxHooks {
+    component: String,
     allowed_hosts: HashSet<String>,
     headers: Vec<InjectedHeader>,
 }
@@ -375,6 +379,7 @@ impl SandboxHooks {
         }
 
         Ok(Self {
+            component: config.path.clone(),
             allowed_hosts,
             headers,
         })
@@ -393,10 +398,7 @@ impl SandboxHooks {
                 continue;
             }
             if !https {
-                eprintln!(
-                    "not sending header '{}' over plain http to {host}",
-                    header.name
-                );
+                tracing::warn!(component = ?self.component, host = ?host, "credential injection skipped for plain HTTP");
                 continue;
             }
             request
@@ -431,22 +433,46 @@ impl WasiHttpHooks for SandboxHooks {
             .host()
             .map(str::to_lowercase)
             .unwrap_or_default();
-        if !self.allowed_hosts.contains(&host) {
+        let allowed = self.allowed_hosts.contains(&host);
+        let span = tracing::info_span!("outbound_http", request_id = activity::next_id(),
+            component = ?self.component, method = ?request.method(),
+            scheme = ?request.uri().scheme_str().unwrap_or(""), host = ?host,
+            port = request.uri().port_u16());
+        let guard = activity::Activity::new(span.clone(), "http");
+        tracing::info!(parent: &span, allowed, "network policy");
+        if !allowed {
             drop(fut);
-            return Box::new(async move {
-                eprintln!("network access denied: {host}");
-                Err(wasmtime_wasi_http::Error::HttpRequestDenied)
-            });
+            return Box::new(
+                async move {
+                    guard.finish("denied", 0, None);
+                    Err(wasmtime_wasi_http::Error::HttpRequestDenied)
+                }
+                .instrument(span)
+                .with_current_subscriber(),
+            );
         }
         self.add_headers(&mut request, &host);
-        Box::new(async move {
-            use http_body_util::BodyExt;
-            let (res, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
-            let io: Box<
-                dyn std::future::Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send,
-            > = Box::new(io);
-            Ok((res.map(BodyExt::boxed_unsync), io))
-        })
+        let io_span = span.clone();
+        Box::new(
+            async move {
+                use http_body_util::BodyExt;
+                let (res, io) =
+                    match wasmtime_wasi_http::default_send_request(request, options).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            guard.finish("transport_error", 0, None);
+                            return Err(error);
+                        }
+                    };
+                guard.finish("headers_received", 0, Some(res.status().as_u16()));
+                let io: Box<
+                    dyn std::future::Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send,
+                > = Box::new(io.instrument(io_span).with_current_subscriber());
+                Ok((res.map(BodyExt::boxed_unsync), io))
+            }
+            .instrument(span)
+            .with_current_subscriber(),
+        )
     }
 }
 
@@ -580,6 +606,7 @@ impl ToolHandle {
             .map_err(cap_tool_output)
     }
 
+    #[tracing::instrument(name = "component", skip_all, fields(component = ?self.config.path, kind = "tool"))]
     async fn call_uncapped(&mut self, input: &str) -> Result<String, String> {
         if self.config.fresh_per_call || !self.healthy {
             let mut store = sandbox_store(&self.engine, &self.config).map_err(|e| e.to_string())?;
@@ -784,10 +811,23 @@ impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
         (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
         let start = std::time::Instant::now();
-        let result = match self.components.tools.get_mut(&name) {
-            Some(tool) => tool.call(&input).await,
-            None => Err(format!("no such tool: {name}")),
-        };
+        let span = tracing::info_span!("tool", call_id = activity::next_id(),
+            tool = ?activity::bounded_name(&name),
+            component = ?self.components.tools.get(&name).map(|tool| &tool.config.path));
+        let guard = activity::Activity::new(span.clone(), "tool");
+        let result = async {
+            match self.components.tools.get_mut(&name) {
+                Some(tool) => tool.call(&input).await,
+                None => Err(format!("no such tool: {name}")),
+            }
+        }
+        .instrument(span)
+        .await;
+        guard.finish(
+            if result.is_ok() { "ok" } else { "error" },
+            result.as_ref().map_or(0, String::len),
+            None,
+        );
         // The error is what the model sees as the tool result, so it is no more private than the session.
         (self.events)(
             serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok(),
@@ -799,7 +839,9 @@ impl chat_api::Host for HostState {
 }
 
 impl session::Host for HostState {
+    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "load", component = ?self.components.session.store.data().hooks.component))]
     async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
+        let guard = activity::Activity::new(tracing::Span::current(), "session_store");
         let handle = &mut self.components.session;
         handle.healthy = false;
         let result = handle
@@ -808,10 +850,16 @@ impl session::Host for HostState {
             .call_load(&mut handle.store, &handle.id)
             .await;
         handle.healthy = result.is_ok();
-        result.map_err(|trap| format!("session store trapped: {trap}"))?
+        let result = result
+            .map_err(|trap| format!("session store trapped: {trap}"))
+            .and_then(|result| result);
+        guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
+        result
     }
 
+    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "save", component = ?self.components.session.store.data().hooks.component))]
     async fn save(&mut self, messages: Vec<Message>) -> Result<(), String> {
+        let guard = activity::Activity::new(tracing::Span::current(), "session_store");
         let handle = &mut self.components.session;
         handle.healthy = false;
         let result = handle
@@ -820,7 +868,11 @@ impl session::Host for HostState {
             .call_save(&mut handle.store, &handle.id, &messages)
             .await;
         handle.healthy = result.is_ok();
-        result.map_err(|trap| format!("session store trapped: {trap}"))??;
+        let result = result
+            .map_err(|trap| format!("session store trapped: {trap}"))
+            .and_then(|result| result);
+        guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
+        result?;
         // Report the agent's successful save before returning control to the guest.
         // Emitting from guest code after save would leave a cancellation window.
         (self.events)(serde_json::json!({"kind":"turn_saved"}));
@@ -850,10 +902,14 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
 
         let (text_tx, text_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let response = run_provider(&provider, tools, request, text_tx).await;
-            let _ = response_tx.send(response);
-        });
+        let task = tokio::spawn(
+            async move {
+                let response = run_provider(&provider, tools, request, text_tx).await;
+                let _ = response_tx.send(response);
+            }
+            .in_current_span()
+            .with_current_subscriber(),
+        );
 
         accessor.with(|mut store| store.get().provider_tasks.0.push(task.abort_handle()));
         accessor.with(|mut store| ChatStream {
@@ -871,6 +927,7 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
 
 /// Calls the provider's `chat` and forwards its reply: text pieces into
 /// `text_tx` as they arrive, then the whole response as the return value.
+#[tracing::instrument(name = "provider", skip_all, fields(component = tracing::field::Empty))]
 async fn run_provider(
     provider: &Mutex<ProviderHandle>,
     tools: Vec<ToolDefinition>,
@@ -878,6 +935,7 @@ async fn run_provider(
     text_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ChatResponse, ChatError> {
     let mut provider = provider.lock().await;
+    tracing::Span::current().record("component", tracing::field::debug(&provider.config.path));
     if !provider.healthy {
         let mut store = sandbox_store(&provider.engine, &provider.config)
             .map_err(|e| ChatError::Internal(e.to_string()))?;
@@ -889,6 +947,7 @@ async fn run_provider(
         provider.store = store;
         provider.instance = instance;
     }
+    let guard = activity::Activity::new(tracing::Span::current(), "provider");
     provider.healthy = false;
     let ProviderHandle {
         model,
@@ -914,7 +973,7 @@ async fn run_provider(
         })
         .await;
 
-    match outcome {
+    let result = match outcome {
         Ok(Ok(Ok(response))) => {
             *healthy = true;
             response
@@ -925,7 +984,9 @@ async fn run_provider(
         Ok(Err(trap)) | Err(trap) => {
             Err(ChatError::Internal(format!("provider trapped: {trap:?}")))
         }
-    }
+    };
+    guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
+    result
 }
 
 /// Feeds a stream returned to a guest from a channel.
@@ -1117,6 +1178,7 @@ impl Runtime {
         store.set_epoch_deadline(1);
     }
 
+    #[tracing::instrument(name = "turn", skip_all, fields(agent = ?agent, session = ?session_id))]
     pub async fn run_turn(
         &self,
         agent: &str,
@@ -1318,6 +1380,96 @@ mod tests {
     fn hooks(toml: &str) -> Result<SandboxHooks> {
         let config: ComponentConfig = toml::from_str(toml).unwrap();
         SandboxHooks::new(&config)
+    }
+
+    #[tokio::test]
+    async fn outbound_http_logs_policy_headers_errors_and_interruption_without_payloads() {
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        let capture = activity::tests::Capture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.subscriber());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let count = socket.read(&mut bytes).unwrap();
+            assert!(count > 0);
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let mut hooks = hooks(
+            r#"path = "test-component.wasm"
+            allowed_hosts = ["127.0.0.1"]"#,
+        )
+        .unwrap();
+        let request = |url: String| {
+            http::Request::get(url)
+                .header("authorization", "HEADER_SECRET")
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap()
+        };
+        let call = |hooks: &mut SandboxHooks, url| {
+            hooks.send_request(request(url), None, Box::new(async { Ok(()) }))
+        };
+        let (response, io) = Box::into_pin(call(
+            &mut hooks,
+            format!("http://127.0.0.1:{port}/PATH_SECRET?QUERY_SECRET"),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 204);
+        drop(io);
+        server.join().unwrap();
+        assert!(
+            Box::into_pin(call(
+                &mut hooks,
+                "http://denied.invalid/PATH_SECRET?QUERY_SECRET".into()
+            ))
+            .await
+            .is_err()
+        );
+        // A reserved then closed local port gives a deterministic transport failure.
+        assert!(
+            Box::into_pin(call(
+                &mut hooks,
+                format!("http://127.0.0.1:{port}/ERROR_SECRET")
+            ))
+            .await
+            .is_err()
+        );
+        // Even a request dropped before its first poll records interruption.
+        drop(call(
+            &mut hooks,
+            format!("http://127.0.0.1:{port}/DROP_SECRET"),
+        ));
+        let logs = capture.text();
+        for expected in [
+            "allowed=true",
+            "allowed=false",
+            "headers_received",
+            "denied",
+            "transport_error",
+            "interrupted",
+            "status=204",
+            "test-component.wasm",
+        ] {
+            assert!(logs.contains(expected), "{expected}: {logs}");
+        }
+        for secret in [
+            "PATH_SECRET",
+            "QUERY_SECRET",
+            "HEADER_SECRET",
+            "ERROR_SECRET",
+            "DROP_SECRET",
+        ] {
+            assert!(!logs.contains(secret), "{logs}");
+        }
     }
 
     /// The headers `hooks` would add to a GET of `url`.
