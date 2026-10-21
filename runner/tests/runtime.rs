@@ -295,7 +295,7 @@ async fn connect(data: &std::path::Path) -> Client {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Ok(client) = Client::connect(data)
-                && client.runs().await.is_ok()
+                && client.runs(None).await.is_ok()
             {
                 break client;
             }
@@ -359,6 +359,134 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
     );
     client.watch(&queued.id, 0, false).await.unwrap();
     assert_eq!(client.run(&id).await.unwrap().status, "completed");
+}
+
+/// `runner chat` with `input` piped in, so its output is plain text.
+fn chat(data: &std::path::Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(data)
+        .arg("chat")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn reconnecting_to_a_chat_replays_its_saved_turns() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    connect(&data).await;
+    let first = chat(
+        &data,
+        &["--session", "trip"],
+        "hello\ntool:probe\nfail\nagain\n",
+    );
+    assert!(first.contains("turn 1: hello"), "{first}");
+    // Ending a chat says how to resume it, with the whole session ID.
+    assert!(
+        first.ends_with("\nresume with: runner chat --session trip\n"),
+        "{first}"
+    );
+    let resumed = chat(&data, &["--session", "trip"], "");
+    let history = resumed
+        .split_once("resumed session · 3 earlier turns\n")
+        .unwrap_or_else(|| panic!("{resumed}"))
+        .1;
+    // Every saved turn in order, with its prompt; no live timings.
+    let hello = history.find("> hello\nturn 1: hello").unwrap();
+    let probe = history.find("> tool:probe\n").unwrap();
+    let tool = history.find("⚙ fixture(probe) ✓").unwrap();
+    let again = history.find("> again\nturn 3: again").unwrap();
+    assert!(hello < probe && probe < tool && tool < again, "{history}");
+    // The failed turn was never saved, so the model doesn't remember it either.
+    assert!(!history.contains("fail"), "{history}");
+    assert!(!history.contains("Thought for"), "{history}");
+    // A generated session ID is printed whole on exit too.
+    let fresh = chat(&data, &[], "hi\n");
+    let id = fresh
+        .split(" · session ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(id.len(), 36, "{fresh}");
+    assert!(
+        fresh.ends_with(&format!("resume with: runner chat --session {id}\n")),
+        "{fresh}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn ctrl_c_at_the_prompt_ends_the_chat() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    connect(&data).await;
+    // Stdin stays open with nothing typed, like a terminal waiting at the prompt.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["chat", "--session", "interrupted"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take();
+    // Wait for the prompt, so the chat is reading stdin and handling Ctrl-C.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("> ") {
+        let mut byte = [0];
+        std::io::Read::read_exact(&mut stdout, &mut byte).unwrap();
+        seen.push(byte[0]);
+    }
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exited = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        child.kill().unwrap();
+        None
+    })
+    .await
+    .unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+    assert!(
+        exited.is_some(),
+        "chat didn't exit within 5s of Ctrl-C: {rest}"
+    );
+    assert!(
+        rest.contains("resume with: runner chat --session interrupted"),
+        "{rest}"
+    );
 }
 
 #[tokio::test]

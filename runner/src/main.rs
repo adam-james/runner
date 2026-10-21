@@ -2,8 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use runner::{client::Client, service, ui};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use runner::{
+    client::Client,
+    service,
+    ui::{self, Ui},
+};
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(about = "Run sandboxed agents through a local service")]
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
             deadline_secs,
         } => {
             let run = client.submit(session, agent, prompt, deadline_secs).await?;
-            eprintln!("session: {}", run.session_id);
+            ui::session(&run.session_id);
             if detach {
                 println!("{}", run.id);
             } else {
@@ -150,36 +154,16 @@ async fn main() -> Result<()> {
             if existing {
                 resumed(&client, &session).await?;
             }
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                ui::prompt();
-                let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
-                ui::end_input();
-                let Some(line) = line else {
-                    break;
-                };
-                let prompt = line.trim();
-                if matches!(prompt, "exit" | "quit") {
-                    break;
-                }
-                if prompt.is_empty() {
-                    continue;
-                }
-                let run = client
-                    .submit(
-                        Some(session.clone()),
-                        agent.clone(),
-                        prompt.to_string(),
-                        deadline_secs,
-                    )
-                    .await?;
-                if let Err(error) = attach(&client, &run.id, 0, false).await {
-                    ui::error(&error.to_string());
-                }
-            }
+            let result = chat(&client, &session, agent, deadline_secs).await;
+            // However chat ends, even on an error, say how to come back to it.
+            ui::goodbye(&session);
+            result?;
         }
         Command::Runs { command } => match command {
-            Runs::List => println!("{}", serde_json::to_string_pretty(&client.runs().await?)?),
+            Runs::List => println!(
+                "{}",
+                serde_json::to_string_pretty(&client.runs(None).await?)?
+            ),
             Runs::Inspect { id } => {
                 println!("{}", serde_json::to_string_pretty(&client.run(&id).await?)?)
             }
@@ -187,7 +171,10 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
-            Runs::Watch { id, after, json } => attach(&client, &id, after, json).await?,
+            Runs::Watch { id, after, json } => {
+                ui::session(&client.run(&id).await?.session_id);
+                attach(&client, &id, after, json).await?
+            }
         },
         Command::Agents {
             command: Agents::List,
@@ -206,22 +193,82 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Says where a picked-up session left off: its completed turns and last reply.
+/// Takes prompts until the user leaves, running each as a turn in `session`.
+async fn chat(
+    client: &Client,
+    session: &str,
+    agent: Option<String>,
+    deadline_secs: u64,
+) -> Result<()> {
+    let mut lines = stdin_lines();
+    loop {
+        ui::prompt();
+        let line =
+            tokio::select! { line = lines.recv() => line, _ = tokio::signal::ctrl_c() => break };
+        ui::end_input();
+        let Some(line) = line else {
+            break;
+        };
+        let line = line?;
+        let prompt = line.trim();
+        if matches!(prompt, "exit" | "quit") {
+            break;
+        }
+        if prompt.is_empty() {
+            continue;
+        }
+        let run = client
+            .submit(
+                Some(session.to_string()),
+                agent.clone(),
+                prompt.to_string(),
+                deadline_secs,
+            )
+            .await?;
+        if let Err(error) = attach(client, &run.id, 0, false).await {
+            ui::error(&error.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Stdin's lines, read on a thread of their own. Tokio's stdin reads on its
+/// blocking pool, which the runtime waits for on exit, so leaving with Ctrl-C
+/// while a read was pending hung until the user pressed Enter. A plain thread
+/// doesn't hold up the process's exit.
+fn stdin_lines() -> mpsc::UnboundedReceiver<std::io::Result<String>> {
+    let (send, receive) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    receive
+}
+
+/// Replays a picked-up session's conversation: each completed turn's prompt
+/// and output. Other turns weren't saved, so the model doesn't remember them.
 async fn resumed(client: &Client, session: &str) -> Result<()> {
     let turns: Vec<_> = client
-        .runs()
+        .runs(Some(session))
         .await?
         .into_iter()
-        .filter(|run| run.session_id == session && run.status == "completed")
+        .filter(|run| run.status == "completed")
         .collect();
-    let Some(last) = turns.last() else {
+    if turns.is_empty() {
         return Ok(());
-    };
-    let reply = client.reply(&last.id).await?;
-    ui::resumed(
-        turns.len(),
-        (!reply.trim().is_empty()).then_some(reply.as_str()),
-    );
+    }
+    ui::resumed(turns.len());
+    for turn in turns {
+        ui::past_prompt(&turn.prompt);
+        let mut ui = Ui::replay();
+        for event in client.events(&turn.id).await? {
+            ui.event(&event.data);
+        }
+        ui.finish();
+    }
     Ok(())
 }
 

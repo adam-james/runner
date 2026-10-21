@@ -228,6 +228,21 @@ async fn runs_execute_the_agent_definition_they_name() {
         .await
         .unwrap();
     assert_eq!(run.agent, "researcher");
+    let other = h.submit(None, "which agent", 5).await;
+    let listed: Vec<Run> = h
+        .client
+        .get(format!("{}/v1/runs?session_id={}", h.url, other.session_id))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|r| &r.id).collect::<Vec<_>>(),
+        [&other.id]
+    );
     // Omitting the agent picks `default`, and a session isn't tied to one.
     let followup = h.submit(Some(&run.session_id), "which agent", 5).await;
     assert_eq!(followup.agent, "default");
@@ -408,7 +423,18 @@ async fn authenticated_api_rejects_invalid_requests() {
             StatusCode::BAD_REQUEST
         );
     }
-    assert!(h.db.runs().unwrap().is_empty());
+    assert_eq!(
+        h.client
+            .get(format!("{}/v1/runs?session={}", h.url, "x"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST,
+        "unknown filters are rejected"
+    );
+    assert!(h.db.runs(None).unwrap().is_empty());
     assert!(
         h.db.sessions().unwrap().is_empty(),
         "invalid submissions cannot create orphan sessions"

@@ -40,6 +40,9 @@ struct Thinking {
 /// Renders one run's events the way the old in-guest REPL did.
 pub struct Ui {
     stdout_tty: bool,
+    /// Rendering a run as it happens, rather than replaying a finished one:
+    /// only then are there waits to show or time.
+    live: bool,
     thinking: Option<Thinking>,
     /// Model text is on the current line and needs a newline before anything else.
     in_text: bool,
@@ -50,14 +53,25 @@ pub struct Ui {
 impl Ui {
     /// Starts with "Thinking…" shown, since the run was just submitted.
     pub fn start() -> Self {
-        let mut ui = Self {
+        let mut ui = Self::new(true);
+        ui.start_thinking(false);
+        ui
+    }
+
+    /// For showing a finished run's events, with no "Thinking…" indicators
+    /// or timings, which replayed events can't reproduce.
+    pub fn replay() -> Self {
+        Self::new(false)
+    }
+
+    fn new(live: bool) -> Self {
+        Self {
             stdout_tty: io::stdout().is_terminal(),
+            live,
             thinking: None,
             in_text: false,
             tool: None,
-        };
-        ui.start_thinking(false);
-        ui
+        }
     }
 
     pub fn event(&mut self, data: &Value) {
@@ -82,7 +96,7 @@ impl Ui {
                 self.end_text();
                 let call = tool_call(name(data), data["input"].as_str().unwrap_or_default());
                 print!("{}", style(self.stdout_tty, DIM, &call));
-                if self.stdout_tty {
+                if self.stdout_tty && self.live {
                     print!("{}", style(true, DIM, " …"));
                 }
                 flush();
@@ -142,6 +156,9 @@ impl Ui {
 
     /// Shows `Thinking… 1.2s`, counting up, while a reply is on its way.
     fn start_thinking(&mut self, after_tool: bool) {
+        if !self.live {
+            return;
+        }
         let done = Arc::new(Mutex::new(false));
         let start = Instant::now();
         let redraw = self.stdout_tty.then(|| {
@@ -209,8 +226,8 @@ pub fn banner(session: &str) {
     );
 }
 
-/// Says a saved conversation was picked up, and where it left off.
-pub fn resumed(turns: usize, last_reply: Option<&str>) {
+/// Says a saved conversation was picked up; its turns are replayed after.
+pub fn resumed(turns: usize) {
     let tty = io::stdout().is_terminal();
     println!(
         "{}",
@@ -223,13 +240,6 @@ pub fn resumed(turns: usize, last_reply: Option<&str>) {
             )
         )
     );
-    if let Some(reply) = last_reply {
-        let reply = reply.split_whitespace().collect::<Vec<_>>().join(" ");
-        println!(
-            "{}",
-            style(tty, DIM, &format!("last reply: {}", truncate(&reply, 80)))
-        );
-    }
 }
 
 /// Shows the prompt. In a terminal, what the user types after it is bold,
@@ -242,6 +252,38 @@ pub fn prompt() {
         print!("> ");
     }
     flush();
+}
+
+/// An earlier turn's prompt, shown as it looked when it was typed.
+pub fn past_prompt(text: &str) {
+    prompt();
+    println!("{text}");
+    end_input();
+}
+
+/// Says how to pick the conversation back up, as `chat` ends.
+pub fn goodbye(session: &str) {
+    end_input();
+    let tty = io::stdout().is_terminal();
+    println!();
+    println!(
+        "{}",
+        style(
+            tty,
+            DIM,
+            &format!("resume with: runner chat --session {session}")
+        )
+    );
+}
+
+/// The session a `run` or `runs watch` belongs to. On stderr, so stdout
+/// stays the run's output (or its ID, with `--detach`).
+pub fn session(session: &str) {
+    if io::stderr().is_terminal() {
+        eprintln!("{DIM}session {session}{RESET}");
+    } else {
+        eprintln!("session: {session}");
+    }
 }
 
 pub fn end_input() {
