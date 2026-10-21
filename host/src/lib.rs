@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use wasmtime::component::{
@@ -17,7 +17,6 @@ use wasmtime::{
     Cache, Config, Engine, Error, Result, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     bail,
 };
-use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
@@ -81,7 +80,7 @@ struct RunnerConfig {
     provider: ProviderConfig,
     #[serde(default)]
     tools: Vec<ComponentConfig>,
-    /// Where sessions are saved. Without one, nothing is.
+    /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
 }
 
@@ -163,10 +162,6 @@ fn expand_env(template: &str) -> Result<String> {
 
 /// How often the engine's epoch advances; the precision of `timeout_secs`.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
-
-/// The epoch deadline of a store that has none: never reached, but small
-/// enough not to overflow when added to the current epoch.
-const NO_DEADLINE: u64 = u64::MAX / 2;
 
 /// The most of a tool's result (or error) passed on to the model, in bytes.
 /// Enforced here rather than in the tool, so a tool running untrusted code
@@ -534,8 +529,6 @@ struct SessionHandle {
     id: String,
     instance: session_store_guest::SessionStoreGuest,
     store: Store<SandboxState>,
-    /// Whether anything has been saved yet this run.
-    saved: bool,
 }
 
 async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Result<SessionHandle> {
@@ -547,7 +540,6 @@ async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Resu
         id: String::new(),
         instance,
         store,
-        saved: false,
     })
 }
 
@@ -569,29 +561,6 @@ fn validate_session_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A fresh session's id: when it started, in UTC, e.g. `20261017-081500`.
-fn new_session_id(now: SystemTime) -> String {
-    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let (days, time) = (secs / 86_400, secs % 86_400);
-    // Days since 1970-01-01 to a civil date, from Howard Hinnant's
-    // `civil_from_days`.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60
-    )
-}
-
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
@@ -600,8 +569,8 @@ struct HostState {
     provider: Arc<Mutex<ProviderHandle>>,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
-    session: Option<SessionHandle>,
-    events: Option<EventSink>,
+    session: SessionHandle,
+    events: EventSink,
     provider_tasks: Vec<tokio::task::AbortHandle>,
 }
 
@@ -619,17 +588,15 @@ impl Drop for HostState {
 
 impl run_events::Host for HostState {
     fn emit(&mut self, value: run_events::Event) {
-        if let Some(events) = &self.events {
-            let value = match value {
-                run_events::Event::Text(text) => serde_json::json!({"kind":"text", "text":text}),
-                run_events::Event::Usage(u) => {
-                    serde_json::json!({"kind":"usage", "reasoning_tokens":u.reasoning_tokens,
-                    "max_tokens":u.max_tokens, "prompt_tokens":u.prompt_tokens,
-                    "cache_read_tokens":u.cache_read_tokens, "cache_creation_tokens":u.cache_creation_tokens})
-                }
-            };
-            events(value);
-        }
+        let value = match value {
+            run_events::Event::Text(text) => serde_json::json!({"kind":"text", "text":text}),
+            run_events::Event::Usage(u) => {
+                serde_json::json!({"kind":"usage", "reasoning_tokens":u.reasoning_tokens,
+                "max_tokens":u.max_tokens, "prompt_tokens":u.prompt_tokens,
+                "cache_read_tokens":u.cache_read_tokens, "cache_creation_tokens":u.cache_creation_tokens})
+            }
+        };
+        (self.events)(value);
     }
 }
 
@@ -644,25 +611,21 @@ impl WasiView for HostState {
 
 impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
-        if let Some(events) = &self.events {
-            events(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
-        }
+        (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
         let result = match self.tools.get_mut(&name) {
             Some(tool) => tool.call(&input).await,
             None => Err(format!("no such tool: {name}")),
         };
-        if let Some(events) = &self.events {
-            events(serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok()}));
-        }
+        (self.events)(
+            serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok()}),
+        );
         result
     }
 }
 
 impl session::Host for HostState {
     async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
-        let Some(handle) = &mut self.session else {
-            return Ok(None);
-        };
+        let handle = &mut self.session;
         handle
             .instance
             .local_agent_session_store()
@@ -672,16 +635,13 @@ impl session::Host for HostState {
     }
 
     async fn save(&mut self, messages: Vec<Message>) -> Result<(), String> {
-        let Some(handle) = &mut self.session else {
-            return Ok(());
-        };
+        let handle = &mut self.session;
         handle
             .instance
             .local_agent_session_store()
             .call_save(&mut handle.store, &handle.id, &messages)
             .await
             .map_err(|trap| format!("session store trapped: {trap}"))??;
-        handle.saved = true;
         Ok(())
     }
 }
@@ -984,7 +944,6 @@ impl Runtime {
         session.id = session_id.to_string();
         let mut linker = Linker::<HostState>::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
         chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
         session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
         run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
@@ -1001,8 +960,8 @@ impl Runtime {
                 provider: Arc::new(Mutex::new(provider)),
                 tools,
                 tool_definitions: definitions,
-                session: Some(session),
-                events: Some(events),
+                session,
+                events,
                 provider_tasks: Vec::new(),
             },
         );
@@ -1053,141 +1012,6 @@ impl Drop for Diagnostics {
 
 pub fn check_session_id(id: &str) -> Result<()> {
     validate_session_id(id)
-}
-
-const USAGE: &str = "usage: host [CONFIG] [--session ID | --sessions]";
-
-struct Args {
-    config: String,
-    /// Resume (or start) this session rather than a fresh one.
-    session: Option<String>,
-    /// List saved sessions instead of running the agent.
-    list_sessions: bool,
-}
-
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args> {
-    let mut config = None;
-    let mut session = None;
-    let mut list_sessions = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--session" => {
-                let id = args
-                    .next()
-                    .ok_or_else(|| Error::msg(format!("--session needs an id\n{USAGE}")))?;
-                validate_session_id(&id)?;
-                session = Some(id);
-            }
-            "--sessions" => list_sessions = true,
-            flag if flag.starts_with("--") => bail!("unknown option {flag}\n{USAGE}"),
-            _ if config.is_none() => config = Some(arg),
-            _ => bail!("unexpected argument {arg}\n{USAGE}"),
-        }
-    }
-    if session.is_some() && list_sessions {
-        bail!("--session and --sessions can't be used together\n{USAGE}");
-    }
-    Ok(Args {
-        config: config.unwrap_or_else(|| "runner.toml".to_string()),
-        session,
-        list_sessions,
-    })
-}
-
-pub async fn direct_main() -> Result<()> {
-    let args = parse_args(env::args().skip(1))?;
-    let config = load_config(&args.config)?;
-
-    let runtime = Runtime::from_config(config.clone())?;
-    let engine = &runtime.engine;
-
-    let mut session = match &config.session_store {
-        Some(store_config) => Some(load_session_store(&runtime, store_config).await?),
-        None if args.session.is_some() || args.list_sessions => {
-            bail!("sessions need a [session_store] in {}", args.config)
-        }
-        None => None,
-    };
-
-    if args.list_sessions {
-        let handle = session.as_mut().expect("checked above");
-        let ids = handle
-            .instance
-            .local_agent_session_store()
-            .call_ids(&mut handle.store)
-            .await?
-            .map_err(Error::msg)?;
-        for id in ids {
-            println!("{id}");
-        }
-        return Ok(());
-    }
-    if let Some(handle) = &mut session {
-        handle.id = args
-            .session
-            .clone()
-            .unwrap_or_else(|| new_session_id(SystemTime::now()));
-    }
-
-    let provider = load_provider(&runtime, &config.provider).await?;
-    let tools = load_tools(&runtime, &config.tools).await?;
-    let mut tool_definitions: Vec<_> = tools
-        .values()
-        .map(|t| ToolDefinition {
-            name: t.description.name.clone(),
-            description: t.description.description.clone(),
-            input_schema_json: t.description.input_schema_json.clone(),
-        })
-        .collect();
-    sort_tool_definitions(&mut tool_definitions);
-
-    let component = runtime.component(&config.agent)?;
-
-    let mut linker = Linker::<HostState>::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    // Only the 0.3 clocks, for the async timer behind the agent's
-    // "Thinking…" indicator; nothing else of WASI 0.3 is needed.
-    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
-    chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-    session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-    run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-
-    let wasi = WasiCtx::builder()
-        .inherit_stdio()
-        // Deliberately NOT .inherit_env() -- the guest gets zero ambient
-        // env vars, so it has no path to the API key.
-        .build();
-
-    let mut store = Store::new(
-        engine,
-        HostState {
-            wasi,
-            table: ResourceTable::new(),
-            provider: Arc::new(Mutex::new(provider)),
-            tool_definitions,
-            tools,
-            session,
-            events: None,
-            provider_tasks: Vec::new(),
-        },
-    );
-    store.set_epoch_deadline(NO_DEADLINE);
-
-    // The agent exports the async WASI 0.3 `wasi:cli/run`, which is run
-    // inside the store's event loop so its streaming `chat` calls work.
-    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
-    let result = store
-        .run_concurrent(async |accessor| command.wasi_cli_run().call_run(accessor).await)
-        .await??;
-    if let Some(handle) = &store.data().session
-        && handle.saved
-    {
-        eprintln!("session saved; resume with --session {}", handle.id);
-    }
-    if result.is_err() {
-        bail!("guest exited with a non-zero result");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1281,15 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_utc_start_time() {
-        let t = |secs| new_session_id(UNIX_EPOCH + std::time::Duration::from_secs(secs));
-        assert_eq!(t(0), "19700101-000000");
-        // 2024 is a leap year.
-        assert_eq!(t(1_709_208_000), "20240229-120000");
-        assert_eq!(t(1_792_224_000 + 29_745), "20261017-161545");
-    }
-
-    #[test]
     fn session_ids_are_validated() {
         assert!(validate_session_id("20261017-081500").is_ok());
         assert!(validate_session_id("trip_plans.v2").is_ok());
@@ -1303,34 +1118,6 @@ mod tests {
         ] {
             assert!(validate_session_id(bad).is_err(), "{bad:?} was accepted");
         }
-    }
-
-    fn args(list: &[&str]) -> Result<Args> {
-        parse_args(list.iter().map(|s| s.to_string()))
-    }
-
-    #[test]
-    fn args_parse() {
-        let a = args(&[]).unwrap();
-        assert_eq!(
-            (a.config.as_str(), a.session, a.list_sessions),
-            ("runner.toml", None, false)
-        );
-        let a = args(&["my.toml", "--session", "work"]).unwrap();
-        assert_eq!(
-            (a.config.as_str(), a.session.as_deref()),
-            ("my.toml", Some("work"))
-        );
-        assert!(args(&["--sessions"]).unwrap().list_sessions);
-    }
-
-    #[test]
-    fn bad_args_are_rejected() {
-        assert!(args(&["--session"]).is_err());
-        assert!(args(&["--session", "../x"]).is_err());
-        assert!(args(&["--session", "a", "--sessions"]).is_err());
-        assert!(args(&["--verbose"]).is_err());
-        assert!(args(&["a.toml", "b.toml"]).is_err());
     }
 
     #[test]

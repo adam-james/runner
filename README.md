@@ -30,7 +30,8 @@ synchronous WASI 0.2 components. Everything still builds for the
 
 Runner can also run as a persistent local daemon. The daemon owns execution;
 closing a client leaves its runs going. CLI and future desktop clients use the
-same authenticated local API. The original direct host REPL remains available.
+same authenticated local API. The agent emits structured events; the CLI owns
+terminal input and rendering.
 
 Build the components as described below, then install the CLI:
 
@@ -41,7 +42,7 @@ runner serve --config runner.toml
 
 Keep `serve` running in a separate terminal (or under your system's service
 manager). Daemon mode requires a `[session_store]`. Configuration paths are
-relative to the daemon's working directory, as with the direct host. Provider
+relative to the daemon's working directory. Provider
 credentials come from the daemon's environment; clients do not need them.
 
 ```bash
@@ -135,16 +136,15 @@ Fixtures are test components and should not be included in normal configs.
   this run is); a session store exports `session-store` (`load`/`save` by
   id, plus `ids()`), and the host passes the agent's calls through to it.
 - `runner/` — local daemon, durable run queue, HTTP/SSE API, and CLI client.
-- `host/` — runtime library and original native binary. Loads the agent, the provider, and every tool
+- `host/` — runtime library. Loads the agent, the provider, and every tool
   from a TOML config file, restricts each provider/tool's outbound
   `wasi:http` to its own allow-list, injects configured headers
   (credentials) into those requests, and runs the show under Wasmtime. It
   has no provider-specific code.
-- `agent/` — the guest. A REPL: reads a line, calls `chat` and prints its
-  text as it streams in, and for as long as the response asks for tools,
-  calls them via `call-tool` and feeds the results back. Its entry point is
-  the async WASI 0.3 `wasi:cli/run` export, which streaming requires.
-  Loads its session at startup and saves it after every turn.
+- `agent/` — the guest. Exports async `agent-api.run-turn`, loads the session,
+  calls `chat`, and emits typed text and usage events. When the model requests
+  tools, it calls them via `call-tool` and feeds the results back. Saves the
+  session after a completed turn. All terminal interaction lives in the CLI.
 - `providers/anthropic/`, `providers/openai/` — the provider components,
   for the Messages API and Chat Completions API respectively. Each sends a
   streaming request over WASI 0.3's `wasi:http/client`, forwards text
@@ -190,7 +190,8 @@ rustup target add wasm32-wasip2
 
 ## Configuration
 
-The host takes a TOML config file as its argument (default `runner.toml`).
+The daemon takes a TOML config file with `runner serve --config PATH`
+(default `runner.toml`).
 
 ```toml
 agent = "target/wasm32-wasip2/release/agent.wasm"
@@ -248,13 +249,20 @@ cargo build -p agent -p anthropic -p openai -p weather -p sports -p search -p fi
 # Build the python tool (a native program, so no --target)
 cargo run -p build-python --release
 
-# Run the host against a config (see runner.toml for a working example)
+# Start the daemon against a config (see runner.toml for a working example)
 export ANTHROPIC_API_KEY=sk-ant-...
 export TAVILY_API_KEY=tvly-...   # for the search tool
-cargo run -p host --release -- runner.toml
+cargo run -p runner --release -- serve --config runner.toml
 ```
 
-Type `exit` or `quit`, or send EOF (Ctrl-D), to end the session.
+In another terminal, start an interactive client:
+
+```bash
+cargo run -p runner --release -- chat
+```
+
+Type `exit` or `quit`, or send EOF (Ctrl-D), to end the client session.
+The daemon continues running.
 
 Note: if `target/` lives on a filesystem that doesn't support `mmap` for
 rlib archiving (e.g. a virtiofs-mounted directory on macOS-hosted sandboxes),
@@ -264,31 +272,29 @@ adjust the paths in your TOML config to match.
 Sample session:
 
 ```
-runner · type exit or quit, or Ctrl-D, to leave
+session: <id> · type exit or quit, or Ctrl-D, to leave
 
 > My name is Ada, remember it.
 Got it, Ada.
 
 > What's the weather in Seattle?
-⚙ weather(location: "Seattle") ✓ 0.8s · 52 B
+tool: weather
 Current weather in Seattle: 14.2°C, wind 9.1 km/h
 
 > Did the Seahawks win last night?
-⚙ sports(league: "nfl", days_from_today: -1, team: "Seahawks") ✓ 0.4s · 1.2 KB
+tool: sports
 Yes — the Seahawks beat the 49ers 24–17.
 
 > quit
 ```
 
-Each tool call is shown as it runs, with its arguments (long ones cut
-short), how long it took, and the size of its result. In a terminal the
-REPL also uses color and shows `…` while waiting for a reply; piped
-output stays plain text.
+The CLI displays reply text and tool activity from the daemon's event stream.
+Terminal styling lives in the client; the agent emits no terminal output.
 
 ## Sessions
 
-With a `[session_store]` in the config, every run is a session that's
-saved after each turn, and can be picked up again later:
+The daemon requires a `[session_store]` in the config. Each session's
+conversation is saved after completed turns and can be picked up later:
 
 ```toml
 [session_store]
@@ -298,15 +304,15 @@ dir_writable = true
 ```
 
 ```bash
-cargo run -p host --release -- runner.toml                    # a new session
-cargo run -p host --release -- runner.toml --sessions         # list saved ones
-cargo run -p host --release -- runner.toml --session 20261017-081500   # resume
+runner chat                          # new session
+runner sessions list                 # list saved sessions
+runner chat --session trip           # create or resume a named session
 ```
 
-A new session is named after when it started (UTC), and the host prints
-`session saved; resume with --session <id>` on exit. `--session <id>` with
-an id that isn't saved yet starts a session under that name, so
-`--session trip` works too. Ids are letters, digits, `-`, `_` and `.`.
+New sessions receive UUIDs. `chat --session ID` creates a named session if it
+isn't saved yet, while `run --session ID` requires an existing session. IDs
+use letters, digits, `-`, `_` and `.`, up to 64 characters, and cannot start
+with a dot. Existing saved sessions are discovered when the daemon starts.
 
 The store is a sandboxed component like any other. `dir` gives it one
 directory on the host, mounted as its `/`, and it can't see anything
@@ -317,8 +323,7 @@ component can read the directory but not change, add or delete anything
 in it, and the directory has to exist already (a writable one is created
 if missing). A store backed by something
 else, such as a database behind an HTTP API, would use `allowed_hosts` and
-`headers` instead; the agent can't tell the difference. Without a
-`[session_store]`, nothing is saved.
+`headers` instead; the agent can't tell the difference.
 
 ## Python
 
@@ -338,7 +343,7 @@ fresh_per_call = true  # a new instance for every call
 - `timeout_secs` covers both a script busy computing (`while True: pass`,
   interrupted by Wasmtime's epoch deadline) and one stuck waiting
   (`time.sleep(1000)`, cut off by a timer). Either way the model just
-  gets an error back, and the REPL carries on.
+  gets an error back, and the agent continues the turn.
 - Every tool's result (or error) is cut to 64 KB by the host before the
   model sees it. `app.py` cuts printed output shorter itself, but a script
   runs in the same interpreter and could undo that, so the host's cap is
@@ -460,7 +465,8 @@ The agent's imports should be limited to `local:agent/chat-api` and
 `local:agent/session` (and the type-only `local:agent/messages` and
 `local:agent/types`) plus the
 standard `wasi:cli`/`wasi:io`/`wasi:clocks` set — no `wasi:http`, no
-`wasi:sockets`, no way to read env vars. Its exports are `wasi:cli/run@0.3.0` and `local:agent/agent-api`.
+`wasi:sockets`, no inherited environment. Its agent entry point is
+`local:agent/agent-api`; it has no `wasi:cli/run` export.
 It also imports `local:agent/run-events` for structured text and usage events.
 
 ```bash

@@ -4,7 +4,8 @@ The native service is the execution authority. Clients submit work and watch
 persisted events; they never own agent lifetimes or receive provider credentials.
 Agents, providers, tools, and session stores remain WASM components with the
 existing capability restrictions. The CLI contains the service's terminal UI.
-The direct host REPL is retained for compatibility.
+The agent has one structured turn interface and no terminal mode or CLI entry
+point; interactive use goes through `runner chat`.
 
 ## Execution and persistence
 
@@ -54,7 +55,7 @@ WASM stack. Runs and events are retained until the data directory is removed;
 retention management is a later addition.
 
 The daemon imports existing session IDs at startup. Do not run a second daemon
-with a different data directory, or a direct host, against the same writable
+with a different data directory against the same writable
 session store at the same time: the service's session serialization only covers
 its own queue. Changing a daemon's config requires restarting it; queued work
 uses the config active when it starts.

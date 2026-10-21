@@ -7,8 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Also supplies wit-bindgen (with its async runtime), so the agent's own
-# bindings and the `wasi:cli/run` export share one copy of it.
-# `async-spawn` runs the "Thinking…" timer alongside the reply it waits on.
-wasip3 = { version = "=0.9.0", features = ["wit-bindgen-macros", "async-spawn"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# Component Model async bindings for the structured turn and event interfaces.
+wasip3 = { version = "=0.9.0", features = ["wit-bindgen-macros"] }
