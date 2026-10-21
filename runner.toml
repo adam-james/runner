@@ -82,6 +82,8 @@ dir_writable = true
 # Each names its provider; `model` overrides the provider's. Tools use their
 # table keys (read_file, web_search, ...); a definition without `tools` has none.
 # `system_prompt` replaces the default "You are a helpful assistant."
+# `max_tokens` caps each reply (default 16384, reasoning included) and
+# `max_model_calls` caps the model requests in one turn (default no limit).
 [agents.default]
 provider = "anthropic"
 tools = ["get_scores", "get_weather"]
@@ -98,6 +100,7 @@ tools = ["read_file"]
 provider = "openai"
 model = "gpt-5-mini"
 tools = ["web_search"]
+max_model_calls = 20
 system_prompt = """
 You are a research assistant. Search the web before answering, prefer recent
 and primary sources, and end with the links you relied on."""

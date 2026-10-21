@@ -246,9 +246,11 @@ To migrate an existing config, replace each `[[tools]]` header with
 stay in that table. The same component may appear under several names with
 different directories or permissions.
 
-An agent definition may set `system_prompt` to replace the agent component's
-built-in one ("You are a helpful assistant."). The included `runner.toml` also
-defines two agents you can try after restarting the server:
+An agent definition may set `system_prompt` to replace the default ("You are a
+helpful assistant."), `max_tokens` to cap each model reply (default 16384,
+hidden reasoning included), and `max_model_calls` to cap the model requests in
+one turn; a turn that hits either limit fails without being saved. The included
+`runner.toml` also defines two agents you can try after restarting the server:
 
 ```bash
 runner chat --agent reader       # read_file only, using the default model

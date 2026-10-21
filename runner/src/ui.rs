@@ -254,17 +254,25 @@ pub fn banner(agent: &host::AgentInfo, session: &str) {
     println!("{}", style(tty, DIM, &agent_details(agent)));
 }
 
-/// `provider openai · model gpt-5 · tools get_scores, get_weather`.
+/// `provider openai · model gpt-5 · tools get_scores, get_weather`, then
+/// any limits that aren't the defaults.
 fn agent_details(agent: &host::AgentInfo) -> String {
     let tools = if agent.tools.is_empty() {
         "none".to_string()
     } else {
         agent.tools.join(", ")
     };
-    format!(
+    let mut details = format!(
         "provider {} · model {} · tools {tools}",
         agent.provider, agent.model
-    )
+    );
+    if agent.max_tokens != host::DEFAULT_MAX_TOKENS {
+        details.push_str(&format!(" · max tokens {}", agent.max_tokens));
+    }
+    if let Some(calls) = agent.max_model_calls {
+        details.push_str(&format!(" · max model calls {calls}"));
+    }
+    details
 }
 
 /// Says a saved conversation was picked up; its turns are replayed after.
@@ -572,6 +580,8 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5".into(),
             tools: vec!["get_scores".into(), "get_weather".into()],
+            max_tokens: host::DEFAULT_MAX_TOKENS,
+            max_model_calls: None,
         };
         assert_eq!(
             agent_details(&agent),
@@ -581,6 +591,12 @@ mod tests {
         assert_eq!(
             agent_details(&agent),
             "provider openai · model gpt-5 · tools none"
+        );
+        agent.max_tokens = 4096;
+        agent.max_model_calls = Some(8);
+        assert_eq!(
+            agent_details(&agent),
+            "provider openai · model gpt-5 · tools none · max tokens 4096 · max model calls 8"
         );
     }
 

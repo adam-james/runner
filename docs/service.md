@@ -14,19 +14,21 @@ for the host's turn loop. The top-level `[providers.<name>]` and
 `[tools.<name>]` are shared pools; each `[agents.<name>]` table picks from them:
 a required `provider` by its table key, an optional `model` overriding the
 provider's default (one of the two must set a model), `tools` by their
-configured table keys (none if omitted), and an optional `system_prompt`. The
-turn loop sends the system prompt with every model request; without one it sends
-"You are a helpful assistant." An empty `system_prompt` is rejected. The config
-must declare `[agents.default]`, which runs use when they don't name a
-definition. Tool names use 1–64 ASCII letters, digits, underscores, or hyphens
-and are used for model calls, dispatch, and events; `describe` supplies
-descriptions and input schemas, and its legacy name field is ignored. Duplicate
-table keys, invalid tool or provider names, unknown references, and invalid
-agent names are rejected before instantiating components. A run names its
-definition; a session is not bound to one, so turns of one conversation may use
-different definitions. A **session** identifies a conversation. A **run**
-performs one turn within a session and has a durable ID, prompt, deadline,
-status, and event history.
+configured table keys (none if omitted), an optional `system_prompt`, and
+optional limits: `max_tokens` per model reply (default 16384, hidden reasoning
+included) and `max_model_calls` per turn (default unlimited, bounded only by the
+run's deadline). Both must be at least 1. The turn loop sends the system prompt
+with every model request; without one it sends "You are a helpful assistant." An
+empty `system_prompt` is rejected. The config must declare `[agents.default]`,
+which runs use when they don't name a definition. Tool names use 1–64 ASCII
+letters, digits, underscores, or hyphens and are used for model calls, dispatch,
+and events; `describe` supplies descriptions and input schemas, and its legacy
+name field is ignored. Duplicate table keys, invalid tool or provider names,
+unknown references, and invalid agent names are rejected before instantiating
+components. A run names its definition; a session is not bound to one, so turns
+of one conversation may use different definitions. A **session** identifies a
+conversation. A **run** performs one turn within a session and has a durable ID,
+prompt, deadline, status, and event history.
 
 `host::Runtime` shares its Wasmtime engine and compiled components. Each session
 retains its own provider, tools, and session-store instances across turns, so
@@ -49,15 +51,16 @@ not isolate changes made to a shared writable directory.
 
 Each turn loads the session's history, appends the prompt, and calls the
 provider until a reply asks for no tools, running the requested tools in order
-between calls. Replies are capped at 16384 tokens per request, covering any
-hidden reasoning. The loop emits `text` as it streams and `usage` after each
-reply, records tool execution and lifecycle transitions, and saves the history
-after a completed turn. When the turn is given up, its message (e.g. `API error
-401: invalid x-api-key`, or the token-limit cut-off) becomes the run's `error`,
-with configured header values redacted and capped at 500 characters. Other
-errors, such as failing to load a component, are not published to clients
-because they may include reflected request data; those runs say only `agent
-execution failed`.
+between calls. Each reply is capped at the agent's `max_tokens`. A turn that
+reaches `max_model_calls` without a final reply is given up unsaved, like one
+whose reply hits the token cap. The loop emits `text` as it streams and `usage`
+after each reply, records tool execution and lifecycle transitions, and saves
+the history after a completed turn. When the turn is given up, its message (e.g.
+`API error 401: invalid x-api-key`, the token-limit cut-off, or the model-call
+limit) becomes the run's `error`, with configured header values redacted and
+capped at 500 characters. Other errors, such as failing to load a component, are
+not published to clients because they may include reflected request data; those
+runs say only `agent execution failed`.
 
 SQLite stores sessions, submitted runs, and ordered events. The existing
 session-store component stores completed conversation turns. Submission and its
