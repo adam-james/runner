@@ -94,8 +94,6 @@ struct ProviderConfig {
 /// A sandboxed component with network access: a provider or a tool.
 #[derive(Clone, serde::Deserialize)]
 struct ComponentConfig {
-    #[serde(skip)]
-    resolved: bool,
     path: String,
     #[serde(default)]
     allowed_hosts: Vec<String>,
@@ -138,7 +136,23 @@ struct HeaderConfig {
 fn load_config(path: &str) -> Result<RunnerConfig> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::msg(format!("reading config {path}: {e}")))?;
-    toml::from_str(&text).map_err(|e| Error::msg(format!("parsing config {path}: {e}")))
+    let mut config: RunnerConfig =
+        toml::from_str(&text).map_err(|e| Error::msg(format!("parsing config {path}: {e}")))?;
+    // Resolve credentials once; runs use the daemon's startup configuration.
+    for component in std::iter::once(&mut config.provider.component)
+        .chain(config.tools.iter_mut())
+        .chain(config.session_store.iter_mut())
+    {
+        for (name, header) in &mut component.headers {
+            header.value = expand_env(&header.value)
+                .map_err(|e| Error::msg(format!("header '{name}' for {}: {e}", component.path)))?;
+        }
+        if let Some(dir) = &mut component.dir {
+            *dir = expand_env(dir)
+                .map_err(|e| Error::msg(format!("dir for {}: {e}", component.path)))?;
+        }
+    }
+    Ok(config)
 }
 
 /// Replaces every `${NAME}` in `template` with the value of env var `NAME`.
@@ -219,12 +233,8 @@ impl SandboxHooks {
                 return Err(context(&format!("host '{host}' is not in allowed_hosts")));
             }
             let name = http::HeaderName::try_from(name.as_str()).map_err(|e| context(&e))?;
-            let value = if config.resolved {
-                header.value.clone()
-            } else {
-                expand_env(&header.value).map_err(|e| context(&e))?
-            };
-            let mut value = http::HeaderValue::try_from(value).map_err(|e| context(&e))?;
+            let mut value =
+                http::HeaderValue::try_from(header.value.as_str()).map_err(|e| context(&e))?;
             value.set_sensitive(true);
             headers.push(InjectedHeader { name, value, hosts });
         }
@@ -361,11 +371,7 @@ fn mounted_dir(config: &ComponentConfig) -> Result<Option<(String, FsPerms)>> {
         }
         return Ok(None);
     };
-    let dir = if config.resolved {
-        dir.clone()
-    } else {
-        expand_env(dir).map_err(|e| context(&e))?
-    };
+    let dir = dir.clone();
     if config.dir_writable {
         std::fs::create_dir_all(&dir).map_err(|e| context(&format!("creating {dir}: {e}")))?;
         return Ok(Some((dir, FsPerms::ReadWrite)));
@@ -831,19 +837,11 @@ impl Runtime {
         Self::from_config(config)
     }
 
-    fn from_config(mut config: RunnerConfig) -> Result<Self> {
-        // Resolve credentials once; runs use the daemon's startup configuration.
-        for component in std::iter::once(&mut config.provider.component)
-            .chain(config.tools.iter_mut())
-            .chain(config.session_store.iter_mut())
+    fn from_config(config: RunnerConfig) -> Result<Self> {
+        for component in std::iter::once(&config.provider.component)
+            .chain(config.tools.iter())
+            .chain(config.session_store.iter())
         {
-            for header in component.headers.values_mut() {
-                header.value = expand_env(&header.value)?;
-            }
-            if let Some(dir) = &mut component.dir {
-                *dir = expand_env(dir)?;
-            }
-            component.resolved = true;
             SandboxHooks::new(component)?;
         }
         let mut options = Config::new();
@@ -1140,6 +1138,54 @@ mod tests {
             err.to_string()
                 .contains("'api.exmaple.com' is not in allowed_hosts")
         );
+    }
+
+    #[test]
+    fn load_config_expands_env_vars_once() {
+        let home = env::var("HOME").unwrap();
+        let path = env::temp_dir().join(format!("runner-config-{}.toml", std::process::id()));
+        let write = |key: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+                    agent = "agent.wasm"
+                    [provider]
+                    path = "provider.wasm"
+                    model = "m"
+                    allowed_hosts = ["api.example.com"]
+                    headers = {{ x-api-key = {{ value = "k-${{{key}}}", hosts = ["api.example.com"] }} }}
+                    [[tools]]
+                    path = "tool.wasm"
+                    dir = "${{HOME}}/data"
+                    "#
+                ),
+            )
+            .unwrap();
+        };
+
+        write("HOME");
+        let config = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            config.provider.component.headers["x-api-key"].value,
+            format!("k-{home}")
+        );
+        assert_eq!(
+            config.tools[0].dir.as_deref(),
+            Some(&*format!("{home}/data"))
+        );
+
+        write("RUNNER_TEST_UNSET_VAR");
+        let err = load_config(path.to_str().unwrap())
+            .err()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            err.contains("header 'x-api-key' for provider.wasm"),
+            "{err}"
+        );
+        assert!(err.contains("RUNNER_TEST_UNSET_VAR is not set"), "{err}");
     }
 
     #[test]
