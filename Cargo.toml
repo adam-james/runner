@@ -9,6 +9,8 @@ members = [
     "tools/sports",
     "tools/search",
     "tools/files",
+    "tools/write-file",
+    "tools/edit-file",
     "tools/rustdocs",
     "tools/python",
     "stores/fs",

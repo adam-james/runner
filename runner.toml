@@ -58,6 +58,19 @@ allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
 path = "target/wasm32-wasip2/release/files.wasm"
 dir = "."
 
+# Let the model write and edit files under `dir`, which it sees as `/`. They
+# can overwrite anything there, so use a directory you don't mind it
+# changing. Created if missing.
+# [[tools]]
+# path = "target/wasm32-wasip2/release/write_file.wasm"
+# dir = "${HOME}/.runner/files"
+# dir_writable = true
+#
+# [[tools]]
+# path = "target/wasm32-wasip2/release/edit_file.wasm"
+# dir = "${HOME}/.runner/files"
+# dir_writable = true
+
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"
 dir = "${HOME}/.runner/sessions"
