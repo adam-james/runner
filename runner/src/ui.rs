@@ -213,7 +213,8 @@ impl Drop for Ui {
     }
 }
 
-pub fn banner(agent: &str, session: &str) {
+/// Chat's opening lines: the agent and session, then what the agent runs with.
+pub fn banner(agent: &host::AgentInfo, session: &str) {
     let tty = io::stdout().is_terminal();
     println!(
         "{}{}",
@@ -222,10 +223,25 @@ pub fn banner(agent: &str, session: &str) {
             tty,
             DIM,
             &format!(
-                " · agent {agent} · session {session} · type exit or quit, or Ctrl-D, to leave"
+                " · agent {} · session {session} · type exit or quit, or Ctrl-D, to leave",
+                agent.name
             )
         )
     );
+    println!("{}", style(tty, DIM, &agent_details(agent)));
+}
+
+/// `provider openai · model gpt-5 · tools get_scores, get_weather`.
+fn agent_details(agent: &host::AgentInfo) -> String {
+    let tools = if agent.tools.is_empty() {
+        "none".to_string()
+    } else {
+        agent.tools.join(", ")
+    };
+    format!(
+        "provider {} · model {} · tools {tools}",
+        agent.provider, agent.model
+    )
 }
 
 /// Says a saved conversation was picked up; its turns are replayed after.
@@ -278,14 +294,17 @@ pub fn goodbye(session: &str) {
     );
 }
 
-/// The agent a `run` or `runs watch` is for, and its session. On stderr, so
-/// stdout stays the run's output (or its ID, with `--detach`).
-pub fn run_header(agent: &str, session: &str) {
-    let line = format!("agent {agent} · session {session}");
-    if io::stderr().is_terminal() {
-        eprintln!("{DIM}{line}{RESET}");
-    } else {
-        eprintln!("{line}");
+/// The agent a `run` or `runs watch` is for and its session, then what the
+/// agent runs with, if the daemon still has that agent. On stderr, so stdout
+/// stays the run's output (or its ID, with `--detach`).
+pub fn run_header(agent: &str, details: Option<&host::AgentInfo>, session: &str) {
+    let tty = io::stderr().is_terminal();
+    eprintln!(
+        "{}",
+        style(tty, DIM, &format!("agent {agent} · session {session}"))
+    );
+    if let Some(details) = details {
+        eprintln!("{}", style(tty, DIM, &agent_details(details)));
     }
 }
 
@@ -465,6 +484,25 @@ mod tests {
             token_usage_line(&json!({"reasoning_tokens":null, "max_tokens":1024,
                 "prompt_tokens":null, "cache_read_tokens":null, "cache_creation_tokens":null})),
             None
+        );
+    }
+
+    #[test]
+    fn agent_details_list_provider_model_and_tools() {
+        let mut agent = host::AgentInfo {
+            name: "default".into(),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            tools: vec!["get_scores".into(), "get_weather".into()],
+        };
+        assert_eq!(
+            agent_details(&agent),
+            "provider openai · model gpt-5 · tools get_scores, get_weather"
+        );
+        agent.tools.clear();
+        assert_eq!(
+            agent_details(&agent),
+            "provider openai · model gpt-5 · tools none"
         );
     }
 

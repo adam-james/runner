@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
             deadline_secs,
         } => {
             let run = client.submit(session, agent, prompt, deadline_secs).await?;
-            ui::run_header(&run.agent, &run.session_id);
+            header(&client, &run).await?;
             if detach {
                 println!("{}", run.id);
             } else {
@@ -139,13 +139,13 @@ async fn main() -> Result<()> {
             let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
             // Checked up front, so a typo doesn't wait for the first prompt to fail.
             let agents = client.agents().await?;
-            if !agents.iter().any(|known| known.name == agent) {
+            let Some(details) = agents.iter().find(|known| known.name == agent) else {
                 let names: Vec<_> = agents.iter().map(|known| known.name.as_str()).collect();
                 bail!(
                     "unknown agent '{agent}'; the daemon has: {}",
                     names.join(", ")
                 );
-            }
+            };
             let (session, existing) = match session {
                 Some(id) => {
                     let existing = client
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
                 }
                 None => (client.create_session(None).await?.id, false),
             };
-            ui::banner(&agent, &session);
+            ui::banner(details, &session);
             if existing {
                 resumed(&client, &session).await?;
             }
@@ -182,8 +182,7 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
             Runs::Watch { id, after, json } => {
-                let run = client.run(&id).await?;
-                ui::run_header(&run.agent, &run.session_id);
+                header(&client, &client.run(&id).await?).await?;
                 attach(&client, &id, after, json).await?
             }
         },
@@ -201,6 +200,15 @@ async fn main() -> Result<()> {
             ),
         },
     }
+    Ok(())
+}
+
+/// Prints a run's agent, with the provider, model and tools the daemon has
+/// configured for it, and its session.
+async fn header(client: &Client, run: &runner::db::Run) -> Result<()> {
+    let agents = client.agents().await?;
+    let details = agents.iter().find(|known| known.name == run.agent);
+    ui::run_header(&run.agent, details, &run.session_id);
     Ok(())
 }
 

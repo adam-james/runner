@@ -105,7 +105,14 @@ impl Harness {
         let service = Service::new(
             db.clone(),
             "test-token".into(),
-            vec!["default".into(), "researcher".into()],
+            ["default", "researcher"]
+                .map(|name| host::AgentInfo {
+                    name: name.into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    tools: vec!["web_search".into()],
+                })
+                .into(),
         );
         let http = tokio::spawn(async move {
             axum::serve(listener, service.router()).await.unwrap();
@@ -213,7 +220,13 @@ async fn runs_execute_the_agent_definition_they_name() {
         .json()
         .await
         .unwrap();
-    assert_eq!(agents, json!([{"name":"default"}, {"name":"researcher"}]));
+    assert_eq!(
+        agents,
+        json!(
+            ["default", "researcher"].map(|name| json!({"name":name, "provider":"openai",
+            "model":"gpt-5", "tools":["web_search"]}))
+        )
+    );
     let run: Run = h
         .client
         .post(format!("{}/v1/runs", h.url))

@@ -55,7 +55,7 @@ impl Fixture {
             format!(
                 r#"
 agent = {}
-[provider]
+[providers.fixture]
 path = {}
 model = "fixture"
 allowed_hosts = ["fixture.invalid"]
@@ -70,9 +70,11 @@ path = {}
 dir = {}
 dir_writable = true
 [agents.default]
+provider = "fixture"
 tools = ["fixture"]
 [agents.notools]
-model = "fixture"
+provider = "fixture"
+model = "fixture-small"
 system_prompt = "Answer without tools."
 "#,
                 quote(target.join("agent.wasm")),
@@ -180,7 +182,23 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
-    assert_eq!(runtime.agents(), ["default", "notools"]);
+    assert_eq!(
+        runtime.agents(),
+        [
+            host::AgentInfo {
+                name: "default".into(),
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                tools: vec!["fixture".into()],
+            },
+            host::AgentInfo {
+                name: "notools".into(),
+                provider: "fixture".into(),
+                model: "fixture-small".into(),
+                tools: vec![],
+            },
+        ]
+    );
     let run = async |agent: &str| {
         let events = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured = events.clone();
@@ -346,6 +364,10 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
     let id = String::from_utf8(output.stdout).unwrap().trim().to_string();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.starts_with("agent default · session "), "{stderr}");
+    assert!(
+        stderr.contains("\nprovider fixture · model fixture · tools fixture\n"),
+        "{stderr}"
+    );
     client.watch(&id, 0, false).await.unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_runner"))
         .arg("--data-dir")
@@ -466,10 +488,19 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
         named.starts_with("runner · agent notools · session a · "),
         "{named}"
     );
+    // The agent's provider, model (here its own override) and tools follow.
+    assert_eq!(
+        named.lines().nth(1),
+        Some("provider fixture · model fixture-small · tools none")
+    );
     let default = chat(&data, &["--session", "b"], "");
     assert!(
         default.starts_with("runner · agent default · session b · "),
         "{default}"
+    );
+    assert_eq!(
+        default.lines().nth(1),
+        Some("provider fixture · model fixture · tools fixture")
     );
     let run = client.runs(Some("a")).await.unwrap();
     assert_eq!(run[0].agent, "notools");

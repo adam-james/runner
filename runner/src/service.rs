@@ -61,7 +61,7 @@ pub struct Service {
     pub db: Database,
     token: Arc<String>,
     /// The agent definitions runs may name; fixed for the daemon's lifetime.
-    agents: Arc<Vec<String>>,
+    agents: Arc<Vec<host::AgentInfo>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -176,7 +176,7 @@ fn bad(error: anyhow::Error) -> ApiError {
 }
 
 impl Service {
-    pub fn new(db: Database, token: String, agents: Vec<String>) -> Self {
+    pub fn new(db: Database, token: String, agents: Vec<host::AgentInfo>) -> Self {
         Self {
             db,
             token: Arc::new(token),
@@ -219,18 +219,8 @@ async fn authenticate(
     next.run(request).await
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Agent {
-    pub name: String,
-}
-
-async fn list_agents(State(s): State<Service>) -> Json<Vec<Agent>> {
-    Json(
-        s.agents
-            .iter()
-            .map(|name| Agent { name: name.clone() })
-            .collect(),
-    )
+async fn list_agents(State(s): State<Service>) -> Json<Vec<host::AgentInfo>> {
+    Json(s.agents.to_vec())
 }
 
 async fn list_sessions(
@@ -273,7 +263,7 @@ async fn submit(
     let agent = input
         .agent
         .unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
-    if !s.agents.contains(&agent) {
+    if !s.agents.iter().any(|known| known.name == agent) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!("unknown agent '{agent}'"),

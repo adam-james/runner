@@ -77,13 +77,15 @@ mod session_store_guest {
 #[derive(Clone, serde::Deserialize)]
 struct RunnerConfig {
     agent: String,
-    provider: ProviderConfig,
+    /// Model providers by name; agent definitions pick one with `provider`.
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     tools: BTreeMap<String, ComponentConfig>,
     /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
     /// Named agent definitions, each picking from the top-level agent,
-    /// provider and tools. Must include `default`.
+    /// providers and tools. Must include `default`.
     #[serde(default)]
     agents: BTreeMap<String, AgentConfig>,
 }
@@ -94,9 +96,9 @@ struct RunnerConfig {
 struct AgentConfig {
     /// The agent component; the top-level `agent` if omitted.
     agent: Option<String>,
-    /// Replaces the top-level `[provider]` for this definition.
-    provider: Option<ProviderConfig>,
-    /// Overrides the top-level provider's model.
+    /// A `[providers.<name>]` key.
+    provider: String,
+    /// Overrides the provider's `model`.
     model: Option<String>,
     /// Tools by their configured table keys. Omitted means none.
     #[serde(default)]
@@ -109,25 +111,53 @@ struct AgentConfig {
 /// A definition resolved against the top-level config.
 struct AgentDefinition {
     agent: String,
+    /// The `[providers.<name>]` key `provider` came from.
+    provider_name: String,
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
     system_prompt: Option<String>,
 }
 
+impl AgentDefinition {
+    /// Always set: `resolve_agents` rejects definitions without a model.
+    fn model(&self) -> &str {
+        self.provider.model.as_deref().unwrap_or_default()
+    }
+}
+
 /// The name of the definition used when a run doesn't pick one.
 pub const DEFAULT_AGENT: &str = "default";
 
-/// Resolve agent tool selections using the names declared in the config.
+/// What an agent definition runs with, for clients to show.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentInfo {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub tools: Vec<String>,
+}
+
+/// Tool and provider table keys: what agent definitions refer to them by.
+/// Tool names are also what the model calls them.
+fn validate_table_key(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        bail!("invalid {kind} name '{name}': use 1–64 letters, digits, '-' or '_'");
+    }
+    Ok(())
+}
+
+/// Resolve agents' provider and tool selections using the names declared in the config.
 fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinition>> {
     for name in config.tools.keys() {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        {
-            bail!("invalid tool name '{name}': use 1–64 letters, digits, '-' or '_'");
-        }
+        validate_table_key("tool", name)?;
+    }
+    for name in config.providers.keys() {
+        validate_table_key("provider", name)?;
     }
     if !config.agents.contains_key(DEFAULT_AGENT) {
         bail!("no [agents.{DEFAULT_AGENT}]: runs that don't name an agent use it");
@@ -142,15 +172,24 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
         {
             bail!("agent '{name}': `system_prompt` is empty; leave it out to use the agent's own");
         }
-        let mut provider = match &agent.provider {
-            Some(_) if agent.model.is_some() => {
-                bail!("agent '{name}': set `model` inside its `provider`, not both")
-            }
-            Some(provider) => provider.clone(),
-            None => config.provider.clone(),
-        };
+        let mut provider = config
+            .providers
+            .get(&agent.provider)
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "agent '{name}': no provider named '{}'",
+                    agent.provider
+                ))
+            })?
+            .clone();
         if let Some(model) = &agent.model {
-            provider.model = model.clone();
+            provider.model = Some(model.clone());
+        }
+        if provider.model.is_none() {
+            bail!(
+                "agent '{name}': no model; set `model` on it or on [providers.{}]",
+                agent.provider
+            );
         }
         let tools = agent
             .tools
@@ -166,6 +205,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
             name.clone(),
             AgentDefinition {
                 agent: agent.agent.clone().unwrap_or_else(|| config.agent.clone()),
+                provider_name: agent.provider.clone(),
                 provider,
                 tools,
                 system_prompt: agent.system_prompt.clone(),
@@ -177,7 +217,8 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
 
 #[derive(Clone, serde::Deserialize)]
 struct ProviderConfig {
-    model: String,
+    /// The model agents using this provider get, unless they set their own.
+    model: Option<String>,
     #[serde(flatten)]
     component: ComponentConfig,
 }
@@ -230,16 +271,12 @@ fn load_config(path: &str) -> Result<RunnerConfig> {
     let mut config: RunnerConfig =
         toml::from_str(&text).map_err(|e| Error::msg(format!("parsing config {path}: {e}")))?;
     // Resolve credentials once; runs use the daemon's startup configuration.
-    for component in std::iter::once(&mut config.provider.component)
+    for component in config
+        .providers
+        .values_mut()
+        .map(|provider| &mut provider.component)
         .chain(config.tools.values_mut())
         .chain(config.session_store.iter_mut())
-        .chain(
-            config
-                .agents
-                .values_mut()
-                .filter_map(|agent| agent.provider.as_mut())
-                .map(|provider| &mut provider.component),
-        )
     {
         for (name, header) in &mut component.headers {
             header.value = expand_env(&header.value)
@@ -627,7 +664,8 @@ struct ProviderHandle {
     store: Store<SandboxState>,
 }
 
-async fn load_provider(runtime: &Runtime, config: &ProviderConfig) -> Result<ProviderHandle> {
+async fn load_provider(runtime: &Runtime, definition: &AgentDefinition) -> Result<ProviderHandle> {
+    let config = &definition.provider;
     let (component, linker, mut store) = load_sandboxed(runtime, &config.component)?;
     let pre = provider_guest::ProviderGuestPre::new(linker.instantiate_pre(&component)?)?;
     let instance = pre.instantiate_async(&mut store).await?;
@@ -636,7 +674,7 @@ async fn load_provider(runtime: &Runtime, config: &ProviderConfig) -> Result<Pro
         config: config.component.clone(),
         pre,
         healthy: true,
-        model: config.model.clone(),
+        model: definition.model().to_string(),
         instance,
         store,
     })
@@ -1052,9 +1090,17 @@ impl Runtime {
         Ok(runtime)
     }
 
-    /// The names of the agent definitions runs can use, sorted.
-    pub fn agents(&self) -> Vec<String> {
-        self.agents.keys().cloned().collect()
+    /// The agent definitions runs can use, sorted by name.
+    pub fn agents(&self) -> Vec<AgentInfo> {
+        self.agents
+            .iter()
+            .map(|(name, definition)| AgentInfo {
+                name: name.clone(),
+                provider: definition.provider_name.clone(),
+                model: definition.model().to_string(),
+                tools: definition.tools.keys().cloned().collect(),
+            })
+            .collect()
     }
 
     fn component(&self, path: &str) -> Result<Component> {
@@ -1148,7 +1194,7 @@ impl Runtime {
         session_id: &str,
     ) -> Result<SessionComponents> {
         let config = &self.config;
-        let provider = load_provider(self, &definition.provider).await?;
+        let provider = load_provider(self, definition).await?;
         let tools = load_tools(self, &definition.tools).await?;
         let mut definitions: Vec<_> = tools
             .iter()
@@ -1180,16 +1226,12 @@ impl Runtime {
 /// Every sandboxed component `config` declares: providers, tools and the
 /// session store.
 fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &ComponentConfig> {
-    std::iter::once(&config.provider.component)
+    config
+        .providers
+        .values()
+        .map(|provider| &provider.component)
         .chain(config.tools.values())
         .chain(&config.session_store)
-        .chain(
-            config
-                .agents
-                .values()
-                .filter_map(|agent| agent.provider.as_ref())
-                .map(|provider| &provider.component),
-        )
 }
 
 /// Strips configured credentials out of a message headed for run storage
@@ -1295,7 +1337,7 @@ mod tests {
         let config: RunnerConfig = toml::from_str(
             r#"
             agent = "agent.wasm"
-            [provider]
+            [providers.main]
             path = "provider.wasm"
             model = "m"
             allowed_hosts = ["api.example.com"]
@@ -1381,7 +1423,8 @@ mod tests {
     async fn component_load_errors_name_the_file() {
         let load = async |tool: &str| {
             let config: RunnerConfig = toml::from_str(&format!(
-                "agent = {tool:?}\n[provider]\npath = {tool:?}\nmodel = \"m\"\n[agents.default]"
+                "agent = {tool:?}\n[providers.p]\npath = {tool:?}\nmodel = \"m\"\n\
+                 [agents.default]\nprovider = \"p\""
             ))
             .unwrap();
             format!("{:#}", Runtime::from_config(config).await.err().unwrap())
@@ -1417,7 +1460,7 @@ mod tests {
                 format!(
                     r#"
                     agent = "agent.wasm"
-                    [provider]
+                    [providers.main]
                     path = "provider.wasm"
                     model = "m"
                     allowed_hosts = ["api.example.com"]
@@ -1434,7 +1477,7 @@ mod tests {
         write("HOME");
         let config = load_config(path.to_str().unwrap()).unwrap();
         assert_eq!(
-            config.provider.component.headers["x-api-key"].value,
+            config.providers["main"].component.headers["x-api-key"].value,
             format!("k-{home}")
         );
         assert_eq!(
@@ -1469,14 +1512,17 @@ mod tests {
         assert!(err.to_string().contains("`hosts` is empty"));
     }
 
-    /// `extra` added to a config with two tools, and no agents of its own.
+    /// `extra` added to a config with two providers (`main`, with a default
+    /// model, and `other`, without) and two tools, and no agents of its own.
     fn agents(extra: &str, tools: &[&str]) -> Result<BTreeMap<String, AgentDefinition>> {
         let config: RunnerConfig = toml::from_str(&format!(
             r#"
             agent = "agent.wasm"
-            [provider]
+            [providers.main]
             path = "provider.wasm"
             model = "big"
+            [providers.other]
+            path = "other-provider.wasm"
             [tools.{}]
             path = "files.wasm"
             [tools.{}]
@@ -1499,32 +1545,43 @@ mod tests {
 
     #[test]
     fn a_default_agent_must_be_declared() {
-        let err = agents("[agents.researcher]", &["files", "docs"])
-            .err()
-            .unwrap()
-            .to_string();
+        let err = agents(
+            "[agents.researcher]\nprovider = \"main\"",
+            &["files", "docs"],
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(err.contains("no [agents.default]"), "{err}");
 
-        let declared = agents("[agents.default]\ntools = [\"docs\"]", &["files", "docs"]).unwrap();
+        let declared = agents(
+            "[agents.default]\nprovider = \"main\"\ntools = [\"docs\"]",
+            &["files", "docs"],
+        )
+        .unwrap();
         let default = &declared["default"];
         assert_eq!(default.agent, "agent.wasm");
-        assert_eq!(default.provider.model, "big");
+        assert_eq!(default.provider_name, "main");
+        assert_eq!(default.model(), "big");
         assert_eq!(tool_paths(default), ["docs.wasm"]);
     }
 
     #[test]
-    fn named_agents_pick_tools_and_override_the_provider() {
+    fn named_agents_pick_a_provider_tools_and_a_model() {
         let agents = agents(
             r#"
             [agents.default]
+            provider = "main"
             [agents.researcher]
+            provider = "main"
             model = "small"
             tools = ["docs"]
             system_prompt = "Cite your sources."
             [agents.bare]
+            provider = "main"
             agent = "other-agent.wasm"
-            [agents.elsewhere.provider]
-            path = "other-provider.wasm"
+            [agents.elsewhere]
+            provider = "other"
             model = "theirs"
             "#,
             &["files", "docs"],
@@ -1535,7 +1592,7 @@ mod tests {
             ["bare", "default", "elsewhere", "researcher"]
         );
         let researcher = &agents["researcher"];
-        assert_eq!(researcher.provider.model, "small");
+        assert_eq!(researcher.model(), "small");
         assert_eq!(researcher.provider.component.path, "provider.wasm");
         assert_eq!(tool_paths(researcher), ["docs.wasm"]);
         assert_eq!(
@@ -1550,30 +1607,55 @@ mod tests {
             agents["elsewhere"].provider.component.path,
             "other-provider.wasm"
         );
-        assert_eq!(agents["elsewhere"].provider.model, "theirs");
+        assert_eq!(agents["elsewhere"].model(), "theirs");
+        assert_eq!(agents["elsewhere"].provider_name, "other");
+        // Overriding one agent's model leaves the provider's default alone.
+        assert_eq!(agents["default"].model(), "big");
     }
 
     #[test]
     fn bad_agent_definitions_are_rejected() {
         let err = |extra: &str, tools: &[&str]| agents(extra, tools).err().unwrap().to_string();
         let tools = &["files", "docs"];
-        let err = |extra: &str, tools: &[&str]| err(&format!("[agents.default]\n{extra}"), tools);
+        let err = |extra: &str, tools: &[&str]| {
+            err(
+                &format!("[agents.default]\nprovider = \"main\"\n{extra}"),
+                tools,
+            )
+        };
+        let main = "[agents.r]\nprovider = \"main\"";
         assert!(
-            err("[agents.r]\ntools = [\"wether\"]", tools)
+            err(&format!("{main}\ntools = [\"wether\"]"), tools)
                 .contains("agent 'r': no tool named 'wether'")
         );
         assert!(err("", &["files", "files"]).contains("duplicate"));
-        assert!(err("[agents.\"../x\"]", tools).contains("invalid agent name '../x'"));
-        assert!(err("[agents.r]\nmodle = \"x\"", tools).contains("unknown field"));
+        assert!(
+            err("[agents.\"../x\"]\nprovider = \"main\"", tools)
+                .contains("invalid agent name '../x'")
+        );
+        assert!(err(&format!("{main}\nmodle = \"x\""), tools).contains("unknown field"));
+        assert!(
+            err(&format!("{main}\nsystem_prompt = \" \""), tools)
+                .contains("`system_prompt` is empty")
+        );
+        // Every agent names its provider, and it has to exist.
+        assert!(err("[agents.r]", tools).contains("missing field `provider`"));
+        assert!(
+            err("[agents.r]\nprovider = \"opneai\"", tools)
+                .contains("agent 'r': no provider named 'opneai'")
+        );
+        // A provider without a default model needs the agent to pick one.
+        assert!(
+            err("[agents.r]\nprovider = \"other\"", tools)
+                .contains("agent 'r': no model; set `model` on it or on [providers.other]")
+        );
+        // Providers are named by table key now, not configured inline.
         assert!(
             err(
-                "[agents.r]\nmodel = \"x\"\nprovider = { path = \"p.wasm\", model = \"y\" }",
+                "[agents.r.provider]\npath = \"p.wasm\"\nmodel = \"y\"",
                 tools
             )
-            .contains("not both")
-        );
-        assert!(
-            err("[agents.r]\nsystem_prompt = \" \"", tools).contains("`system_prompt` is empty")
+            .contains("invalid type")
         );
     }
 
@@ -1581,12 +1663,13 @@ mod tests {
     fn tool_names_are_validated_from_config() {
         let mut config: RunnerConfig = toml::from_str(
             r#"agent = "agent.wasm"
-            [provider]
+            [providers.main]
             path = "provider.wasm"
             model = "m"
             [tools.valid_name-1]
             path = "tool.wasm"
             [agents.default]
+            provider = "main"
             tools = ["valid_name-1"]
             "#,
         )
@@ -1599,12 +1682,23 @@ mod tests {
             let error = resolve_agents(&config).err().unwrap().to_string();
             assert!(error.contains("invalid tool name"), "{error}");
         }
+        config.tools.clear();
+        let provider = config.providers.remove("main").unwrap();
+        config.providers.insert("dot.name".into(), provider);
+        let error = resolve_agents(&config).err().unwrap().to_string();
+        assert!(
+            error.contains("invalid provider name 'dot.name'"),
+            "{error}"
+        );
     }
 
     #[test]
     fn example_config_has_valid_named_tools_and_agents() {
         let config: RunnerConfig = toml::from_str(include_str!("../../runner.toml")).unwrap();
         let agents = resolve_agents(&config).unwrap();
+        assert_eq!(agents["researcher"].provider_name, "openai");
+        assert_eq!(agents["researcher"].model(), "gpt-5-mini");
+        assert_eq!(agents["default"].model(), "gpt-5");
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]
@@ -1622,14 +1716,14 @@ mod tests {
     }
 
     #[test]
-    fn override_providers_are_redacted() {
+    fn every_providers_credentials_are_redacted() {
         let config: RunnerConfig = toml::from_str(
             r#"
             agent = "agent.wasm"
-            [provider]
+            [providers.main]
             path = "provider.wasm"
             model = "m"
-            [agents.other.provider]
+            [providers.other]
             path = "other.wasm"
             model = "m"
             allowed_hosts = ["api.example.com"]
