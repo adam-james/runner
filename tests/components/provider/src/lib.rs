@@ -93,6 +93,8 @@ impl Guest for Provider {
                             .join(",")
                     } else if prompt == "provider-counter" {
                         call.to_string()
+                    } else if prompt == "system-prompt" {
+                        request.system.clone().unwrap_or_default()
                     } else {
                         format!("turn {turns}: {prompt}")
                     }

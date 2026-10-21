@@ -73,8 +73,9 @@ dir_writable = true
 
 # Agent definitions pick from the provider and tools above. Runs use
 # `default` unless they name another, e.g. `runner run --agent researcher ...`.
-# Tools use their table keys (read_file, rust_docs, ...); a definition without
-# `tools` has none.
+# Tools use their table keys (read_file, web_search, ...); a definition without
+# `tools` has none. `system_prompt` replaces the agent's built-in "You are a
+# helpful assistant."
 [agents.default]
 tools = ["get_scores", "get_weather"]
 
@@ -88,6 +89,9 @@ tools = ["read_file"]
 [agents.researcher]
 model = "gpt-5-mini"
 tools = ["web_search"]
+system_prompt = """
+You are a research assistant. Search the web before answering, prefer recent
+and primary sources, and end with the links you relied on."""
 
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"

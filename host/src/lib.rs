@@ -101,6 +101,9 @@ struct AgentConfig {
     /// Tools by their configured table keys. Omitted means none.
     #[serde(default)]
     tools: Vec<String>,
+    /// Replaces the system prompt the agent component sends with each model
+    /// request. Without one, the component's own prompt is used.
+    system_prompt: Option<String>,
 }
 
 /// A definition resolved against the top-level config.
@@ -108,6 +111,7 @@ struct AgentDefinition {
     agent: String,
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
+    system_prompt: Option<String>,
 }
 
 /// The name of the definition used when a run doesn't pick one.
@@ -131,6 +135,13 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
     let mut agents = BTreeMap::new();
     for (name, agent) in &config.agents {
         validate_name("agent name", name)?;
+        if agent
+            .system_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.trim().is_empty())
+        {
+            bail!("agent '{name}': `system_prompt` is empty; leave it out to use the agent's own");
+        }
         let mut provider = match &agent.provider {
             Some(_) if agent.model.is_some() => {
                 bail!("agent '{name}': set `model` inside its `provider`, not both")
@@ -157,6 +168,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 agent: agent.agent.clone().unwrap_or_else(|| config.agent.clone()),
                 provider,
                 tools,
+                system_prompt: agent.system_prompt.clone(),
             },
         );
     }
@@ -677,6 +689,8 @@ fn validate_name(kind: &str, id: &str) -> Result<()> {
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
+    /// The run's definition's `system_prompt`, if it sets one.
+    system_prompt: Option<String>,
     components: SessionComponents,
     events: EventSink,
     provider_tasks: ProviderTasks,
@@ -782,14 +796,19 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
     /// agent: it copies the reply across through channels, read on the
     /// provider side by a background task and written on the agent side by
     /// the stream/future returned here.
-    async fn chat(accessor: &Accessor<U, Self>, request: ChatRequest) -> ChatStream {
-        let (provider, tools) = accessor.with(|mut store| {
+    async fn chat(accessor: &Accessor<U, Self>, mut request: ChatRequest) -> ChatStream {
+        let (provider, tools, system_prompt) = accessor.with(|mut store| {
             let state = store.get();
             (
                 state.components.provider.clone(),
                 state.components.tool_definitions.clone(),
+                state.system_prompt.clone(),
             )
         });
+        // Like the model, a configured system prompt is host config the agent can't override.
+        if system_prompt.is_some() {
+            request.system = system_prompt;
+        }
 
         let (text_tx, text_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = oneshot::channel();
@@ -1096,6 +1115,7 @@ impl Runtime {
                     .stderr(diagnostics.stderr.clone())
                     .build(),
                 table: ResourceTable::new(),
+                system_prompt: definition.system_prompt.clone(),
                 components,
                 events,
                 provider_tasks: ProviderTasks::default(),
@@ -1500,6 +1520,7 @@ mod tests {
             [agents.researcher]
             model = "small"
             tools = ["docs"]
+            system_prompt = "Cite your sources."
             [agents.bare]
             agent = "other-agent.wasm"
             [agents.elsewhere.provider]
@@ -1517,6 +1538,11 @@ mod tests {
         assert_eq!(researcher.provider.model, "small");
         assert_eq!(researcher.provider.component.path, "provider.wasm");
         assert_eq!(tool_paths(researcher), ["docs.wasm"]);
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("Cite your sources.")
+        );
+        assert_eq!(agents["bare"].system_prompt, None);
         // Tools are opt-in for a named definition.
         assert!(agents["bare"].tools.is_empty());
         assert_eq!(agents["bare"].agent, "other-agent.wasm");
@@ -1545,6 +1571,9 @@ mod tests {
                 tools
             )
             .contains("not both")
+        );
+        assert!(
+            err("[agents.r]\nsystem_prompt = \" \"", tools).contains("`system_prompt` is empty")
         );
     }
 
@@ -1583,6 +1612,12 @@ mod tests {
         assert_eq!(
             agents["researcher"].tools.keys().collect::<Vec<_>>(),
             ["web_search"]
+        );
+        assert!(
+            agents["researcher"]
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("You are a research assistant."))
         );
     }
 
