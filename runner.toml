@@ -83,11 +83,11 @@ tools = ["get_scores", "get_weather"]
 [agents.reader]
 tools = ["read_file"]
 
-# Rust documentation with a smaller model and no local file access.
+# Web search with a smaller model and no local file access.
 # Try: runner chat --agent researcher
 [agents.researcher]
 model = "gpt-5-mini"
-tools = ["rust_docs"]
+tools = ["web_search"]
 
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"

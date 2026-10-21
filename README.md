@@ -58,7 +58,7 @@ runner sessions list
 runner sessions create trip
 runner run --session trip "Plan a weekend in Seattle"
 runner agents list
-runner run --agent researcher "Find the tokio docs for JoinSet"
+runner run --agent researcher "What changed in the latest Rust release?"
 ```
 
 `run` and `runs watch` print the run's agent and session ID on stderr; `run
@@ -243,7 +243,7 @@ the server:
 
 ```bash
 runner chat --agent reader       # read_file only, using the default model
-runner chat --agent researcher   # rust_docs only, using gpt-5-mini
+runner chat --agent researcher   # web_search only, using gpt-5-mini
 ```
 
 All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single

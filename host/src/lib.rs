@@ -1582,7 +1582,7 @@ mod tests {
         );
         assert_eq!(
             agents["researcher"].tools.keys().collect::<Vec<_>>(),
-            ["rust_docs"]
+            ["web_search"]
         );
     }
 
