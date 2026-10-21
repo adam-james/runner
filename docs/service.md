@@ -197,3 +197,24 @@ threads. Delivery is best effort: overload drops logs, and a crash can lose queu
 records. Normal shutdown retains the writer guard to drain queued output. These
 logs are diagnostic, not a durable audit trail; there are no log files, rotation,
 or log-viewing command.
+
+## Reattaching to session work
+
+`runner chat --session SESSION` replays completed history, then shows and follows
+pending turns in submission order before accepting input. Catch-up refreshes the
+run list after each batch, including work submitted while attached. A followed
+turn that fails or is cancelled is reported and catch-up continues; connection
+errors stop catch-up rather than showing an idle prompt.
+
+Chat remains turn-by-turn: use `runner run --session SESSION "prompt" --detach`
+to queue additional work from another terminal. It does not continuously monitor
+other clients' submissions while idle at the prompt. If new work arrives before
+your next submission, the daemon serializes it and the watcher displays the queue
+wait separately from thinking time. Indicator timings measure the local watch,
+not historical execution.
+
+Ctrl-C while following a run exits successfully without cancellation and prints
+a normal detach notice and resume command. Use `runner runs cancel RUN_ID` to
+cancel work. Session create/list responses retain `id` and `created_at` and add
+numeric `running_runs` and `queued_runs` fields; creation returns zero counts.
+List counts come from one database snapshot. No schema migration is required.

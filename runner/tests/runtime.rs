@@ -938,3 +938,258 @@ async fn activity_logs_attribute_cached_components_and_concurrent_turns_without_
         assert!(!logs.contains(secret), "{logs}");
     }
 }
+
+/// A chat whose input remains open; output reads are bounded so regressions fail
+/// instead of leaving a subprocess stuck waiting for input.
+struct LiveChat {
+    child: Option<Child>,
+    input: Option<std::process::ChildStdin>,
+    output: std::sync::mpsc::Receiver<u8>,
+    text: Vec<u8>,
+}
+
+impl LiveChat {
+    fn new(data: &std::path::Path, args: &[&str]) -> Self {
+        use std::io::Read;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
+            .arg("--data-dir")
+            .arg(data)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let mut stdout = child.stdout.take().unwrap();
+        let (send, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut byte = [0];
+            while stdout.read_exact(&mut byte).is_ok() {
+                if send.send(byte[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child: Some(child),
+            input,
+            output,
+            text: Vec::new(),
+        }
+    }
+
+    fn until(&mut self, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !String::from_utf8_lossy(&self.text).contains(needle) {
+            let byte = self
+                .output
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for {needle:?}: {error}; output: {}",
+                        String::from_utf8_lossy(&self.text)
+                    )
+                });
+            self.text.push(byte);
+        }
+    }
+
+    fn finish(self) -> (String, String) {
+        self.finish_status(true)
+    }
+
+    fn finish_status(mut self, success: bool) -> (String, String) {
+        self.input.take();
+        let child = self.child.as_mut().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "chat did not exit: {}",
+                String::from_utf8_lossy(&self.text)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(output.status.success(), success, "{:?}", output);
+        for byte in self.output.iter() {
+            self.text.push(byte);
+        }
+        (
+            String::from_utf8(std::mem::take(&mut self.text)).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    }
+}
+
+impl Drop for LiveChat {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+async fn running(client: &Client, id: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while client.run(id).await.unwrap().status != "running" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn chat_catches_up_pending_and_new_turns_before_accepting_input() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    client
+        .create_session(Some("catch-up".into()))
+        .await
+        .unwrap();
+    let history = client
+        .submit(Some("catch-up".into()), None, "history".into(), 30)
+        .await
+        .unwrap();
+    client.watch(&history.id, 0, false).await.unwrap();
+    let active = client
+        .submit(Some("catch-up".into()), None, "wait".into(), 30)
+        .await
+        .unwrap();
+    running(&client, &active.id).await;
+    let failed = client
+        .submit(Some("catch-up".into()), None, "fail".into(), 30)
+        .await
+        .unwrap();
+    let queued = client
+        .submit(Some("catch-up".into()), None, "wait".into(), 30)
+        .await
+        .unwrap();
+    let mut chat = LiveChat::new(&data, &["chat", "--session", "catch-up"]);
+    chat.until(&format!("run {} ", active.id));
+    // Input written now must not submit a new turn until catch-up finishes.
+    use std::io::Write;
+    writeln!(chat.input.as_mut().unwrap(), "new-input").unwrap();
+    assert_eq!(client.runs(Some("catch-up")).await.unwrap().len(), 4);
+    client.cancel(&active.id).await.unwrap();
+    chat.until(&format!("run {} ", queued.id));
+    let added = client
+        .submit(Some("catch-up".into()), None, "after-catch-up".into(), 30)
+        .await
+        .unwrap();
+    client.cancel(&queued.id).await.unwrap();
+    chat.until("turn 3: new-input");
+    let (text, errors) = chat.finish();
+    let history_pos = text.find("> history").unwrap();
+    let active_pos = text.find(&format!("run {} ", active.id)).unwrap();
+    let failed_pos = text.find(&format!("run {} ", failed.id)).unwrap();
+    let queued_pos = text.find(&format!("run {} ", queued.id)).unwrap();
+    let added_pos = text.find(&format!("run {} ", added.id)).unwrap();
+    let input_pos = text.find("turn 3: new-input").unwrap();
+    assert!(
+        history_pos < active_pos
+            && active_pos < failed_pos
+            && failed_pos < queued_pos
+            && queued_pos < added_pos
+            && added_pos < input_pos,
+        "{text}"
+    );
+    assert_eq!(text.matches("> history").count(), 1, "{text}");
+    assert_eq!(text.matches("turn 2: after-catch-up").count(), 1, "{text}");
+    assert!(errors.contains("run cancelled"), "{errors}");
+    assert!(errors.contains("fixture failure"), "{errors}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn ctrl_c_detaches_chat_and_watch_successfully_without_cancelling_work() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    client.create_session(Some("detach".into())).await.unwrap();
+    let active = client
+        .submit(Some("detach".into()), None, "wait".into(), 30)
+        .await
+        .unwrap();
+    running(&client, &active.id).await;
+    let queued = client
+        .submit(Some("detach".into()), None, "hello".into(), 30)
+        .await
+        .unwrap();
+    for (args, marker, id) in [
+        (
+            vec!["chat", "--session", "detach"],
+            format!("run {} ", active.id),
+            active.id.as_str(),
+        ),
+        (
+            vec!["runs", "watch", &queued.id],
+            "Queued".into(),
+            queued.id.as_str(),
+        ),
+        (
+            vec!["run", "--session", "detach", "another"],
+            "Queued".into(),
+            "",
+        ),
+    ] {
+        let mut chat = LiveChat::new(&data, &args);
+        chat.until(&marker);
+        let status = Command::new("kill")
+            .args(["-INT", &chat.child.as_ref().unwrap().id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (text, errors) = chat.finish();
+        assert!(errors.contains("detached; run "), "{errors}");
+        assert!(errors.contains(id), "{errors}");
+        assert!(errors.contains("runner chat --session detach"), "{errors}");
+        assert!(!errors.contains("Error:"), "{errors}");
+        if args[0] == "chat" {
+            assert!(
+                text.ends_with("resume with: runner chat --session detach\n"),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(client.run(&active.id).await.unwrap().status, "running");
+    assert_eq!(client.run(&queued.id).await.unwrap().status, "queued");
+    for run in client.runs(Some("detach")).await.unwrap() {
+        assert!(!run.cancel_requested);
+        client.cancel(&run.id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn connection_failure_during_catch_up_does_not_offer_an_idle_prompt() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    client.create_session(Some("lost".into())).await.unwrap();
+    let active = client
+        .submit(Some("lost".into()), None, "wait".into(), 30)
+        .await
+        .unwrap();
+    running(&client, &active.id).await;
+    let mut chat = LiveChat::new(&data, &["chat", "--session", "lost"]);
+    chat.until(&format!("run {} ", active.id));
+    drop(daemon);
+    let (text, errors) = chat.finish_status(false);
+    // Only the pending turn's historical prompt was printed.
+    assert_eq!(text.matches("\n> ").count(), 1, "{text}");
+    assert!(errors.contains("Error:"), "{errors}");
+    assert!(
+        text.ends_with("resume with: runner chat --session lost\n"),
+        "{text}"
+    );
+}

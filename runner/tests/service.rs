@@ -733,3 +733,55 @@ async fn a_cancel_after_save_before_execution_returns_preserves_completion() {
     );
     h.close().await;
 }
+
+#[tokio::test]
+async fn session_responses_report_current_work_counts() {
+    let h = Harness::new(1).await;
+    let session: runner::db::Session = h
+        .client
+        .post(format!("{}/v1/sessions", h.url))
+        .bearer_auth("test-token")
+        .json(&json!({"id":"counts"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!((session.running_runs, session.queued_runs), (0, 0));
+    let first = h.submit(Some("counts"), "wait", 30).await;
+    h.wait_status(&first.id, "running").await;
+    let second = h.submit(Some("counts"), "wait", 30).await;
+    let third = h.submit(Some("counts"), "unused", 30).await;
+    let counts = || async {
+        let sessions: Vec<runner::db::Session> = h
+            .client
+            .get(format!("{}/v1/sessions", h.url))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = sessions.iter().find(|s| s.id == "counts").unwrap();
+        (session.running_runs, session.queued_runs)
+    };
+    assert_eq!(counts().await, (1, 2));
+    h.db.cancel(&third.id).unwrap();
+    assert_eq!(counts().await, (1, 1));
+    h.db.cancel(&first.id).unwrap();
+    h.wait_status(&second.id, "running").await;
+    assert_eq!(counts().await, (1, 0));
+    h.db.cancel(&second.id).unwrap();
+    h.wait_status(&second.id, "cancelled").await;
+    assert_eq!(counts().await, (0, 0));
+    let legacy: runner::db::Session =
+        serde_json::from_value(json!({"id":"old", "created_at":0})).unwrap();
+    assert_eq!((legacy.running_runs, legacy.queued_runs), (0, 0));
+    h.close().await;
+}

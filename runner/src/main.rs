@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, future::Future, path::PathBuf, pin::Pin};
+
+type Interrupt = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use runner::{
-    client::Client,
+    client::{Client, RunFailed},
     service,
     ui::{self, Ui},
 };
@@ -128,6 +130,14 @@ async fn main() -> Result<()> {
         return service::serve(&config, &args.data_dir, concurrency).await;
     }
     let client = Client::connect(&args.data_dir)?;
+    // Register before printing headers. Retain this future so a signal arriving
+    // during API requests or replay stays pending until the next exit point.
+    let mut interrupt: Interrupt = Box::pin(tokio::signal::ctrl_c());
+    tokio::select! {
+        biased;
+        result = &mut interrupt => { result?; return Ok(()); },
+        _ = std::future::ready(()) => {},
+    }
     match args.command {
         Command::Serve { .. } => unreachable!(),
         Command::Run {
@@ -142,7 +152,7 @@ async fn main() -> Result<()> {
             if detach {
                 println!("{}", run.id);
             } else {
-                attach(&client, &run.id, 0, false).await?;
+                let _ = attach(&client, &run.id, 0, false, &mut interrupt).await?;
             }
         }
         Command::Chat {
@@ -175,10 +185,15 @@ async fn main() -> Result<()> {
                 None => (client.create_session(None).await?.id, false),
             };
             ui::banner(details, &session);
-            if existing {
-                resumed(&client, &session).await?;
-            }
-            let result = chat(&client, &session, agent, deadline_secs).await;
+            let result = chat(
+                &client,
+                &session,
+                agent,
+                deadline_secs,
+                existing,
+                &mut interrupt,
+            )
+            .await;
             // However chat ends, even on an error, say how to come back to it.
             ui::goodbye(&session);
             result?;
@@ -197,7 +212,7 @@ async fn main() -> Result<()> {
             ),
             Runs::Watch { id, after, json } => {
                 header(&client, &client.run(&id).await?).await?;
-                attach(&client, &id, after, json).await?
+                let _ = attach(&client, &id, after, json, &mut interrupt).await?;
             }
         },
         Command::Agents {
@@ -227,12 +242,25 @@ async fn header(client: &Client, run: &runner::db::Run) -> Result<()> {
 }
 
 /// Takes prompts until the user leaves, running each as a turn in `session`.
-async fn chat(client: &Client, session: &str, agent: String, deadline_secs: u64) -> Result<()> {
+async fn chat(
+    client: &Client,
+    session: &str,
+    agent: String,
+    deadline_secs: u64,
+    existing: bool,
+    interrupt: &mut Interrupt,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    if existing {
+        resumed(client, session, &mut seen).await?;
+    }
     let mut lines = stdin_lines();
     loop {
+        if catch_up(client, session, &mut seen, interrupt, None).await? == Attachment::Detached {
+            break;
+        }
         ui::prompt();
-        let line =
-            tokio::select! { line = lines.recv() => line, _ = tokio::signal::ctrl_c() => break };
+        let line = tokio::select! { biased; result = &mut *interrupt => { result?; break; }, line = lines.recv() => line };
         ui::end_input();
         let Some(line) = line else {
             break;
@@ -253,8 +281,10 @@ async fn chat(client: &Client, session: &str, agent: String, deadline_secs: u64)
                 deadline_secs,
             )
             .await?;
-        if let Err(error) = attach(client, &run.id, 0, false).await {
-            ui::error(&error.to_string());
+        if catch_up(client, session, &mut seen, interrupt, Some(&run.id)).await?
+            == Attachment::Detached
+        {
+            break;
         }
     }
     Ok(())
@@ -278,10 +308,16 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<std::io::Result<String>> {
 
 /// Replays a picked-up session's conversation: each completed turn's prompt
 /// and output. Other turns weren't saved, so the model doesn't remember them.
-async fn resumed(client: &Client, session: &str) -> Result<()> {
-    let turns: Vec<_> = client
-        .runs(Some(session))
-        .await?
+async fn resumed(client: &Client, session: &str, seen: &mut HashSet<String>) -> Result<()> {
+    let runs = client.runs(Some(session)).await?;
+    // Failed history was not saved. Mark all initial terminal turns as seen,
+    // but leave pending turns to catch_up even if they finish before it lists.
+    seen.extend(
+        runs.iter()
+            .filter(|run| run.terminal())
+            .map(|run| run.id.clone()),
+    );
+    let turns: Vec<_> = runs
         .into_iter()
         .filter(|run| run.status == "completed")
         .collect();
@@ -300,9 +336,68 @@ async fn resumed(client: &Client, session: &str) -> Result<()> {
     Ok(())
 }
 
-async fn attach(client: &Client, id: &str, after: i64, json: bool) -> Result<()> {
-    tokio::select! {
-        result = client.watch(id, after, json) => result,
-        _ = tokio::signal::ctrl_c() => bail!("detached; run {id} continues. Stop it with `runner runs cancel {id}`"),
+#[derive(Debug, PartialEq, Eq)]
+enum Attachment {
+    Finished,
+    Detached,
+}
+
+/// Follow terminal failures visibly, while connection failures abort catch-up.
+async fn follow(client: &Client, id: &str, interrupt: &mut Interrupt) -> Result<Attachment> {
+    match attach(client, id, 0, false, interrupt).await {
+        Err(error) if error.is::<RunFailed>() => {
+            ui::error(&error.to_string());
+            Ok(Attachment::Finished)
+        }
+        result => result,
     }
+}
+
+async fn catch_up(
+    client: &Client,
+    session: &str,
+    seen: &mut HashSet<String>,
+    interrupt: &mut Interrupt,
+    submitted: Option<&str>,
+) -> Result<Attachment> {
+    loop {
+        let pending: Vec<_> = client
+            .runs(Some(session))
+            .await?
+            .into_iter()
+            .filter(|run| !seen.contains(&run.id))
+            .collect();
+        if pending.is_empty() {
+            return Ok(Attachment::Finished);
+        }
+        for run in pending {
+            if submitted != Some(run.id.as_str()) {
+                ui::past_prompt(&run.prompt);
+                ui::pending(&run);
+            }
+            if follow(client, &run.id, interrupt).await? == Attachment::Detached {
+                return Ok(Attachment::Detached);
+            }
+            seen.insert(run.id);
+        }
+    }
+}
+
+async fn attach(
+    client: &Client,
+    id: &str,
+    after: i64,
+    json: bool,
+    interrupt: &mut Interrupt,
+) -> Result<Attachment> {
+    let run = client.run(id).await?;
+    let outcome = tokio::select! {
+        biased;
+        result = &mut *interrupt => { result?; Attachment::Detached },
+        result = client.watch(id, after, json) => { result?; Attachment::Finished },
+    };
+    if outcome == Attachment::Detached {
+        ui::detached(&run);
+    }
+    Ok(outcome)
 }

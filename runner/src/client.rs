@@ -11,6 +11,21 @@ use crate::db::{Event, Run, Session};
 use crate::service::ConnectionInfo;
 use crate::ui::Ui;
 
+/// A terminal run failure, distinct from a transport or protocol error.
+#[derive(Debug)]
+pub struct RunFailed(pub Run);
+
+impl std::fmt::Display for RunFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.0.status.as_str(), self.0.error.as_deref()) {
+            ("failed", Some(error)) => f.write_str(error),
+            (status, error) => write!(f, "run {status}: {}", error.unwrap_or("")),
+        }
+    }
+}
+
+impl std::error::Error for RunFailed {}
+
 pub struct Client {
     http: HttpClient,
     info: ConnectionInfo,
@@ -134,7 +149,16 @@ impl Client {
         if after < 0 {
             bail!("event cursor must be nonnegative");
         }
-        let mut ui = (!json_output).then(Ui::start);
+        let run = self.run(id).await?;
+        let mut ui = (!json_output).then(|| {
+            if run.terminal() {
+                Ui::replay()
+            } else {
+                let mut ui = Ui::start();
+                ui.event(&json!({"kind":"status", "status":run.status}));
+                ui
+            }
+        });
         loop {
             let response = self
                 .request(
@@ -173,13 +197,7 @@ impl Client {
                         ui.finish();
                     }
                     if run.status != "completed" {
-                        match (run.status.as_str(), run.error) {
-                            // Already a full sentence, e.g. "API error 401: invalid x-api-key".
-                            ("failed", Some(error)) => bail!("{error}"),
-                            (status, error) => {
-                                bail!("run {status}: {}", error.as_deref().unwrap_or(""))
-                            }
-                        }
+                        return Err(RunFailed(run).into());
                     }
                     return Ok(());
                 }

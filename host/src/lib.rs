@@ -1850,7 +1850,8 @@ mod tests {
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");
-        assert_eq!(agents["default"].model(), "gpt-5");
+        assert_eq!(agents["default"].provider_name, "anthropic");
+        assert_eq!(agents["default"].model(), "claude-sonnet-5");
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]

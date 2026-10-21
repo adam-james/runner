@@ -12,7 +12,12 @@ async fn api_logs_include_auth_rejections_and_templates_without_secrets() {
     let service = Service::new(
         Database::open(&dir.path().join("db")).unwrap(),
         "TOKEN_SECRET".into(),
-        vec!["default".into()],
+        vec![host::AgentInfo {
+            name: "default".into(),
+            provider: "fixture".into(),
+            model: "fixture".into(),
+            tools: vec![],
+        }],
     );
     for (path, authorized, expected) in [
         ("/v1/agents?QUERY_SECRET", true, 200),
