@@ -163,7 +163,13 @@ impl Client {
                         ui.finish();
                     }
                     if run.status != "completed" {
-                        bail!("run {}: {}", run.status, run.error.as_deref().unwrap_or(""));
+                        match (run.status.as_str(), run.error) {
+                            // Already a full sentence, e.g. "API error 401: invalid x-api-key".
+                            ("failed", Some(error)) => bail!("{error}"),
+                            (status, error) => {
+                                bail!("run {status}: {}", error.as_deref().unwrap_or(""))
+                            }
+                        }
                     }
                     return Ok(());
                 }

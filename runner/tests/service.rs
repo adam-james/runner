@@ -57,6 +57,9 @@ impl Executor for FakeExecutor {
             if run.prompt == "fail" {
                 bail!("private provider failure: SECRET");
             }
+            if run.prompt == "api error" {
+                return Err(host::TurnFailed("API error 401: invalid x-api-key".into()).into());
+            }
             if run.prompt == "panic" {
                 panic!("executor bug");
             }
@@ -229,8 +232,16 @@ async fn cancellation_deadlines_and_failures_release_execution() {
     let run = h.wait_status(&timed.id, "failed").await;
     assert_eq!(run.error.as_deref(), Some("run deadline exceeded"));
     assert_eq!(h.executor.active.load(Ordering::SeqCst), 0);
+    let failed = h.submit(None, "api error", 5).await;
+    let run = h.wait_status(&failed.id, "failed").await;
+    assert_eq!(
+        run.error.as_deref(),
+        Some("API error 401: invalid x-api-key"),
+        "the agent's message for the user is kept"
+    );
     let failed = h.submit(None, "fail", 5).await;
-    h.wait_status(&failed.id, "failed").await;
+    let run = h.wait_status(&failed.id, "failed").await;
+    assert_eq!(run.error.as_deref(), Some("agent execution failed"));
     assert!(
         !serde_json::to_string(&h.db.events(&failed.id, 0).unwrap())
             .unwrap()

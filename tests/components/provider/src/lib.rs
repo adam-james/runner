@@ -7,7 +7,7 @@ wit_bindgen::generate!({
 });
 use exports::local::agent::provider_api::{Guest, ToolDefinition};
 use local::agent::messages::{ContentBlock, Role, ToolUseBlock};
-use local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
+use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream};
 struct Provider;
 
 impl Guest for Provider {
@@ -31,6 +31,19 @@ impl Guest for Provider {
             }
             if prompt == "wait" {
                 wasip3::clocks::monotonic_clock::wait_for(60_000_000_000).await;
+            }
+            if prompt == "api-error" {
+                drop(writer);
+                // A server that reflects the credential back, as some do.
+                let body = r#"{"error":{"message":"invalid x-api-key host-only-fixture-key"}}"#;
+                result
+                    .write(Err(ChatError::Api(ApiErrorDetail {
+                        status: 401,
+                        body: body.into(),
+                    })))
+                    .await
+                    .ok();
+                return;
             }
             if prompt == "fail" {
                 drop(writer);
@@ -70,7 +83,14 @@ impl Guest for Provider {
             result
                 .write(Ok(ChatResponse {
                     content,
-                    stop_reason: Some("end_turn".into()),
+                    stop_reason: Some(
+                        if prompt == "cutoff" {
+                            "max_tokens"
+                        } else {
+                            "end_turn"
+                        }
+                        .into(),
+                    ),
                     reasoning_tokens: Some(1),
                     prompt_tokens: Some(7),
                     cache_read_tokens: Some(0),

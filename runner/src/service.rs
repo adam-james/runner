@@ -364,21 +364,25 @@ async fn execute(
     let deadline = tokio::time::sleep(Duration::from_secs(run.deadline_secs));
     tokio::pin!(deadline);
     let mut poll = tokio::time::interval(Duration::from_millis(25));
-    let (status, error) = loop {
+    let (status, error): (&str, Option<String>) = loop {
         tokio::select! {
             biased;
             // A finished turn has already been saved, so it wins over cancel, deadline and shutdown.
             result = &mut future => break match result {
                 Ok(()) => ("completed", None),
-                // Component/provider errors can contain reflected request headers or secrets.
-                Err(_) => ("failed", Some("agent execution failed")),
+                Err(error) => ("failed", Some(match error.downcast_ref::<host::TurnFailed>() {
+                    // The agent's own message for the user, with credentials redacted by the host.
+                    Some(failed) => failed.0.clone(),
+                    // Other component/provider errors can contain reflected request headers or secrets.
+                    None => "agent execution failed".into(),
+                })),
             },
-            _ = shutdown.cancelled() => break ("interrupted", Some("daemon stopped during execution")),
-            _ = &mut deadline => break ("failed", Some("run deadline exceeded")),
+            _ = shutdown.cancelled() => break ("interrupted", Some("daemon stopped during execution".into())),
+            _ = &mut deadline => break ("failed", Some("run deadline exceeded".into())),
             _ = poll.tick() => {
                 let mut writer = buffer.lock().unwrap();
                 if writer.last_flush.elapsed() >= Duration::from_millis(50) { writer.flush(); }
-                if writer.failed { break ("failed", Some("could not persist run events")); }
+                if writer.failed { break ("failed", Some("could not persist run events".into())); }
                 drop(writer);
                 // A failed poll (e.g. SQLITE_BUSY) is retried on the next tick.
                 if matches!(db.run(&run.id), Ok(Some(r)) if r.cancel_requested) { break ("cancelled", None); }
@@ -398,7 +402,7 @@ async fn execute(
         if failed {
             Some("could not persist run events")
         } else {
-            error
+            error.as_deref()
         },
     )?;
     Ok(())

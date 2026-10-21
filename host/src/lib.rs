@@ -968,9 +968,55 @@ impl Runtime {
                     .await
             })
             .await??
-            .map_err(Error::msg)
+            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
     }
 }
+
+/// Strips configured credentials out of a message headed for run storage
+/// and the user, in case a server reflected one back in an error.
+fn redact(config: &RunnerConfig, message: &str) -> String {
+    let mut secrets: Vec<&str> = std::iter::once(&config.provider.component)
+        .chain(&config.tools)
+        .chain(&config.session_store)
+        .flat_map(|component| component.headers.values())
+        // The whole value, and its parts, e.g. the token in "Bearer <token>".
+        .flat_map(|header| {
+            std::iter::once(header.value.as_str()).chain(header.value.split_whitespace())
+        })
+        .filter(|secret| secret.len() >= 8)
+        .collect();
+    // Longest first, so a value is redacted whole before any part of it.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let mut message = message.to_string();
+    for secret in secrets {
+        message = message.replace(secret, "[redacted]");
+    }
+    if message.chars().count() > MAX_ERROR_CHARS {
+        message = message
+            .chars()
+            .take(MAX_ERROR_CHARS - 1)
+            .collect::<String>()
+            + "…";
+    }
+    message
+}
+
+/// Longest turn error kept; API error bodies can be whole HTML pages.
+const MAX_ERROR_CHARS: usize = 500;
+
+/// A turn the agent gave up on, with a message written for the user (e.g.
+/// "API error 401: invalid x-api-key"). Credentials are already redacted.
+/// Any other `run_turn` error is internal and may contain secrets.
+#[derive(Debug)]
+pub struct TurnFailed(pub String);
+
+impl std::fmt::Display for TurnFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TurnFailed {}
 
 // Bounded diagnostic capture; dropped after execution stores on every exit path.
 struct Diagnostics {
@@ -1024,6 +1070,38 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
             .collect()
+    }
+
+    #[test]
+    fn turn_errors_redact_configured_credentials() {
+        let config: RunnerConfig = toml::from_str(
+            r#"
+            agent = "agent.wasm"
+            [provider]
+            path = "provider.wasm"
+            model = "m"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = { value = "Bearer sk-live-12345", hosts = ["api.example.com"] } }
+            [[tools]]
+            path = "tool.wasm"
+            allowed_hosts = ["tool.example.com"]
+            headers = { x-key = { value = "tool-key-abcdef", hosts = ["tool.example.com"] }, x-client = { value = "runner", hosts = ["tool.example.com"] } }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            redact(&config, "API error 401: bad header 'Bearer sk-live-12345'"),
+            "API error 401: bad header '[redacted]'"
+        );
+        assert_eq!(
+            redact(&config, "token sk-live-12345 and tool-key-abcdef rejected"),
+            "token [redacted] and [redacted] rejected"
+        );
+        // Short values like "runner" would mangle ordinary words.
+        assert_eq!(redact(&config, "runner failed"), "runner failed");
+        let long = redact(&config, &"x".repeat(2000));
+        assert_eq!(long.chars().count(), MAX_ERROR_CHARS);
+        assert!(long.ends_with('…'));
     }
 
     const CONFIG: &str = r#"

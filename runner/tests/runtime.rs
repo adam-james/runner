@@ -310,6 +310,36 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
+async fn failed_turns_explain_why_without_leaking_credentials() {
+    let fixture = Fixture::new();
+    let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(fixture.runtime())),
+        1,
+        stop.clone(),
+    ));
+    for (prompt, error) in [
+        ("api-error", "API error 401: invalid x-api-key [redacted]"),
+        (
+            "cutoff",
+            "reply cut off: hit the 16384 token limit, so this turn wasn't saved",
+        ),
+        ("fail", "internal error: fixture failure"),
+    ] {
+        let run = db.submit(None, prompt.into(), 5).unwrap();
+        assert_eq!(
+            wait(&db, &run.id, "failed").await.error.as_deref(),
+            Some(error)
+        );
+    }
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
 async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
     let fixture = Fixture::with_tool_timeout(60);
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();

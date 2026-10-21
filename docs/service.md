@@ -25,8 +25,12 @@ for text and usage. It retains its model/tool loop and session load/save calls.
 The host records tool execution and lifecycle transitions itself. Terminal
 formatting is not part of the service's component protocol. The host captures
 guest stdout/stderr separately, up to 64 KiB each, and emits them as
-diagnostics when execution ends. Raw component/provider errors are not published
-to clients because they may include reflected request data.
+diagnostics when execution ends. When the agent gives up on a turn, its message
+(e.g. `API error 401: invalid x-api-key`, or the token-limit cut-off) becomes the
+run's `error`, with configured header values redacted and capped at 500
+characters. Other component/provider errors are not published to clients
+because they may include reflected request data; those runs say only
+`agent execution failed`.
 
 SQLite stores sessions, submitted runs, and ordered events. The existing
 session-store component stores completed conversation turns. Submission and its

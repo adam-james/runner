@@ -23,8 +23,10 @@ impl exports::local::agent::agent_api::Guest for Agent {
             content: vec![ContentBlock::Text(prompt)],
         });
         run_turn(&mut history).await.map_err(|error| match error {
-            TurnError::Chat(error) => format!("{error:?}"),
-            TurnError::TokenLimit => "reply exceeded token limit".to_string(),
+            TurnError::Chat(error) => describe(&error),
+            TurnError::TokenLimit => format!(
+                "reply cut off: hit the {MAX_TOKENS} token limit, so this turn wasn't saved"
+            ),
         })?;
         session::save(&history)
     }
@@ -109,4 +111,24 @@ async fn run_turn(history: &mut Vec<Message>) -> Result<(), TurnError> {
             content: tool_results,
         });
     }
+}
+
+fn describe(error: &ChatError) -> String {
+    match error {
+        ChatError::InvalidRequest(m) => format!("invalid request: {m}"),
+        ChatError::Network(m) => format!("network error: {m}"),
+        ChatError::Api(detail) => format!(
+            "API error {}: {}",
+            detail.status,
+            api_error_message(&detail.body).unwrap_or_else(|| detail.body.trim().to_string())
+        ),
+        ChatError::Internal(m) => format!("internal error: {m}"),
+    }
+}
+
+/// The message out of an API error body shaped like
+/// `{"error": {"message": ...}}`, which both Anthropic and OpenAI use.
+fn api_error_message(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(body["error"]["message"].as_str()?.to_string())
 }
