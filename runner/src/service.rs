@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::future::IntoFuture;
@@ -90,12 +91,15 @@ fn private_options() -> OpenOptions {
 
 impl LocalInstance {
     pub fn acquire(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        // Only directories we create are made private; never chmod a user-supplied one like $HOME.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        builder.create(dir)?;
         let file = private_options().open(dir.join("daemon.lock"))?;
         file.try_lock()
             .context("a daemon is already using this data directory")?;
@@ -363,6 +367,12 @@ async fn execute(
     let (status, error) = loop {
         tokio::select! {
             biased;
+            // A finished turn has already been saved, so it wins over cancel, deadline and shutdown.
+            result = &mut future => break match result {
+                Ok(()) => ("completed", None),
+                // Component/provider errors can contain reflected request headers or secrets.
+                Err(_) => ("failed", Some("agent execution failed")),
+            },
             _ = shutdown.cancelled() => break ("interrupted", Some("daemon stopped during execution")),
             _ = &mut deadline => break ("failed", Some("run deadline exceeded")),
             _ = poll.tick() => {
@@ -370,13 +380,9 @@ async fn execute(
                 if writer.last_flush.elapsed() >= Duration::from_millis(50) { writer.flush(); }
                 if writer.failed { break ("failed", Some("could not persist run events")); }
                 drop(writer);
-                if db.run(&run.id)?.is_some_and(|r| r.cancel_requested) { break ("cancelled", None); }
+                // A failed poll (e.g. SQLITE_BUSY) is retried on the next tick.
+                if matches!(db.run(&run.id), Ok(Some(r)) if r.cancel_requested) { break ("cancelled", None); }
             }
-            result = &mut future => break match result {
-                Ok(()) => ("completed", None),
-                // Component/provider errors can contain reflected request headers or secrets.
-                Err(_) => ("failed", Some("agent execution failed")),
-            },
         }
     };
     cancel.cancel();
@@ -409,26 +415,59 @@ pub async fn worker(
         bail!("concurrency must be positive");
     }
     let mut jobs = JoinSet::new();
+    let mut runs = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            completed = jobs.join_next(), if !jobs.is_empty() => {
-                completed.context("worker task disappeared")???;
+            Some(completed) = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                contain(&db, &mut runs, completed);
             }
             _ = tick.tick() => {
                 while jobs.len() < concurrency {
-                    let Some(run) = db.claim()? else { break; };
-                    jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone()));
+                    let run = match db.claim() {
+                        Ok(Some(run)) => run,
+                        Ok(None) => break,
+                        // Transient (e.g. SQLITE_BUSY); retry on the next tick.
+                        Err(error) => {
+                            eprintln!("could not claim run: {error:#}");
+                            break;
+                        }
+                    };
+                    let id = run.id.clone();
+                    let job = jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone()));
+                    runs.insert(job.id(), id);
                 }
             }
         }
     }
-    while let Some(result) = jobs.join_next().await {
-        result??;
+    while let Some(completed) = jobs.join_next_with_id().await {
+        contain(&db, &mut runs, completed);
     }
     Ok(())
+}
+
+/// One job's error or panic must not stop the daemon or abort its sibling runs.
+fn contain(
+    db: &Database,
+    runs: &mut HashMap<tokio::task::Id, String>,
+    completed: Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
+) {
+    let (id, error) = match completed {
+        Ok((id, Ok(()))) => {
+            runs.remove(&id);
+            return;
+        }
+        Ok((id, Err(error))) => (id, format!("{error:#}")),
+        Err(error) => (error.id(), error.to_string()),
+    };
+    let Some(run) = runs.remove(&id) else { return };
+    eprintln!("run {run} failed internally: {error}");
+    // No-op if execute already published a terminal status.
+    if let Err(error) = db.finish(&run, "failed", Some("internal error")) {
+        eprintln!("could not mark run {run} failed: {error:#}");
+    }
 }
 
 pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<()> {

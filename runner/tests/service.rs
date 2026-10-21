@@ -57,6 +57,9 @@ impl Executor for FakeExecutor {
             if run.prompt == "fail" {
                 bail!("private provider failure: SECRET");
             }
+            if run.prompt == "panic" {
+                panic!("executor bug");
+            }
             events(json!({"kind":"text", "text":run.prompt}));
             Ok(())
         })
@@ -237,6 +240,37 @@ async fn cancellation_deadlines_and_failures_release_execution() {
 }
 
 #[tokio::test]
+async fn a_panicking_job_fails_alone_and_the_worker_keeps_running() {
+    let h = Harness::new(2).await;
+    let sibling = h.submit(None, "sibling", 5).await;
+    let broken = h.submit(None, "panic", 5).await;
+    let run = h.wait_status(&broken.id, "failed").await;
+    assert_eq!(run.error.as_deref(), Some("internal error"));
+    h.wait_status(&sibling.id, "completed").await;
+    let later = h.submit(None, "later", 5).await;
+    h.wait_status(&later.id, "completed").await;
+    assert!(!h.worker.is_finished());
+    h.close().await;
+}
+
+#[test]
+fn a_late_cancel_does_not_hide_a_completed_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    let completed = db.submit(None, "done".into(), 60).unwrap();
+    let failed = db.submit(None, "broken".into(), 60).unwrap();
+    db.claim().unwrap().unwrap();
+    db.cancel(&completed.id).unwrap();
+    db.finish(&completed.id, "completed", None).unwrap();
+    assert_eq!(db.run(&completed.id).unwrap().unwrap().status, "completed");
+    db.claim().unwrap().unwrap();
+    db.cancel(&failed.id).unwrap();
+    db.finish(&failed.id, "failed", Some("agent execution failed"))
+        .unwrap();
+    assert_eq!(db.run(&failed.id).unwrap().unwrap().status, "cancelled");
+}
+
+#[tokio::test]
 async fn authenticated_api_rejects_invalid_requests() {
     let h = Harness::new(1).await;
     assert_eq!(
@@ -350,10 +384,6 @@ fn daemon_lock_and_descriptor_are_private() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
             std::fs::metadata(dir.path().join("connection.json"))
                 .unwrap()
                 .permissions()
@@ -369,4 +399,25 @@ fn daemon_lock_and_descriptor_are_private() {
     drop(first);
     assert!(!dir.path().join("connection.json").exists());
     assert!(LocalInstance::acquire(dir.path()).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn acquire_creates_a_private_directory_but_leaves_existing_ones_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let created = dir.path().join("new/service");
+    let _first = LocalInstance::acquire(&created).unwrap();
+    assert_eq!(
+        std::fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let existing = dir.path().join("shared");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _second = LocalInstance::acquire(&existing).unwrap();
+    assert_eq!(
+        std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }

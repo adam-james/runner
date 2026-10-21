@@ -263,7 +263,12 @@ impl Database {
             tx.query_row("SELECT cancel_requested FROM runs WHERE id=?1", [id], |r| {
                 r.get::<_, bool>(0)
             })?;
-        let status = if cancelled { "cancelled" } else { status };
+        // A completed turn is already in the session history; a late cancel must not hide it.
+        let status = if cancelled && status != "completed" {
+            "cancelled"
+        } else {
+            status
+        };
         if tx.execute(
             "UPDATE runs SET status=?2, error=?3 WHERE id=?1 AND status='running'",
             params![id, status, error],
