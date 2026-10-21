@@ -1,17 +1,23 @@
 agent = "target/wasm32-wasip2/release/agent.wasm"
 
-# [provider]
-# path = "target/wasm32-wasip2/release/anthropic.wasm"
-# model = "claude-sonnet-5"
-# allowed_hosts = ["api.anthropic.com"]
-# headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = ["api.anthropic.com"] } }
-
-[provider]
+# Model providers, by name. Agent definitions pick one with `provider = "<name>"`;
+# `model` here is the default for agents that don't set their own. Every
+# provider's credentials must be set when the daemon starts, so leave unused
+# ones commented out.
+[providers.openai]
 path = "target/wasm32-wasip2/release/openai.wasm"
 model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
 headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = [
     "api.openai.com",
+] } }
+
+[providers.anthropic]
+path = "target/wasm32-wasip2/release/anthropic.wasm"
+model = "claude-sonnet-5"
+allowed_hosts = ["api.anthropic.com"]
+headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = [
+    "api.anthropic.com",
 ] } }
 
 [tools.get_weather]
@@ -25,7 +31,9 @@ allowed_hosts = ["site.api.espn.com"]
 [tools.web_search]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
-headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = [
+    "api.tavily.com",
+] } }
 
 [tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
@@ -71,22 +79,25 @@ path = "target/wasm32-wasip2/release/edit_file.wasm"
 dir = "${HOME}/.runner/files"
 dir_writable = true
 
-# Agent definitions pick from the provider and tools above. Runs use
+# Agent definitions pick from the providers and tools above. Runs use
 # `default` unless they name another, e.g. `runner run --agent researcher ...`.
-# Tools use their table keys (read_file, web_search, ...); a definition without
-# `tools` has none. `system_prompt` replaces the agent's built-in "You are a
-# helpful assistant."
+# Each names its provider; `model` overrides the provider's. Tools use their
+# table keys (read_file, web_search, ...); a definition without `tools` has none.
+# `system_prompt` replaces the agent's built-in "You are a helpful assistant."
 [agents.default]
+provider = "anthropic"
 tools = ["get_scores", "get_weather"]
 
 # Read-only access to files under the configured read_file directory.
 # Try: runner chat --agent reader
 [agents.reader]
+provider = "openai"
 tools = ["read_file"]
 
 # Web search with a smaller model and no local file access.
 # Try: runner chat --agent researcher
 [agents.researcher]
+provider = "openai"
 model = "gpt-5-mini"
 tools = ["web_search"]
 system_prompt = """

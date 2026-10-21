@@ -61,18 +61,19 @@ runner agents list
 runner run --agent researcher "What changed in the latest Rust release?"
 ```
 
-`run` and `runs watch` print the run's agent and session ID on stderr; `run
---detach` prints the run ID on stdout. Without `--detach`, `run` streams output
-until completion. Ctrl-C while watching detaches; use `runs cancel` to stop the
-run. Failed, cancelled, and interrupted runs produce a nonzero watcher exit
-status. `chat` submits one turn at a time in the same session; its banner names
-the agent and session. When it ends, it prints the command to resume the
-session. Resuming a session with `chat --session` first replays its completed
-turns: each prompt, the reply, and its tool calls. Failed and cancelled turns
-aren't replayed, since they weren't saved to the conversation. `--session` on
-`run` requires an existing session. `--agent` on `run` and `chat` picks a named
-agent definition from the config's `[agents.<name>]` tables (see `runner.toml`);
-without it, runs use `default`.
+`run` and `runs watch` print the run's agent and session ID on stderr, followed
+by the agent's provider, model, and tools; `run --detach` prints the run ID on
+stdout. Without `--detach`, `run` streams output until completion. Ctrl-C while
+watching detaches; use `runs cancel` to stop the run. Failed, cancelled, and
+interrupted runs produce a nonzero watcher exit status. `chat` submits one turn
+at a time in the same session; its banner names the agent and session, followed
+by the agent's provider, model, and tools. When it ends, it prints the command
+to resume the session. Resuming a session with `chat --session` first replays
+its completed turns: each prompt, the reply, and its tool calls. Failed and
+cancelled turns aren't replayed, since they weren't saved to the conversation.
+`--session` on `run` requires an existing session. `--agent` on `run` and `chat`
+picks a named agent definition from the config's `[agents.<name>]` tables (see
+`runner.toml`); without it, runs use `default`.
 
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;
@@ -190,8 +191,8 @@ Fixtures are test components and should not be included in normal configs.
 - `stores/fs/` — a session store that keeps each session as a JSON file
   in the one directory its config gives it.
 
-Only the keys the config actually uses need to be set — the provider's,
-plus `TAVILY_API_KEY` if the search tool is configured. The host only reads
+Only the keys the config actually uses need to be set — each configured
+provider's, plus `TAVILY_API_KEY` if the search tool is configured. The host only reads
 the env vars the config's `headers` reference, and fails at startup with
 `environment variable ... is not set` if one is missing.
 
@@ -209,7 +210,7 @@ The daemon takes a TOML config file with `runner serve --config PATH`
 ```toml
 agent = "target/wasm32-wasip2/release/agent.wasm"
 
-[provider]
+[providers.anthropic]
 path = "target/wasm32-wasip2/release/anthropic.wasm"
 model = "claude-sonnet-5"
 allowed_hosts = ["api.anthropic.com"]
@@ -227,7 +228,18 @@ allowed_hosts = ["site.api.espn.com"]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
 headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+
+[agents.default]
+provider = "anthropic"
+tools = ["get_weather", "get_scores", "web_search"]
 ```
+
+Providers are named the same way: each `[providers.<name>]` table is a provider
+component with its default `model`, and every agent definition picks one with
+`provider = "<name>"`, optionally overriding its `model`. Several providers can
+be configured at once, and different agents can use different ones. Each
+configured provider's credentials must be set when the daemon starts, so
+leave unused ones out or commented out.
 
 Tool table keys are the names the model sees and agent definitions select. For
 example, `[tools.read_file]` is selected with `tools = ["read_file"]`. Names must
@@ -513,7 +525,7 @@ against any provider/model/tool-set the config points them at:
 ```toml
 agent = "target/wasm32-wasip2/release/agent.wasm"
 
-[provider]
+[providers.openai]
 path = "target/wasm32-wasip2/release/openai.wasm"
 model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
@@ -522,6 +534,10 @@ headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.
 [tools.get_weather]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
+
+[agents.default]
+provider = "openai"
+tools = ["get_weather"]
 ```
 
 A new tool is a new `[tools.<name>]` table pointing at its own component, with

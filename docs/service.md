@@ -10,22 +10,23 @@ point; interactive use goes through `runner chat`.
 ## Execution and persistence
 
 An **agent definition** selects the agent component, provider, model, tools, and
-system prompt. The top-level `agent`, `[provider]`, and `[tools.<name>]` are
-shared pools; each `[agents.<name>]` table picks from them: an optional `agent`
-path, either a `model` override or a whole `provider` table, `tools` by their
-configured table keys (none if omitted), and an optional `system_prompt`. The
-host puts a configured system prompt on every model request the agent makes, in
-place of the component's own; like the model, it is host configuration the agent
-cannot override. An empty `system_prompt` is rejected. The config must declare
-`[agents.default]`, which runs use when they don't name a definition. Tool names
-use 1–64 ASCII letters, digits, underscores, or hyphens and are used for model
-calls, dispatch, and events; `describe` supplies descriptions and input schemas,
-and its legacy name field is ignored. Duplicate table keys, invalid tool names,
-unknown references, and invalid agent names are rejected before instantiating
-components. A run names its definition; a session is not bound to one, so turns
-of one conversation may use different definitions. A **session** identifies a
-conversation. A **run** performs one turn within a session and has a durable ID,
-prompt, deadline, status, and event history.
+system prompt. The top-level `agent`, `[providers.<name>]`, and `[tools.<name>]`
+are shared pools; each `[agents.<name>]` table picks from them: an optional
+`agent` path, a required `provider` by its table key, an optional `model`
+overriding the provider's default (one of the two must set a model), `tools` by
+their configured table keys (none if omitted), and an optional `system_prompt`.
+The host puts a configured system prompt on every model request the agent makes,
+in place of the component's own; like the model, it is host configuration the
+agent cannot override. An empty `system_prompt` is rejected. The config must
+declare `[agents.default]`, which runs use when they don't name a definition.
+Tool names use 1–64 ASCII letters, digits, underscores, or hyphens and are used
+for model calls, dispatch, and events; `describe` supplies descriptions and
+input schemas, and its legacy name field is ignored. Duplicate table keys,
+invalid tool or provider names, unknown references, and invalid agent names are
+rejected before instantiating components. A run names its definition; a session
+is not bound to one, so turns of one conversation may use different definitions.
+A **session** identifies a conversation. A **run** performs one turn within a
+session and has a durable ID, prompt, deadline, status, and event history.
 
 `host::Runtime` shares its Wasmtime engine and compiled components. Each session
 retains its own provider, tools, and session-store instances across turns, so tool
@@ -110,7 +111,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 
 | Method and route | Input / behavior |
 | --- | --- |
-| `GET /v1/agents` | List agent definitions as `[{"name": "default"}, ...]`, sorted by name |
+| `GET /v1/agents` | List agent definitions, sorted by name, as `[{"name": "default", "provider": "openai", "model": "gpt-5", "tools": ["get_scores"]}, ...]` |
 | `POST /v1/sessions` | `{ "id": "optional-name" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
