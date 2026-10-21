@@ -37,6 +37,9 @@ enum Command {
         prompt: String,
         #[arg(long)]
         session: Option<String>,
+        /// The agent definition to run; `default` if omitted.
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long)]
         detach: bool,
         #[arg(long, default_value_t = service::default_deadline())]
@@ -46,6 +49,9 @@ enum Command {
     Chat {
         #[arg(long)]
         session: Option<String>,
+        /// The agent definition each turn runs; `default` if omitted.
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
     },
@@ -57,6 +63,16 @@ enum Command {
         #[command(subcommand)]
         command: Sessions,
     },
+    Agents {
+        #[command(subcommand)]
+        command: Agents,
+    },
+}
+
+#[derive(Subcommand)]
+enum Agents {
+    /// The agent definitions the daemon's config declares.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -99,10 +115,11 @@ async fn main() -> Result<()> {
         Command::Run {
             prompt,
             session,
+            agent,
             detach,
             deadline_secs,
         } => {
-            let run = client.submit(session, prompt, deadline_secs).await?;
+            let run = client.submit(session, agent, prompt, deadline_secs).await?;
             eprintln!("session: {}", run.session_id);
             if detach {
                 println!("{}", run.id);
@@ -112,6 +129,7 @@ async fn main() -> Result<()> {
         }
         Command::Chat {
             session,
+            agent,
             deadline_secs,
         } => {
             let (session, existing) = match session {
@@ -148,7 +166,12 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let run = client
-                    .submit(Some(session.clone()), prompt.to_string(), deadline_secs)
+                    .submit(
+                        Some(session.clone()),
+                        agent.clone(),
+                        prompt.to_string(),
+                        deadline_secs,
+                    )
                     .await?;
                 if let Err(error) = attach(&client, &run.id, 0, false).await {
                     ui::error(&error.to_string());
@@ -166,6 +189,9 @@ async fn main() -> Result<()> {
             ),
             Runs::Watch { id, after, json } => attach(&client, &id, after, json).await?,
         },
+        Command::Agents {
+            command: Agents::List,
+        } => println!("{}", serde_json::to_string_pretty(&client.agents().await?)?),
         Command::Sessions { command } => match command {
             Sessions::List => println!(
                 "{}",

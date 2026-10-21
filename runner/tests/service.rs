@@ -67,6 +67,10 @@ impl Executor for FakeExecutor {
             if run.prompt == "panic" {
                 panic!("executor bug");
             }
+            if run.prompt == "which agent" {
+                events(json!({"kind":"text", "text":run.agent}));
+                return Ok(());
+            }
             events(json!({"kind":"text", "text":run.prompt}));
             Ok(())
         })
@@ -98,7 +102,11 @@ impl Harness {
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let service = Service::new(db.clone(), "test-token".into());
+        let service = Service::new(
+            db.clone(),
+            "test-token".into(),
+            vec!["default".into(), "researcher".into()],
+        );
         let http = tokio::spawn(async move {
             axum::serve(listener, service.router()).await.unwrap();
         });
@@ -189,6 +197,50 @@ async fn detached_runs_replay_and_reconnect_over_http() {
             .filter_map(|e| e.data["text"].as_str())
             .collect();
     assert_eq!(text, "turn 2: again");
+    h.close().await;
+}
+
+#[tokio::test]
+async fn runs_execute_the_agent_definition_they_name() {
+    let h = Harness::new(1).await;
+    let agents: Value = h
+        .client
+        .get(format!("{}/v1/agents", h.url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(agents, json!([{"name":"default"}, {"name":"researcher"}]));
+    let run: Run = h
+        .client
+        .post(format!("{}/v1/runs", h.url))
+        .bearer_auth("test-token")
+        .json(&json!({"prompt":"which agent","agent":"researcher"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run.agent, "researcher");
+    // Omitting the agent picks `default`, and a session isn't tied to one.
+    let followup = h.submit(Some(&run.session_id), "which agent", 5).await;
+    assert_eq!(followup.agent, "default");
+    for (run, agent) in [(&run, "researcher"), (&followup, "default")] {
+        h.wait_status(&run.id, "completed").await;
+        let text: String =
+            h.db.events(&run.id, 0)
+                .unwrap()
+                .iter()
+                .filter_map(|e| e.data["text"].as_str())
+                .collect();
+        assert!(text.ends_with(agent), "{text}");
+    }
     h.close().await;
 }
 
@@ -297,8 +349,12 @@ async fn failed_terminal_writes_are_retried_and_release_the_session() {
 fn a_late_cancel_does_not_hide_a_completed_turn() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
-    let completed = db.submit(None, "done".into(), 60).unwrap();
-    let failed = db.submit(None, "broken".into(), 60).unwrap();
+    let completed = db
+        .submit(None, "default".into(), "done".into(), 60)
+        .unwrap();
+    let failed = db
+        .submit(None, "default".into(), "broken".into(), 60)
+        .unwrap();
     db.claim().unwrap().unwrap();
     db.cancel(&completed.id).unwrap();
     db.finish(&completed.id, "completed", None).unwrap();
@@ -338,6 +394,7 @@ async fn authenticated_api_rejects_invalid_requests() {
         json!({"prompt":"a","deadline_secs":0}),
         json!({"prompt":"a","session_id":"../escape"}),
         json!({"prompt":"a","session_id":"missing"}),
+        json!({"prompt":"a","agent":"nope"}),
     ] {
         assert_eq!(
             h.client
@@ -387,8 +444,12 @@ fn crash_recovery_is_durable_and_does_not_replay_running_work() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");
     let db = Database::open(&path).unwrap();
-    let active = db.submit(None, "in progress".into(), 60).unwrap();
-    let queued = db.submit(None, "pending".into(), 60).unwrap();
+    let active = db
+        .submit(None, "default".into(), "in progress".into(), 60)
+        .unwrap();
+    let queued = db
+        .submit(None, "default".into(), "pending".into(), 60)
+        .unwrap();
     assert_eq!(db.claim().unwrap().unwrap().id, active.id);
     db.event(&active.id, json!({"kind":"text","text":"partial"}))
         .unwrap();
@@ -553,7 +614,9 @@ async fn live_sse_watchers_receive_all_committed_events_and_close() {
 async fn cancellation_before_execution_is_remembered_in_memory() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
-    let run = db.submit(None, "wait".into(), 60).unwrap();
+    let run = db
+        .submit(None, "default".into(), "wait".into(), 60)
+        .unwrap();
     db.claim().unwrap().unwrap();
     db.cancel(&run.id).unwrap();
     assert!(db.cancellation(&run.id).is_cancelled());
@@ -578,7 +641,8 @@ fn database_files_are_private_in_a_shared_directory() {
     std::fs::write(&stale_shm, b"").unwrap();
     std::fs::set_permissions(&stale_shm, std::fs::Permissions::from_mode(0o644)).unwrap();
     let db = Database::open(&path).unwrap();
-    db.submit(None, "secret".into(), 60).unwrap();
+    db.submit(None, "default".into(), "secret".into(), 60)
+        .unwrap();
     for suffix in ["", "-wal", "-shm"] {
         assert_eq!(mode(suffix), 0o600, "state.sqlite3{suffix}");
     }

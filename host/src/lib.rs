@@ -82,6 +82,93 @@ struct RunnerConfig {
     tools: Vec<ComponentConfig>,
     /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
+    /// Named agent definitions, each picking from the top-level agent,
+    /// provider and tools. Without a `default` entry, `default` is the
+    /// top-level config with every tool.
+    #[serde(default)]
+    agents: BTreeMap<String, AgentConfig>,
+}
+
+/// One `[agents.<name>]` table.
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfig {
+    /// The agent component; the top-level `agent` if omitted.
+    agent: Option<String>,
+    /// Replaces the top-level `[provider]` for this definition.
+    provider: Option<ProviderConfig>,
+    /// Overrides the top-level provider's model.
+    model: Option<String>,
+    /// Tools by the name each reports from `describe`. Omitted means none.
+    #[serde(default)]
+    tools: Vec<String>,
+}
+
+/// A definition resolved against the top-level config.
+struct AgentDefinition {
+    agent: String,
+    provider: ProviderConfig,
+    tools: Vec<ComponentConfig>,
+}
+
+/// The name of the definition used when a run doesn't pick one.
+pub const DEFAULT_AGENT: &str = "default";
+
+/// `config`'s definitions, with `tool_names` (one per configured tool, in
+/// order) used to look up the tools each one names.
+fn resolve_agents(
+    config: &RunnerConfig,
+    tool_names: &[String],
+) -> Result<BTreeMap<String, AgentDefinition>> {
+    let mut by_name = HashMap::new();
+    for (index, name) in tool_names.iter().enumerate() {
+        if by_name.insert(name.as_str(), index).is_some() {
+            bail!("two tools are both named '{name}'");
+        }
+    }
+    let mut agents = BTreeMap::new();
+    if !config.agents.contains_key(DEFAULT_AGENT) {
+        agents.insert(
+            DEFAULT_AGENT.to_string(),
+            AgentDefinition {
+                agent: config.agent.clone(),
+                provider: config.provider.clone(),
+                tools: config.tools.clone(),
+            },
+        );
+    }
+    for (name, agent) in &config.agents {
+        validate_name("agent name", name)?;
+        let mut provider = match &agent.provider {
+            Some(_) if agent.model.is_some() => {
+                bail!("agent '{name}': set `model` inside its `provider`, not both")
+            }
+            Some(provider) => provider.clone(),
+            None => config.provider.clone(),
+        };
+        if let Some(model) = &agent.model {
+            provider.model = model.clone();
+        }
+        let tools = agent
+            .tools
+            .iter()
+            .map(|tool| match by_name.get(tool.as_str()) {
+                Some(&index) => Ok(config.tools[index].clone()),
+                None => Err(Error::msg(format!(
+                    "agent '{name}': no tool named '{tool}'"
+                ))),
+            })
+            .collect::<Result<_>>()?;
+        agents.insert(
+            name.clone(),
+            AgentDefinition {
+                agent: agent.agent.clone().unwrap_or_else(|| config.agent.clone()),
+                provider,
+                tools,
+            },
+        );
+    }
+    Ok(agents)
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -142,6 +229,13 @@ fn load_config(path: &str) -> Result<RunnerConfig> {
     for component in std::iter::once(&mut config.provider.component)
         .chain(config.tools.iter_mut())
         .chain(config.session_store.iter_mut())
+        .chain(
+            config
+                .agents
+                .values_mut()
+                .filter_map(|agent| agent.provider.as_mut())
+                .map(|provider| &mut provider.component),
+        )
     {
         for (name, header) in &mut component.headers {
             header.value = expand_env(&header.value)
@@ -479,37 +573,37 @@ impl ToolHandle {
     }
 }
 
+async fn load_tool(runtime: &Runtime, config: &ComponentConfig) -> Result<ToolHandle> {
+    let (component, linker, mut store) = load_sandboxed(runtime, config)?;
+    let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
+    let instance = pre.instantiate_async(&mut store).await?;
+    let mut description = instance
+        .local_agent_tool_api()
+        .call_describe(&mut store)
+        .await
+        .map_err(|e| e.context(format!("describing tool {}", config.path)))?;
+    if let Some(note) = dir_note(config) {
+        description.description = format!("{} {note}", description.description);
+    }
+    Ok(ToolHandle {
+        runtime: runtime.clone(),
+        description,
+        config: config.clone(),
+        pre,
+        instance,
+        store,
+    })
+}
+
 async fn load_tools(
     runtime: &Runtime,
     configs: &[ComponentConfig],
 ) -> Result<HashMap<String, ToolHandle>> {
     let mut tools = HashMap::new();
-
     for config in configs {
-        let (component, linker, mut store) = load_sandboxed(runtime, config)?;
-        let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
-        let instance = pre.instantiate_async(&mut store).await?;
-        let mut description = instance
-            .local_agent_tool_api()
-            .call_describe(&mut store)
-            .await?;
-        if let Some(note) = dir_note(config) {
-            description.description = format!("{} {note}", description.description);
-        }
-
-        tools.insert(
-            description.name.clone(),
-            ToolHandle {
-                runtime: runtime.clone(),
-                description,
-                config: config.clone(),
-                pre,
-                instance,
-                store,
-            },
-        );
+        let tool = load_tool(runtime, config).await?;
+        tools.insert(tool.description.name.clone(), tool);
     }
-
     Ok(tools)
 }
 
@@ -552,6 +646,11 @@ async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Resu
 /// Whether `id` is fine to hand a store as a session name: short, and
 /// nothing a store using it as a file name or key could misread.
 fn validate_session_id(id: &str) -> Result<()> {
+    validate_name("session id", id)
+}
+
+/// Session ids' rules, for any name a client sends.
+fn validate_name(kind: &str, id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 64
         && !id.starts_with('.')
@@ -560,7 +659,7 @@ fn validate_session_id(id: &str) -> Result<()> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if !ok {
         bail!(
-            "invalid session id '{id}': use up to 64 letters, digits, '-', '_' or '.', \
+            "invalid {kind} '{id}': use up to 64 letters, digits, '-', '_' or '.', \
              not starting with '.'"
         );
     }
@@ -817,6 +916,7 @@ impl<T: Lift + Send + Sync + 'static, D> FutureConsumer<D> for OneshotConsumer<T
 pub struct Runtime {
     engine: Engine,
     config: Arc<RunnerConfig>,
+    agents: Arc<BTreeMap<String, AgentDefinition>>,
     components: Arc<HashMap<String, Component>>,
     _ticker: Arc<EpochTicker>,
 }
@@ -832,19 +932,18 @@ impl Drop for EpochTicker {
 pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
 impl Runtime {
-    pub fn new(path: &str) -> Result<Self> {
+    /// Loads every component, and instantiates each tool once to learn the
+    /// names agent definitions refer to it by.
+    pub async fn new(path: &str) -> Result<Self> {
         let config = load_config(path)?;
         if config.session_store.is_none() {
             bail!("daemon mode requires a [session_store]");
         }
-        Self::from_config(config)
+        Self::from_config(config).await
     }
 
-    fn from_config(config: RunnerConfig) -> Result<Self> {
-        for component in std::iter::once(&config.provider.component)
-            .chain(config.tools.iter())
-            .chain(config.session_store.iter())
-        {
+    async fn from_config(config: RunnerConfig) -> Result<Self> {
+        for component in sandboxed_components(&config) {
             SandboxHooks::new(component)?;
         }
         let mut options = Config::new();
@@ -856,10 +955,17 @@ impl Runtime {
         let engine = Engine::new(&options)?;
         let mut components = HashMap::new();
         let paths = std::iter::once(&config.agent)
-            .chain(std::iter::once(&config.provider.component.path))
-            .chain(config.tools.iter().map(|tool| &tool.path))
-            .chain(config.session_store.iter().map(|store| &store.path));
+            .chain(
+                config
+                    .agents
+                    .values()
+                    .filter_map(|agent| agent.agent.as_ref()),
+            )
+            .chain(sandboxed_components(&config).map(|component| &component.path));
         for path in paths {
+            if components.contains_key(path) {
+                continue;
+            }
             let component = Component::from_file(&engine, path)
                 .map_err(|e| e.context(format!("loading component {path}")))?;
             components.insert(path.clone(), component);
@@ -873,12 +979,24 @@ impl Runtime {
                 ticker.increment_epoch();
             }
         });
-        Ok(Self {
+        let mut runtime = Self {
             engine,
             config: Arc::new(config),
+            agents: Arc::default(),
             components: Arc::new(components),
             _ticker: Arc::new(EpochTicker(stopped)),
-        })
+        };
+        let mut tool_names = Vec::new();
+        for tool in &runtime.config.tools {
+            tool_names.push(load_tool(&runtime, tool).await?.description.name);
+        }
+        runtime.agents = Arc::new(resolve_agents(&runtime.config, &tool_names)?);
+        Ok(runtime)
+    }
+
+    /// The names of the agent definitions runs can use, sorted.
+    pub fn agents(&self) -> Vec<String> {
+        self.agents.keys().cloned().collect()
     }
 
     fn component(&self, path: &str) -> Result<Component> {
@@ -895,11 +1013,21 @@ impl Runtime {
         store.set_epoch_deadline(1);
     }
 
-    pub async fn run_turn(&self, session_id: &str, prompt: &str, events: EventSink) -> Result<()> {
+    pub async fn run_turn(
+        &self,
+        agent: &str,
+        session_id: &str,
+        prompt: &str,
+        events: EventSink,
+    ) -> Result<()> {
         validate_session_id(session_id)?;
         let config = &self.config;
-        let provider = load_provider(self, &config.provider).await?;
-        let tools = load_tools(self, &config.tools).await?;
+        let definition = self
+            .agents
+            .get(agent)
+            .ok_or_else(|| Error::msg(format!("unknown agent '{agent}'")))?;
+        let provider = load_provider(self, &definition.provider).await?;
+        let tools = load_tools(self, &definition.tools).await?;
         let mut definitions: Vec<_> = tools
             .values()
             .map(|tool| ToolDefinition {
@@ -943,7 +1071,7 @@ impl Runtime {
         );
         self.control_store(&mut store);
         let guest =
-            ChatGuest::instantiate_async(&mut store, &self.component(&config.agent)?, &linker)
+            ChatGuest::instantiate_async(&mut store, &self.component(&definition.agent)?, &linker)
                 .await?;
         let prompt = prompt.to_string();
         store
@@ -958,12 +1086,25 @@ impl Runtime {
     }
 }
 
+/// Every sandboxed component `config` declares: providers, tools and the
+/// session store.
+fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &ComponentConfig> {
+    std::iter::once(&config.provider.component)
+        .chain(&config.tools)
+        .chain(&config.session_store)
+        .chain(
+            config
+                .agents
+                .values()
+                .filter_map(|agent| agent.provider.as_ref())
+                .map(|provider| &provider.component),
+        )
+}
+
 /// Strips configured credentials out of a message headed for run storage
 /// and the user, in case a server reflected one back in an error.
 fn redact(config: &RunnerConfig, message: &str) -> String {
-    let mut secrets: Vec<&str> = std::iter::once(&config.provider.component)
-        .chain(&config.tools)
-        .chain(&config.session_store)
+    let mut secrets: Vec<&str> = sandboxed_components(config)
         .flat_map(|component| component.headers.values())
         // The whole value, and its parts, e.g. the token in "Bearer <token>".
         .flat_map(|header| {
@@ -1145,19 +1286,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn component_load_errors_name_the_file() {
-        let load = |tool: &str| {
+    #[tokio::test]
+    async fn component_load_errors_name_the_file() {
+        let load = async |tool: &str| {
             let config: RunnerConfig = toml::from_str(&format!(
                 "agent = {tool:?}\n[provider]\npath = {tool:?}\nmodel = \"m\""
             ))
             .unwrap();
-            format!("{:#}", Runtime::from_config(config).err().unwrap())
+            format!("{:#}", Runtime::from_config(config).await.err().unwrap())
         };
 
         let missing = env::temp_dir().join(format!("runner-missing-{}.wasm", std::process::id()));
         let missing = missing.to_string_lossy().into_owned();
-        let err = load(&missing);
+        let err = load(&missing).await;
         assert!(
             err.contains(&format!("loading component {missing}")),
             "{err}"
@@ -1167,7 +1308,7 @@ mod tests {
         let corrupt = env::temp_dir().join(format!("runner-corrupt-{}.wasm", std::process::id()));
         std::fs::write(&corrupt, b"\0asm\x0d\0\x01\0garbage").unwrap();
         let corrupt_path = corrupt.to_string_lossy().into_owned();
-        let err = load(&corrupt_path);
+        let err = load(&corrupt_path).await;
         std::fs::remove_file(&corrupt).unwrap();
         assert!(
             err.contains(&format!("loading component {corrupt_path}")),
@@ -1235,6 +1376,118 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.to_string().contains("`hosts` is empty"));
+    }
+
+    fn agents(extra: &str, tools: &[&str]) -> Result<BTreeMap<String, AgentDefinition>> {
+        let config: RunnerConfig = toml::from_str(&format!(
+            r#"
+            agent = "agent.wasm"
+            [provider]
+            path = "provider.wasm"
+            model = "big"
+            [[tools]]
+            path = "files.wasm"
+            [[tools]]
+            path = "docs.wasm"
+            {extra}
+            "#
+        ))
+        .map_err(|e| Error::msg(e.to_string()))?;
+        let names: Vec<String> = tools.iter().map(|name| name.to_string()).collect();
+        resolve_agents(&config, &names)
+    }
+
+    fn tool_paths(agent: &AgentDefinition) -> Vec<&str> {
+        agent.tools.iter().map(|tool| tool.path.as_str()).collect()
+    }
+
+    #[test]
+    fn default_agent_is_the_top_level_config_unless_declared() {
+        let implicit = agents("", &["files", "docs"]).unwrap();
+        assert_eq!(implicit.keys().collect::<Vec<_>>(), ["default"]);
+        let default = &implicit["default"];
+        assert_eq!(default.agent, "agent.wasm");
+        assert_eq!(default.provider.model, "big");
+        assert_eq!(tool_paths(default), ["files.wasm", "docs.wasm"]);
+
+        let declared = agents("[agents.default]\ntools = [\"docs\"]", &["files", "docs"]).unwrap();
+        assert_eq!(tool_paths(&declared["default"]), ["docs.wasm"]);
+    }
+
+    #[test]
+    fn named_agents_pick_tools_and_override_the_provider() {
+        let agents = agents(
+            r#"
+            [agents.researcher]
+            model = "small"
+            tools = ["docs"]
+            [agents.bare]
+            agent = "other-agent.wasm"
+            [agents.elsewhere.provider]
+            path = "other-provider.wasm"
+            model = "theirs"
+            "#,
+            &["files", "docs"],
+        )
+        .unwrap();
+        assert_eq!(
+            agents.keys().collect::<Vec<_>>(),
+            ["bare", "default", "elsewhere", "researcher"]
+        );
+        let researcher = &agents["researcher"];
+        assert_eq!(researcher.provider.model, "small");
+        assert_eq!(researcher.provider.component.path, "provider.wasm");
+        assert_eq!(tool_paths(researcher), ["docs.wasm"]);
+        // Tools are opt-in for a named definition.
+        assert!(agents["bare"].tools.is_empty());
+        assert_eq!(agents["bare"].agent, "other-agent.wasm");
+        assert_eq!(
+            agents["elsewhere"].provider.component.path,
+            "other-provider.wasm"
+        );
+        assert_eq!(agents["elsewhere"].provider.model, "theirs");
+    }
+
+    #[test]
+    fn bad_agent_definitions_are_rejected() {
+        let err = |extra: &str, tools: &[&str]| agents(extra, tools).err().unwrap().to_string();
+        let tools = &["files", "docs"];
+        assert!(
+            err("[agents.r]\ntools = [\"wether\"]", tools)
+                .contains("agent 'r': no tool named 'wether'")
+        );
+        assert!(err("", &["files", "files"]).contains("two tools are both named 'files'"));
+        assert!(err("[agents.\"../x\"]", tools).contains("invalid agent name '../x'"));
+        assert!(err("[agents.r]\nmodle = \"x\"", tools).contains("unknown field"));
+        assert!(
+            err(
+                "[agents.r]\nmodel = \"x\"\nprovider = { path = \"p.wasm\", model = \"y\" }",
+                tools
+            )
+            .contains("not both")
+        );
+    }
+
+    #[test]
+    fn override_providers_are_redacted() {
+        let config: RunnerConfig = toml::from_str(
+            r#"
+            agent = "agent.wasm"
+            [provider]
+            path = "provider.wasm"
+            model = "m"
+            [agents.other.provider]
+            path = "other.wasm"
+            model = "m"
+            allowed_hosts = ["api.example.com"]
+            headers = { x-api-key = { value = "other-secret-key", hosts = ["api.example.com"] } }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            redact(&config, "bad key other-secret-key"),
+            "bad key [redacted]"
+        );
     }
 
     #[test]

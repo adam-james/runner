@@ -10,7 +10,15 @@ point; interactive use goes through `runner chat`.
 ## Execution and persistence
 
 An **agent definition** selects the agent component, provider, model, and tools.
-This milestone exposes the existing config as the single `default` definition.
+The top-level `agent`, `[provider]`, and `[[tools]]` are shared pools; each
+`[agents.<name>]` table picks from them: an optional `agent` path, either a
+`model` override or a whole `provider` table, and `tools` by the name each tool
+reports (none if omitted). Without an `[agents.default]` table, `default` is the
+top-level config with every tool. At startup the daemon instantiates each tool
+once to learn its name, and rejects duplicate tool names, unknown tool
+references, and agent names that break the session ID rules. A run names its
+definition; a session is not bound to one, so turns of one conversation may use
+different definitions.
 A **session** identifies a conversation. A **run** performs one turn within a
 session and has a durable ID, prompt, deadline, status, and event history.
 
@@ -84,9 +92,10 @@ directory; a descriptor left by a crash is replaced at the next startup.
 
 | Method and route | Input / behavior |
 | --- | --- |
+| `GET /v1/agents` | List agent definitions as `[{"name": "default"}, ...]`, sorted by name |
 | `POST /v1/sessions` | `{ "id": "optional-name" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
-| `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "deadline_secs": 600 }`; returns queued run, HTTP 202 |
+| `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
 | `GET /v1/runs` | List runs in submission order |
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
@@ -96,9 +105,10 @@ Omitting `session_id` creates a fresh session transactionally with submission.
 A supplied session must already exist. Session IDs use the existing host rules:
 up to 64 ASCII letters, digits, dots, underscores, or hyphens, starting with a
 letter or digit. Prompts must contain non-whitespace text and be at most 256 KiB.
-Deadlines range from 1 to 86400 seconds. Unknown submission fields are rejected.
+Deadlines range from 1 to 86400 seconds. Omitting `agent` selects `default`; an
+unknown definition is rejected. Unknown submission fields are rejected.
 
-Run records contain `id`, `session_id`, `agent` (`default`), `prompt`, `status`,
+Run records contain `id`, `session_id`, `agent`, `prompt`, `status`,
 `created_at` (Unix milliseconds), `deadline_secs`, `cancel_requested`, and
 nullable `error`. Session records contain `id` and `created_at`.
 
@@ -129,7 +139,7 @@ so they are stored inside the private service directory.
    fresh session. Unique occurrence IDs prevent duplicate enqueueing. Skip
    missed recurring occurrences and enqueue overdue one-off tasks once when
    the daemon returns. No wake-from-sleep or remote execution initially.
-2. **Explicit delegation:** add named agent definitions and an async host
+2. **Explicit delegation:** add an async host
    capability to submit child tasks and receive results. Persist parent-child
    links. Children use separate sessions and their target definition's
    capabilities. Enforce target permissions, deadlines, and depth limits;

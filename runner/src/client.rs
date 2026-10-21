@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::db::{Event, Run, Session};
-use crate::service::ConnectionInfo;
+use crate::service::{Agent, ConnectionInfo};
 use crate::ui::Ui;
 
 pub struct Client {
@@ -69,6 +69,10 @@ impl Client {
             .await
     }
 
+    pub async fn agents(&self) -> Result<Vec<Agent>> {
+        self.json(Method::GET, "/v1/agents", None).await
+    }
+
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         self.json(Method::GET, "/v1/sessions", None).await
     }
@@ -76,13 +80,16 @@ impl Client {
     pub async fn submit(
         &self,
         session: Option<String>,
+        agent: Option<String>,
         prompt: String,
         deadline: u64,
     ) -> Result<Run> {
         self.json(
             Method::POST,
             "/v1/runs",
-            Some(json!({"session_id":session,"prompt":prompt,"deadline_secs":deadline})),
+            Some(
+                json!({"session_id":session,"agent":agent,"prompt":prompt,"deadline_secs":deadline}),
+            ),
         )
         .await
     }

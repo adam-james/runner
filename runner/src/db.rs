@@ -230,6 +230,7 @@ impl Database {
     pub fn submit(
         &self,
         session_id: Option<String>,
+        agent: String,
         prompt: String,
         deadline_secs: u64,
     ) -> Result<Run> {
@@ -264,7 +265,7 @@ impl Database {
         let run = Run {
             id: new_id(),
             session_id,
-            agent: "default".into(),
+            agent,
             prompt,
             status: "queued".into(),
             created_at: now(),

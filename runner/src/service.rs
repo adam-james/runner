@@ -49,7 +49,7 @@ impl Executor for WasmExecutor {
         Box::pin(async move {
             // Dropping the losing branch's future stops the guest at its next epoch yield.
             tokio::select! {
-                result = runtime.run_turn(&run.session_id, &run.prompt, events) => result.map_err(Into::into),
+                result = runtime.run_turn(&run.agent, &run.session_id, &run.prompt, events) => result.map_err(Into::into),
                 _ = cancel.cancelled() => bail!("run cancelled"),
             }
         })
@@ -60,6 +60,8 @@ impl Executor for WasmExecutor {
 pub struct Service {
     pub db: Database,
     token: Arc<String>,
+    /// The agent definitions runs may name; fixed for the daemon's lifetime.
+    agents: Arc<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -126,6 +128,8 @@ impl Drop for LocalInstance {
 pub struct Submit {
     pub prompt: String,
     pub session_id: Option<String>,
+    /// An agent definition's name; `default` if omitted.
+    pub agent: Option<String>,
     #[serde(default = "default_deadline")]
     pub deadline_secs: u64,
 }
@@ -166,15 +170,17 @@ fn bad(error: anyhow::Error) -> ApiError {
 }
 
 impl Service {
-    pub fn new(db: Database, token: String) -> Self {
+    pub fn new(db: Database, token: String, agents: Vec<String>) -> Self {
         Self {
             db,
             token: Arc::new(token),
+            agents: Arc::new(agents),
         }
     }
 
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/v1/agents", get(list_agents))
             .route("/v1/sessions", get(list_sessions).post(create_session))
             .route("/v1/runs", get(list_runs).post(submit))
             .route("/v1/runs/{id}", get(inspect))
@@ -207,6 +213,20 @@ async fn authenticate(
     next.run(request).await
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Agent {
+    pub name: String,
+}
+
+async fn list_agents(State(s): State<Service>) -> Json<Vec<Agent>> {
+    Json(
+        s.agents
+            .iter()
+            .map(|name| Agent { name: name.clone() })
+            .collect(),
+    )
+}
+
 async fn list_sessions(
     State(s): State<Service>,
 ) -> Result<Json<Vec<crate::db::Session>>, ApiError> {
@@ -237,10 +257,20 @@ async fn submit(
     State(s): State<Service>,
     Json(input): Json<Submit>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let run =
-        s.db.blocking(move |db| db.submit(input.session_id, input.prompt, input.deadline_secs))
-            .await
-            .map_err(bad)?;
+    let agent = input
+        .agent
+        .unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+    if !s.agents.contains(&agent) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent '{agent}'"),
+        ));
+    }
+    let run = s
+        .db
+        .blocking(move |db| db.submit(input.session_id, agent, input.prompt, input.deadline_secs))
+        .await
+        .map_err(bad)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -585,7 +615,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         bail!("concurrency must be positive");
     }
     let instance = LocalInstance::acquire(data_dir)?;
-    let runtime = host::Runtime::new(config)?;
+    let runtime = host::Runtime::new(config).await?;
     let path = data_dir.join("state.sqlite3");
     let db = tokio::task::spawn_blocking(move || {
         let db = Database::open(&path)?;
@@ -600,7 +630,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         token: token.clone(),
     };
     instance.publish(&info)?;
-    let service = Service::new(db.clone(), token);
+    let service = Service::new(db.clone(), token, runtime.agents());
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();

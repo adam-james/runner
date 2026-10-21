@@ -69,6 +69,8 @@ fresh_per_call = true
 path = {}
 dir = {}
 dir_writable = true
+[agents.notools]
+model = "fixture"
 "#,
                 quote(target.join("agent.wasm")),
                 quote(target.join("test_provider.wasm")),
@@ -82,8 +84,10 @@ dir_writable = true
         Self { dir, config }
     }
 
-    fn runtime(&self) -> host::Runtime {
-        host::Runtime::new(self.config.to_str().unwrap()).unwrap()
+    async fn runtime(&self) -> host::Runtime {
+        host::Runtime::new(self.config.to_str().unwrap())
+            .await
+            .unwrap()
     }
 }
 
@@ -91,20 +95,20 @@ dir_writable = true
 #[ignore = "requires WASM fixture build"]
 async fn real_components_stream_save_resume_and_enforce_capabilities() {
     let fixture = Fixture::new();
-    let runtime = fixture.runtime();
+    let runtime = fixture.runtime().await;
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
     runtime
-        .run_turn("conversation", "hello", sink.clone())
+        .run_turn("default", "conversation", "hello", sink.clone())
         .await
         .unwrap();
     runtime
-        .run_turn("conversation", "again", sink.clone())
+        .run_turn("default", "conversation", "again", sink.clone())
         .await
         .unwrap();
     runtime
-        .run_turn("other", "separate", sink.clone())
+        .run_turn("default", "other", "separate", sink.clone())
         .await
         .unwrap();
     let output: String = events
@@ -125,7 +129,10 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         3
     );
     events.lock().unwrap().clear();
-    runtime.run_turn("probe", "tool:probe", sink).await.unwrap();
+    runtime
+        .run_turn("default", "probe", "tool:probe", sink)
+        .await
+        .unwrap();
     let events = events.lock().unwrap();
     let text: String = events.iter().filter_map(|e| e["text"].as_str()).collect();
     let probe: Value = serde_json::from_str(&text).unwrap();
@@ -165,11 +172,49 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
     .unwrap_or_else(|_| panic!("waiting for {state}: {:?}", db.run(id)))
 }
 
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn agent_definitions_only_get_the_tools_they_name() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    assert_eq!(runtime.agents(), ["default", "notools"]);
+    let run = async |agent: &str| {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = events.clone();
+        let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+        runtime
+            .run_turn(agent, agent, "tool:probe", sink)
+            .await
+            .unwrap();
+        events.lock().unwrap().clone()
+    };
+    let default = run("default").await;
+    assert!(
+        default
+            .iter()
+            .any(|e| e["kind"] == "tool_finished" && e["ok"] == true)
+    );
+    let notools = run("notools").await;
+    let finished = notools
+        .iter()
+        .find(|e| e["kind"] == "tool_finished")
+        .unwrap();
+    assert_eq!(finished["error"], "no such tool: fixture");
+    let error = runtime
+        .run_turn("nope", "s", "hello", Arc::new(|_| {}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown agent 'nope'"),
+        "{error}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires WASM fixture build"]
 async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs() {
     let fixture = Fixture::new();
-    let runtime = fixture.runtime();
+    let runtime = fixture.runtime().await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
@@ -179,16 +224,20 @@ async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs()
         stop.clone(),
     ));
     for prompt in ["cpu", "wait", "tool:spin", "tool:sleep"] {
-        let busy = db.submit(None, prompt.into(), 10).unwrap();
+        let busy = db
+            .submit(None, "default".into(), prompt.into(), 10)
+            .unwrap();
         wait(&db, &busy.id, "running").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let independent = db.submit(None, "independent".into(), 5).unwrap();
+        let independent = db
+            .submit(None, "default".into(), "independent".into(), 5)
+            .unwrap();
         wait(&db, &independent.id, "completed").await;
         db.cancel(&busy.id).unwrap();
         wait(&db, &busy.id, "cancelled").await;
     }
     for prompt in ["cpu", "wait"] {
-        let timed = db.submit(None, prompt.into(), 1).unwrap();
+        let timed = db.submit(None, "default".into(), prompt.into(), 1).unwrap();
         assert_eq!(
             wait(&db, &timed.id, "failed").await.error.as_deref(),
             Some("run deadline exceeded")
@@ -196,7 +245,7 @@ async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs()
     }
     // A tool timeout becomes a tool result; the next call uses a fresh store.
     for prompt in ["tool:spin", "tool:sleep", "tool:hello"] {
-        let run = db.submit(None, prompt.into(), 5).unwrap();
+        let run = db.submit(None, "default".into(), prompt.into(), 5).unwrap();
         wait(&db, &run.id, "completed").await;
         let text: String = db
             .events(&run.id, 0)
@@ -287,7 +336,7 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
             .unwrap()
             .contains("completed")
     );
-    let interrupted = client.submit(None, "wait".into(), 60).await.unwrap();
+    let interrupted = client.submit(None, None, "wait".into(), 60).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while client.run(&interrupted.id).await.unwrap().status != "running" {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -296,7 +345,7 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
     .await
     .unwrap();
     let queued = client
-        .submit(None, "after restart".into(), 5)
+        .submit(None, None, "after restart".into(), 5)
         .await
         .unwrap();
     drop(daemon); // SIGKILL, deliberately bypassing graceful shutdown.
@@ -318,7 +367,7 @@ async fn failed_turns_explain_why_without_leaking_credentials() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(fixture.runtime())),
+        Arc::new(WasmExecutor(fixture.runtime().await)),
         1,
         stop.clone(),
     ));
@@ -330,7 +379,7 @@ async fn failed_turns_explain_why_without_leaking_credentials() {
         ),
         ("fail", "internal error: fixture failure"),
     ] {
-        let run = db.submit(None, prompt.into(), 5).unwrap();
+        let run = db.submit(None, "default".into(), prompt.into(), 5).unwrap();
         assert_eq!(
             wait(&db, &run.id, "failed").await.error.as_deref(),
             Some(error)
@@ -354,11 +403,13 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(fixture.runtime())),
+        Arc::new(WasmExecutor(fixture.runtime().await)),
         1,
         stop.clone(),
     ));
-    let run = db.submit(None, "tool:spin".into(), 1).unwrap();
+    let run = db
+        .submit(None, "default".into(), "tool:spin".into(), 1)
+        .unwrap();
     assert_eq!(
         wait(&db, &run.id, "failed").await.error.as_deref(),
         Some("run deadline exceeded")
@@ -381,7 +432,8 @@ async fn a_failed_session_save_does_not_report_a_saved_turn() {
     let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
     let error = fixture
         .runtime()
-        .run_turn("read-only", "hello", sink)
+        .await
+        .run_turn("default", "read-only", "hello", sink)
         .await
         .unwrap_err();
     assert!(
