@@ -646,6 +646,9 @@ impl session::Host for HostState {
             .call_save(&mut handle.store, &handle.id, &messages)
             .await
             .map_err(|trap| format!("session store trapped: {trap}"))??;
+        // Report the agent's successful save before returning control to the guest.
+        // Emitting from guest code after save would leave a cancellation window.
+        (self.events)(serde_json::json!({"kind":"turn_saved"}));
         Ok(())
     }
 }
