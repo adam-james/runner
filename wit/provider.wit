@@ -10,7 +10,7 @@ interface provider-api {
     }
 
     // Translates one `chat-request` into this provider's native API call and
-    // back. `model` and `tools` come from the host's config, not the agent.
+    // back. `model` and `tools` come from the host's agent definition.
     // Credentials never cross this boundary: the host adds them as headers
     // to the provider's outbound requests (see `headers` in the config).
     chat: async func(

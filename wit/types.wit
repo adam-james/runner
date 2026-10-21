@@ -1,15 +1,14 @@
 package local:agent@0.1.0;
 
-// The types of a `chat` call, shared by the agent (via `chat-api`) and
-// providers (via `provider-api`). Kept in their own type-only interface so a
-// provider can use them without also importing `chat-api`'s functions.
+// The types of a `chat` call between the host's turn loop and a provider
+// (via `provider-api`). Kept in their own type-only interface, apart from
+// `provider-api`'s functions.
 interface types {
     use messages.{message, content-block};
 
     // Deliberately has no `provider`/`model` field: which provider and model
-    // actually serve a `chat` call is host configuration, not something the
-    // guest states or can override. Any guest component works unmodified
-    // against whatever provider the host is configured for.
+    // serve a `chat` call is host configuration, passed to the provider
+    // alongside the request.
     record chat-request {
         system: option<string>,
         max-tokens: u32,

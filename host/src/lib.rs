@@ -13,8 +13,7 @@ use tracing::{Instrument, instrument::WithSubscriber};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use wasmtime::component::{
-    Accessor, Component, Destination, FutureConsumer, FutureReader, HasSelf, Lift, Linker,
-    ResourceTable, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+    Component, FutureConsumer, Lift, Linker, ResourceTable, Source, StreamConsumer, StreamResult,
 };
 use wasmtime::{
     Cache, Config, Engine, Error, Result, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
@@ -23,24 +22,9 @@ use wasmtime::{
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
-wasmtime::component::bindgen!({
-    world: "chat-guest",
-    path: "../wit",
-    imports: {
-        // Call into the tool's or session store's own store, which is async.
-        "local:agent/chat-api.call-tool": async,
-        "local:agent/session.load": async,
-        "local:agent/session.save": async,
-    },
-});
-
-use local::agent::messages::Message;
-use local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
-use local::agent::{chat_api, run_events, session};
-
-// Scoped in their own modules so each world's generated types (also under
+// Scoped in their own modules so each world's generated types (all under
 // the `local:agent` package, since wit_bindgen requires one package per
-// directory) don't collide with the chat-guest bindgen above.
+// directory) don't collide.
 mod tool_guest {
     wasmtime::component::bindgen!({
         world: "tool-guest",
@@ -50,36 +34,32 @@ mod tool_guest {
 }
 use tool_guest::exports::local::agent::tool_api::ToolDescription;
 
+// Its bindings own the conversation types the turn loop builds requests from.
 mod provider_guest {
     wasmtime::component::bindgen!({
         world: "provider-guest",
         path: "../wit",
-        // Reuse the chat-guest bindings' types, so a `chat-request` from the
-        // agent can be handed straight to the provider, and the reply's
-        // pieces straight back, with no conversion in between.
-        with: {
-            "local:agent/messages": crate::local::agent::messages,
-            "local:agent/types": crate::local::agent::types,
-        },
     });
 }
 use provider_guest::exports::local::agent::provider_api::ToolDefinition;
+use provider_guest::local::agent::messages::{ContentBlock, Message, Role, ToolResultBlock};
+use provider_guest::local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
 
 mod session_store_guest {
     wasmtime::component::bindgen!({
         world: "session-store-guest",
         path: "../wit",
         exports: { default: async },
-        // So the agent's messages can be handed to the store as they are.
+        // So the turn's messages can be handed to the store as they are.
         with: {
-            "local:agent/messages": crate::local::agent::messages,
+            "local:agent/messages": crate::provider_guest::local::agent::messages,
         },
     });
 }
 
 #[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunnerConfig {
-    agent: String,
     /// Model providers by name; agent definitions pick one with `provider`.
     #[serde(default)]
     providers: BTreeMap<String, ProviderConfig>,
@@ -87,8 +67,8 @@ struct RunnerConfig {
     tools: BTreeMap<String, ComponentConfig>,
     /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
-    /// Named agent definitions, each picking from the top-level agent,
-    /// providers and tools. Must include `default`.
+    /// Named agent definitions, each picking from the providers and tools.
+    /// Must include `default`.
     #[serde(default)]
     agents: BTreeMap<String, AgentConfig>,
 }
@@ -97,8 +77,6 @@ struct RunnerConfig {
 #[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfig {
-    /// The agent component; the top-level `agent` if omitted.
-    agent: Option<String>,
     /// A `[providers.<name>]` key.
     provider: String,
     /// Overrides the provider's `model`.
@@ -106,14 +84,13 @@ struct AgentConfig {
     /// Tools by their configured table keys. Omitted means none.
     #[serde(default)]
     tools: Vec<String>,
-    /// Replaces the system prompt the agent component sends with each model
-    /// request. Without one, the component's own prompt is used.
+    /// The system prompt sent with each model request; without one,
+    /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
 }
 
 /// A definition resolved against the top-level config.
 struct AgentDefinition {
-    agent: String,
     /// The `[providers.<name>]` key `provider` came from.
     provider_name: String,
     provider: ProviderConfig,
@@ -173,7 +150,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
             .as_ref()
             .is_some_and(|prompt| prompt.trim().is_empty())
         {
-            bail!("agent '{name}': `system_prompt` is empty; leave it out to use the agent's own");
+            bail!("agent '{name}': `system_prompt` is empty; leave it out to use the default");
         }
         let mut provider = config
             .providers
@@ -207,7 +184,6 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
         agents.insert(
             name.clone(),
             AgentDefinition {
-                agent: agent.agent.clone().unwrap_or_else(|| config.agent.clone()),
                 provider_name: agent.provider.clone(),
                 provider,
                 tools,
@@ -751,73 +727,133 @@ fn validate_name(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-struct HostState {
-    wasi: WasiCtx,
-    table: ResourceTable,
-    /// The run's definition's `system_prompt`, if it sets one.
-    system_prompt: Option<String>,
-    components: SessionComponents,
-    events: EventSink,
-    provider_tasks: ProviderTasks,
-}
-
+/// A session's retained provider, tools and session store, and the turn
+/// loop that drives them.
 struct SessionComponents {
-    // Shared with the task driving the provider while the agent reads its response.
-    provider: Arc<Mutex<ProviderHandle>>,
+    provider: ProviderHandle,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
     session: SessionHandle,
 }
 
-#[derive(Default)]
-struct ProviderTasks(Vec<tokio::task::AbortHandle>);
-
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
     definitions.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 }
 
-impl Drop for ProviderTasks {
-    fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
-    }
-}
+/// The system prompt for definitions that don't set `system_prompt`.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+/// Per request, and it covers a reasoning model's hidden reasoning as well
+/// as the reply, so it needs headroom. Only tokens actually used are billed.
+const MAX_TOKENS: u32 = 16384;
 
-impl run_events::Host for HostState {
-    fn emit(&mut self, value: run_events::Event) {
-        let value = match value {
-            run_events::Event::Text(text) => serde_json::json!({"kind":"text", "text":text}),
-            run_events::Event::Usage(u) => {
-                serde_json::json!({"kind":"usage", "reasoning_tokens":u.reasoning_tokens,
-                "max_tokens":u.max_tokens, "prompt_tokens":u.prompt_tokens,
-                "cache_read_tokens":u.cache_read_tokens, "cache_creation_tokens":u.cache_creation_tokens})
+impl SessionComponents {
+    /// Runs one turn to completion: loads the session, calls the model and
+    /// the tools it asks for until it finishes, then saves the session. An
+    /// error is why the turn was given up, written for the user.
+    async fn turn(
+        &mut self,
+        system: &str,
+        prompt: String,
+        events: &EventSink,
+    ) -> Result<(), String> {
+        let mut history = self.load().await?.unwrap_or_default();
+        history.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(prompt)],
+        });
+        loop {
+            let request = ChatRequest {
+                system: Some(system.to_string()),
+                max_tokens: MAX_TOKENS,
+                messages: history.clone(),
+            };
+            let response = self.chat(request, events).await.map_err(|e| describe(&e))?;
+            events(serde_json::json!({"kind":"usage",
+                "reasoning_tokens":response.reasoning_tokens, "max_tokens":MAX_TOKENS,
+                "prompt_tokens":response.prompt_tokens,
+                "cache_read_tokens":response.cache_read_tokens,
+                "cache_creation_tokens":response.cache_creation_tokens}));
+            // A cut-off reply may end mid-sentence or mid-tool-call, and keeping
+            // it would only confuse the next turn. OpenAI reports "length",
+            // Anthropic "max_tokens".
+            if matches!(
+                response.stop_reason.as_deref(),
+                Some("length" | "max_tokens")
+            ) {
+                return Err(format!(
+                    "reply cut off: hit the {MAX_TOKENS} token limit, so this turn wasn't saved"
+                ));
+            }
+            let mut tool_results = Vec::new();
+            for block in &response.content {
+                if let ContentBlock::ToolUse(tool_use) = block {
+                    let result = self
+                        .call_tool(&tool_use.name, &tool_use.input_json, events)
+                        .await;
+                    tool_results.push(ContentBlock::ToolResult(ToolResultBlock {
+                        tool_use_id: tool_use.id.clone(),
+                        content: result.unwrap_or_else(|e| format!("error: {e}")),
+                    }));
+                }
+            }
+            history.push(Message {
+                role: Role::Assistant,
+                content: response.content,
+            });
+            if tool_results.is_empty() {
+                break;
+            }
+            history.push(Message {
+                role: Role::User,
+                content: tool_results,
+            });
+        }
+        self.save(&history, events).await
+    }
+
+    /// One model request, its text emitted as `text` events as it streams in.
+    async fn chat(
+        &mut self,
+        request: ChatRequest,
+        events: &EventSink,
+    ) -> Result<ChatResponse, ChatError> {
+        let (text_tx, mut text_rx) = mpsc::unbounded_channel();
+        let reply = run_provider(
+            &mut self.provider,
+            self.tool_definitions.clone(),
+            request,
+            text_tx,
+        );
+        tokio::pin!(reply);
+        let response = loop {
+            tokio::select! {
+                // Text that has arrived goes out before the reply it belongs to.
+                biased;
+                Some(text) = text_rx.recv() => events(serde_json::json!({"kind":"text", "text":text})),
+                response = &mut reply => break response,
             }
         };
-        (self.events)(value);
-    }
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
+        while let Ok(text) = text_rx.try_recv() {
+            events(serde_json::json!({"kind":"text", "text":text}));
         }
+        response
     }
-}
 
-impl chat_api::Host for HostState {
-    async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
-        (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        input: &str,
+        events: &EventSink,
+    ) -> Result<String, String> {
+        events(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
         let start = std::time::Instant::now();
         let span = tracing::info_span!("tool", call_id = activity::next_id(),
-            tool = ?activity::bounded_name(&name),
-            component = ?self.components.tools.get(&name).map(|tool| &tool.config.path));
+            tool = ?activity::bounded_name(name),
+            component = ?self.tools.get(name).map(|tool| &tool.config.path));
         let guard = activity::Activity::new(span.clone(), "tool");
         let result = async {
-            match self.components.tools.get_mut(&name) {
-                Some(tool) => tool.call(&input).await,
+            match self.tools.get_mut(name) {
+                Some(tool) => tool.call(input).await,
                 None => Err(format!("no such tool: {name}")),
             }
         }
@@ -829,20 +865,18 @@ impl chat_api::Host for HostState {
             None,
         );
         // The error is what the model sees as the tool result, so it is no more private than the session.
-        (self.events)(
+        events(
             serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok(),
             "elapsed_ms":start.elapsed().as_millis() as u64,
             "bytes":result.as_ref().map_or(0, String::len), "error":result.as_ref().err()}),
         );
         result
     }
-}
 
-impl session::Host for HostState {
-    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "load", component = ?self.components.session.store.data().hooks.component))]
+    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "load", component = ?self.session.store.data().hooks.component))]
     async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
         let guard = activity::Activity::new(tracing::Span::current(), "session_store");
-        let handle = &mut self.components.session;
+        let handle = &mut self.session;
         handle.healthy = false;
         let result = handle
             .instance
@@ -857,15 +891,15 @@ impl session::Host for HostState {
         result
     }
 
-    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "save", component = ?self.components.session.store.data().hooks.component))]
-    async fn save(&mut self, messages: Vec<Message>) -> Result<(), String> {
+    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "save", component = ?self.session.store.data().hooks.component))]
+    async fn save(&mut self, messages: &[Message], events: &EventSink) -> Result<(), String> {
         let guard = activity::Activity::new(tracing::Span::current(), "session_store");
-        let handle = &mut self.components.session;
+        let handle = &mut self.session;
         handle.healthy = false;
         let result = handle
             .instance
             .local_agent_session_store()
-            .call_save(&mut handle.store, &handle.id, &messages)
+            .call_save(&mut handle.store, &handle.id, messages)
             .await;
         handle.healthy = result.is_ok();
         let result = result
@@ -873,68 +907,43 @@ impl session::Host for HostState {
             .and_then(|result| result);
         guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
         result?;
-        // Report the agent's successful save before returning control to the guest.
-        // Emitting from guest code after save would leave a cancellation window.
-        (self.events)(serde_json::json!({"kind":"turn_saved"}));
+        // Reported before the turn returns: once the transcript is saved, the
+        // run completes even if cancellation or a deadline wins afterwards.
+        events(serde_json::json!({"kind":"turn_saved"}));
         Ok(())
     }
 }
 
-impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
-    /// Streams belong to a single store, and the provider and agent each have
-    /// their own, so the host can't just hand the provider's stream to the
-    /// agent: it copies the reply across through channels, read on the
-    /// provider side by a background task and written on the agent side by
-    /// the stream/future returned here.
-    async fn chat(accessor: &Accessor<U, Self>, mut request: ChatRequest) -> ChatStream {
-        let (provider, tools, system_prompt) = accessor.with(|mut store| {
-            let state = store.get();
-            (
-                state.components.provider.clone(),
-                state.components.tool_definitions.clone(),
-                state.system_prompt.clone(),
-            )
-        });
-        // Like the model, a configured system prompt is host config the agent can't override.
-        if system_prompt.is_some() {
-            request.system = system_prompt;
-        }
-
-        let (text_tx, text_rx) = mpsc::unbounded_channel();
-        let (response_tx, response_rx) = oneshot::channel();
-        let task = tokio::spawn(
-            async move {
-                let response = run_provider(&provider, tools, request, text_tx).await;
-                let _ = response_tx.send(response);
-            }
-            .in_current_span()
-            .with_current_subscriber(),
-        );
-
-        accessor.with(|mut store| store.get().provider_tasks.0.push(task.abort_handle()));
-        accessor.with(|mut store| ChatStream {
-            text: StreamReader::new(&mut store, ChannelProducer(text_rx))
-                .expect("concurrency support is enabled"),
-            response: FutureReader::new(&mut store, async move {
-                Ok::<_, Error>(response_rx.await.unwrap_or_else(|_| {
-                    Err(ChatError::Internal("provider task ended early".to_string()))
-                }))
-            })
-            .expect("concurrency support is enabled"),
-        })
+/// A model error as the user sees it.
+fn describe(error: &ChatError) -> String {
+    match error {
+        ChatError::InvalidRequest(m) => format!("invalid request: {m}"),
+        ChatError::Network(m) => format!("network error: {m}"),
+        ChatError::Api(detail) => format!(
+            "API error {}: {}",
+            detail.status,
+            api_error_message(&detail.body).unwrap_or_else(|| detail.body.trim().to_string())
+        ),
+        ChatError::Internal(m) => format!("internal error: {m}"),
     }
+}
+
+/// The message out of an API error body shaped like
+/// `{"error": {"message": ...}}`, which both Anthropic and OpenAI use.
+fn api_error_message(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(body["error"]["message"].as_str()?.to_string())
 }
 
 /// Calls the provider's `chat` and forwards its reply: text pieces into
 /// `text_tx` as they arrive, then the whole response as the return value.
 #[tracing::instrument(name = "provider", skip_all, fields(component = tracing::field::Empty))]
 async fn run_provider(
-    provider: &Mutex<ProviderHandle>,
+    provider: &mut ProviderHandle,
     tools: Vec<ToolDefinition>,
     request: ChatRequest,
     text_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ChatResponse, ChatError> {
-    let mut provider = provider.lock().await;
     tracing::Span::current().record("component", tracing::field::debug(&provider.config.path));
     if !provider.healthy {
         let mut store = sandbox_store(&provider.engine, &provider.config)
@@ -987,37 +996,6 @@ async fn run_provider(
     };
     guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
     result
-}
-
-/// Feeds a stream returned to a guest from a channel.
-struct ChannelProducer<T>(mpsc::UnboundedReceiver<T>);
-
-impl<T: Send + Sync + 'static, D> StreamProducer<D> for ChannelProducer<T> {
-    type Item = T;
-    type Buffer = Option<T>;
-
-    fn poll_produce<'a>(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        store: StoreContextMut<'a, D>,
-        mut destination: Destination<'a, T, Option<T>>,
-        finish: bool,
-    ) -> Poll<Result<StreamResult>> {
-        // A zero-length read is the guest checking for readiness; say yes
-        // rather than taking an item it might never collect.
-        if destination.remaining(store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        match self.get_mut().0.poll_recv(cx) {
-            Poll::Ready(Some(item)) => {
-                destination.set_buffer(Some(item));
-                Poll::Ready(Ok(StreamResult::Completed))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
-            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
 }
 
 /// Drains a stream a guest returned into a channel.
@@ -1115,15 +1093,7 @@ impl Runtime {
         options.cache(Some(Cache::from_file(None)?));
         let engine = Engine::new(&options)?;
         let mut components = HashMap::new();
-        let paths = std::iter::once(&config.agent)
-            .chain(
-                config
-                    .agents
-                    .values()
-                    .filter_map(|agent| agent.agent.as_ref()),
-            )
-            .chain(sandboxed_components(&config).map(|component| &component.path));
-        for path in paths {
+        for path in sandboxed_components(&config).map(|component| &component.path) {
             if components.contains_key(path) {
                 continue;
             }
@@ -1204,50 +1174,19 @@ impl Runtime {
         // the agent reports an application error (e.g. a rejected API request).
         // A turn with a different definition starts over with that definition's
         // own instances; it never inherits another agent's provider or tool state.
-        let components = match cached.take() {
+        let mut components = match cached.take() {
             Some((cached_agent, components)) if cached_agent == agent => components,
             _ => self.load_session(definition, session_id).await?,
         };
-        let mut linker = Linker::<HostState>::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        let diagnostics = Diagnostics::new(events.clone());
-        // No inherited terminal, environment, filesystem or network for the agent.
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                wasi: WasiCtx::builder()
-                    .stdout(diagnostics.stdout.clone())
-                    .stderr(diagnostics.stderr.clone())
-                    .build(),
-                table: ResourceTable::new(),
-                system_prompt: definition.system_prompt.clone(),
-                components,
-                events,
-                provider_tasks: ProviderTasks::default(),
-            },
-        );
-        Self::control_store(&mut store);
-        let guest =
-            ChatGuest::instantiate_async(&mut store, &self.component(&definition.agent)?, &linker)
-                .await?;
-        let prompt = prompt.to_string();
-        let result = store
-            .run_concurrent(async |accessor| {
-                guest
-                    .local_agent_agent_api()
-                    .call_run_turn(accessor, prompt)
-                    .await
-            })
-            .await??
-            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))));
-        let HostState { components, .. } = store.into_data();
+        let system = definition
+            .system_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        let result = components.turn(system, prompt.to_string(), &events).await;
         if components.session.healthy {
             *cached = Some((agent.to_string(), components));
         }
-        result
+        result.map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
     }
 
     async fn load_session(
@@ -1277,7 +1216,7 @@ impl Runtime {
         .await?;
         session.id = session_id.to_string();
         Ok(SessionComponents {
-            provider: Arc::new(Mutex::new(provider)),
+            provider,
             tools,
             tool_definitions: definitions,
             session,
@@ -1339,35 +1278,6 @@ impl std::fmt::Display for TurnFailed {
 }
 
 impl std::error::Error for TurnFailed {}
-
-// Bounded diagnostic capture; dropped after execution stores on every exit path.
-struct Diagnostics {
-    stdout: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
-    stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
-    events: EventSink,
-}
-
-impl Diagnostics {
-    fn new(events: EventSink) -> Self {
-        Self {
-            stdout: wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64 * 1024),
-            stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64 * 1024),
-            events,
-        }
-    }
-}
-impl Drop for Diagnostics {
-    fn drop(&mut self) {
-        for (source, pipe) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
-            let bytes = pipe.contents();
-            if !bytes.is_empty() {
-                (self.events)(
-                    serde_json::json!({"kind":"diagnostic", "source":source, "text":String::from_utf8_lossy(&bytes)}),
-                );
-            }
-        }
-    }
-}
 
 pub fn check_session_id(id: &str) -> Result<()> {
     validate_session_id(id)
@@ -1488,7 +1398,6 @@ mod tests {
     fn turn_errors_redact_configured_credentials() {
         let config: RunnerConfig = toml::from_str(
             r#"
-            agent = "agent.wasm"
             [providers.main]
             path = "provider.wasm"
             model = "m"
@@ -1575,7 +1484,7 @@ mod tests {
     async fn component_load_errors_name_the_file() {
         let load = async |tool: &str| {
             let config: RunnerConfig = toml::from_str(&format!(
-                "agent = {tool:?}\n[providers.p]\npath = {tool:?}\nmodel = \"m\"\n\
+                "[providers.p]\npath = {tool:?}\nmodel = \"m\"\n\
                  [agents.default]\nprovider = \"p\""
             ))
             .unwrap();
@@ -1611,7 +1520,6 @@ mod tests {
                 &path,
                 format!(
                     r#"
-                    agent = "agent.wasm"
                     [providers.main]
                     path = "provider.wasm"
                     model = "m"
@@ -1669,7 +1577,6 @@ mod tests {
     fn agents(extra: &str, tools: &[&str]) -> Result<BTreeMap<String, AgentDefinition>> {
         let config: RunnerConfig = toml::from_str(&format!(
             r#"
-            agent = "agent.wasm"
             [providers.main]
             path = "provider.wasm"
             model = "big"
@@ -1712,7 +1619,6 @@ mod tests {
         )
         .unwrap();
         let default = &declared["default"];
-        assert_eq!(default.agent, "agent.wasm");
         assert_eq!(default.provider_name, "main");
         assert_eq!(default.model(), "big");
         assert_eq!(tool_paths(default), ["docs.wasm"]);
@@ -1731,7 +1637,6 @@ mod tests {
             system_prompt = "Cite your sources."
             [agents.bare]
             provider = "main"
-            agent = "other-agent.wasm"
             [agents.elsewhere]
             provider = "other"
             model = "theirs"
@@ -1754,7 +1659,6 @@ mod tests {
         assert_eq!(agents["bare"].system_prompt, None);
         // Tools are opt-in for a named definition.
         assert!(agents["bare"].tools.is_empty());
-        assert_eq!(agents["bare"].agent, "other-agent.wasm");
         assert_eq!(
             agents["elsewhere"].provider.component.path,
             "other-provider.wasm"
@@ -1814,7 +1718,7 @@ mod tests {
     #[test]
     fn tool_names_are_validated_from_config() {
         let mut config: RunnerConfig = toml::from_str(
-            r#"agent = "agent.wasm"
+            r#"
             [providers.main]
             path = "provider.wasm"
             model = "m"
@@ -1850,7 +1754,8 @@ mod tests {
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");
-        assert_eq!(agents["default"].model(), "gpt-5");
+        assert_eq!(agents["default"].provider_name, "anthropic");
+        assert_eq!(agents["default"].model(), "claude-sonnet-5");
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]
@@ -1871,7 +1776,6 @@ mod tests {
     fn every_providers_credentials_are_redacted() {
         let config: RunnerConfig = toml::from_str(
             r#"
-            agent = "agent.wasm"
             [providers.main]
             path = "provider.wasm"
             model = "m"
@@ -1886,6 +1790,58 @@ mod tests {
         assert_eq!(
             redact(&config, "bad key other-secret-key"),
             "bad key [redacted]"
+        );
+    }
+
+    #[test]
+    fn agent_component_config_is_rejected() {
+        // The turn loop is native now; a config naming an agent component is stale.
+        let stale = toml::from_str::<RunnerConfig>(
+            "agent = \"agent.wasm\"\n[providers.p]\npath = \"p.wasm\"\nmodel = \"m\"",
+        );
+        assert!(
+            stale
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unknown field `agent`")
+        );
+        let err = agents(
+            "[agents.default]\nprovider = \"main\"\nagent = \"other-agent.wasm\"",
+            &["files", "docs"],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("unknown field `agent`"), "{err}");
+    }
+
+    #[test]
+    fn model_errors_are_described_for_the_user() {
+        use provider_guest::local::agent::types::ApiErrorDetail;
+        let api = |body: &str| {
+            describe(&ChatError::Api(ApiErrorDetail {
+                status: 401,
+                body: body.into(),
+            }))
+        };
+        // Anthropic and OpenAI both put the reason in error.message.
+        assert_eq!(
+            api(r#"{"error":{"message":"invalid x-api-key"}}"#),
+            "API error 401: invalid x-api-key"
+        );
+        assert_eq!(api("  Unauthorized\n"), "API error 401: Unauthorized");
+        assert_eq!(
+            describe(&ChatError::Network("timed out".into())),
+            "network error: timed out"
+        );
+        assert_eq!(
+            describe(&ChatError::InvalidRequest("no messages".into())),
+            "invalid request: no messages"
+        );
+        assert_eq!(
+            describe(&ChatError::Internal("provider trapped".into())),
+            "internal error: provider trapped"
         );
     }
 

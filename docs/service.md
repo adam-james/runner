@@ -1,63 +1,63 @@
 # Local agent service
 
 The native service is the execution authority. Clients submit work and watch
-persisted events; they never own agent lifetimes or receive provider credentials.
-Agents, providers, tools, and session stores remain WASM components with the
-existing capability restrictions. The CLI contains the service's terminal UI.
-The agent has one structured turn interface and no terminal mode or CLI entry
-point; interactive use goes through `runner chat`.
+persisted events; they never own agent lifetimes or receive provider
+credentials. Providers, tools, and session stores are WASM components with the
+existing capability restrictions; the agent's turn loop is native host code. The
+CLI contains the service's terminal UI. Interactive use goes through `runner
+chat`.
 
 ## Execution and persistence
 
-An **agent definition** selects the agent component, provider, model, tools, and
-system prompt. The top-level `agent`, `[providers.<name>]`, and `[tools.<name>]`
-are shared pools; each `[agents.<name>]` table picks from them: an optional
-`agent` path, a required `provider` by its table key, an optional `model`
-overriding the provider's default (one of the two must set a model), `tools` by
-their configured table keys (none if omitted), and an optional `system_prompt`.
-The host puts a configured system prompt on every model request the agent makes,
-in place of the component's own; like the model, it is host configuration the
-agent cannot override. An empty `system_prompt` is rejected. The config must
-declare `[agents.default]`, which runs use when they don't name a definition.
-Tool names use 1–64 ASCII letters, digits, underscores, or hyphens and are used
-for model calls, dispatch, and events; `describe` supplies descriptions and
-input schemas, and its legacy name field is ignored. Duplicate table keys,
-invalid tool or provider names, unknown references, and invalid agent names are
-rejected before instantiating components. A run names its definition; a session
-is not bound to one, so turns of one conversation may use different definitions.
-A **session** identifies a conversation. A **run** performs one turn within a
-session and has a durable ID, prompt, deadline, status, and event history.
+An **agent definition** selects the provider, model, tools, and system prompt
+for the host's turn loop. The top-level `[providers.<name>]` and
+`[tools.<name>]` are shared pools; each `[agents.<name>]` table picks from them:
+a required `provider` by its table key, an optional `model` overriding the
+provider's default (one of the two must set a model), `tools` by their
+configured table keys (none if omitted), and an optional `system_prompt`. The
+turn loop sends the system prompt with every model request; without one it sends
+"You are a helpful assistant." An empty `system_prompt` is rejected. The config
+must declare `[agents.default]`, which runs use when they don't name a
+definition. Tool names use 1–64 ASCII letters, digits, underscores, or hyphens
+and are used for model calls, dispatch, and events; `describe` supplies
+descriptions and input schemas, and its legacy name field is ignored. Duplicate
+table keys, invalid tool or provider names, unknown references, and invalid
+agent names are rejected before instantiating components. A run names its
+definition; a session is not bound to one, so turns of one conversation may use
+different definitions. A **session** identifies a conversation. A **run**
+performs one turn within a session and has a durable ID, prompt, deadline,
+status, and event history.
 
 `host::Runtime` shares its Wasmtime engine and compiled components. Each session
-retains its own provider, tools, and session-store instances across turns, so tool
-memory (such as Python variables) survives. Runtime clones share this session
-state. Turns within a session are serialized; different sessions use independent
-stores and provider mutexes. The agent and its diagnostic capture are fresh each
-turn. `fresh_per_call` tools still start with a new instance on every call.
-The instances belong to the definition that created them: a turn that names a
-different definition than the session's previous turn starts with new instances
-for its own definition, and later turns keep those.
+retains its own provider, tools, and session-store instances across turns, so
+tool memory (such as Python variables) survives. Runtime clones share this
+session state. Turns within a session are serialized; different sessions use
+independent stores and provider mutexes. `fresh_per_call` tools still start with
+a new instance on every call. The instances belong to the definition that
+created them: a turn that names a different definition than the session's
+previous turn starts with new instances for its own definition, and later turns
+keep those.
 
 Instances remain in memory until the runtime stops. They are not restored after
-a daemon restart; saved conversation history is. A cancelled turn or an agent
-trap discards that session's instances, since interrupted component calls cannot
-safely resume. Tool timeouts and traps recreate that tool before its next call;
-provider traps similarly recreate the provider. Normal application errors retain
-state. A session-store trap discards the session's instances. Filesystem mounts
-remain shared according to their configured paths and permissions; separate
-stores do not isolate changes made to a shared writable directory.
+a daemon restart; saved conversation history is. A cancelled turn discards that
+session's instances, since interrupted component calls cannot safely resume.
+Tool timeouts and traps recreate that tool before its next call; provider traps
+similarly recreate the provider. Normal application errors retain state. A
+session-store trap discards the session's instances. Filesystem mounts remain
+shared according to their configured paths and permissions; separate stores do
+not isolate changes made to a shared writable directory.
 
-The guest exports `agent-api.run-turn(prompt)` and imports typed `run-events`
-for text and usage. It retains its model/tool loop and session load/save calls.
-The host records tool execution and lifecycle transitions itself. Terminal
-formatting is not part of the service's component protocol. The host captures
-guest stdout/stderr separately, up to 64 KiB each, and emits them as
-diagnostics when execution ends. When the agent gives up on a turn, its message
-(e.g. `API error 401: invalid x-api-key`, or the token-limit cut-off) becomes the
-run's `error`, with configured header values redacted and capped at 500
-characters. Other component/provider errors are not published to clients
-because they may include reflected request data; those runs say only
-`agent execution failed`.
+Each turn loads the session's history, appends the prompt, and calls the
+provider until a reply asks for no tools, running the requested tools in order
+between calls. Replies are capped at 16384 tokens per request, covering any
+hidden reasoning. The loop emits `text` as it streams and `usage` after each
+reply, records tool execution and lifecycle transitions, and saves the history
+after a completed turn. When the turn is given up, its message (e.g. `API error
+401: invalid x-api-key`, or the token-limit cut-off) becomes the run's `error`,
+with configured header values redacted and capped at 500 characters. Other
+errors, such as failing to load a component, are not published to clients
+because they may include reflected request data; those runs say only `agent
+execution failed`.
 
 SQLite stores sessions, submitted runs, and ordered events. The existing
 session-store component stores completed conversation turns. Submission and its
@@ -145,11 +145,11 @@ rendered cursor; restarting the daemon requires reconnecting the CLI with its
 new connection descriptor.
 
 Other event kinds are `status`, `usage`, `tool_started`, `tool_finished`,
-`diagnostic`, `turn_saved`, and `cancellation_requested`. Tool-start events contain name and
+`turn_saved`, and `cancellation_requested`. Tool-start events contain name and
 input; tool-finish events contain name, success, `elapsed_ms`, output `bytes`,
-and the tool's `error` (the same text the model receives). Diagnostic events contain
-source (`stdout`/`stderr`) and text. These records may contain private task data,
-so they are stored inside the private service directory.
+and the tool's `error` (the same text the model receives). These records may
+contain private task data, so they are stored inside the private service
+directory.
 
 ## Roadmap
 
