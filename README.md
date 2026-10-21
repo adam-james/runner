@@ -42,7 +42,8 @@ runner serve --config runner.toml
 
 Keep `serve` running in a separate terminal (or under your system's service
 manager). The daemon requires a `[session_store]`. Configuration paths are
-relative to the daemon's working directory. Provider credentials come from the daemon's environment; clients do not need them.
+relative to the daemon's working directory. It also requires an
+`[agents.default]` table listing the tools runs may use. Provider credentials come from the daemon's environment; clients do not need them.
 
 ```bash
 runner chat                         # new conversation
@@ -56,13 +57,17 @@ runner runs cancel RUN_ID
 runner sessions list
 runner sessions create trip
 runner run --session trip "Plan a weekend in Seattle"
+runner agents list
+runner run --agent researcher "Find the tokio docs for JoinSet"
 ```
 
 `run --detach` prints a run ID on stdout and the session ID on stderr. Without
 `--detach`, `run` streams output until completion. Ctrl-C while watching detaches;
 use `runs cancel` to stop the run. Failed, cancelled, and interrupted runs produce
 a nonzero watcher exit status. `chat` submits one turn at a time in the same
-session. `--session` on `run` requires an existing session.
+session. `--session` on `run` requires an existing session. `--agent` on `run`
+and `chat` picks a named agent definition from the config's `[agents.<name>]`
+tables (see `runner.toml`); without it, runs use `default`.
 
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;

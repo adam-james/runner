@@ -71,6 +71,17 @@ dir = "."
 # dir = "${HOME}/.runner/files"
 # dir_writable = true
 
+# Agent definitions pick from the provider and tools above. Runs use
+# `default` unless they name another, e.g. `runner run --agent researcher ...`.
+# Tools go by the name each one reports (read_file, rust_docs, get_weather,
+# web_search, write_file, edit_file, ...); a definition without `tools` has none.
+[agents.default]
+tools = ["read_file", "rust_docs"]
+
+# [agents.researcher]
+# model = "gpt-5-mini"   # or a whole `provider = { ... }` table
+# tools = ["rust_docs"]
+
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"
 dir = "${HOME}/.runner/sessions"
