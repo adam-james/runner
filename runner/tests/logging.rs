@@ -17,6 +17,7 @@ async fn api_logs_include_auth_rejections_and_templates_without_secrets() {
             provider: "fixture".into(),
             model: "fixture".into(),
             tools: vec![],
+            delegates: vec![],
         }],
     );
     for (path, authorized, expected) in [

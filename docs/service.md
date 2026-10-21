@@ -158,12 +158,10 @@ directory.
    fresh session. Unique occurrence IDs prevent duplicate enqueueing. Skip
    missed recurring occurrences and enqueue overdue one-off tasks once when
    the daemon returns. No wake-from-sleep or remote execution initially.
-2. **Explicit delegation:** add an async host
-   capability to submit child tasks and receive results. Persist parent-child
-   links. Children use separate sessions and their target definition's
-   capabilities. Enforce target permissions, deadlines, and depth limits;
-   parents awaiting children release execution capacity to prevent deadlocks.
-   Broader persistent mailboxes and workflow graphs follow only when needed.
+2. **Dynamic agents:** temporary specialists and constrained overrides of static
+   definitions. Host-approved models, tools, and targets bound their authority;
+   define lifetime, quotas, and persistence before implementation. Static
+   delegation is implemented; see [delegation](delegation.md).
 3. **Desktop:** use the same API for sessions, live output, run trees,
    cancellation, and scheduling. Desktop and CLI share a daemon. Choose the UI
    framework when implementation starts; it does not determine the runtime.

@@ -62,7 +62,76 @@ impl Guest for Provider {
                 ContentBlock::ToolResult(result) => Some(result.content.clone()),
                 _ => None,
             });
-            let content = if let Some(input) = prompt.strip_prefix("tool:") {
+            let original = request
+                .messages
+                .iter()
+                .rev()
+                .filter(|m| matches!(m.role, Role::User))
+                .find_map(|m| {
+                    m.content.iter().find_map(|b| {
+                        if let ContentBlock::Text(t) = b {
+                            Some(t.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default();
+            let call_id = std::cell::Cell::new(0);
+            let invoke = |name: &str, input: serde_json::Value| {
+                ContentBlock::ToolUse(ToolUseBlock {
+                    id: {
+                        let id = call_id.get();
+                        call_id.set(id + 1);
+                        format!("{name}-{id}")
+                    },
+                    name: name.into(),
+                    input_json: input.to_string(),
+                })
+            };
+            let content = if let Some(task) = prompt
+                .strip_prefix("delegate:")
+                .or_else(|| prompt.strip_prefix("spawn:"))
+            {
+                let (agent, task) = task.split_once(':').unwrap();
+                vec![invoke(
+                    "delegate",
+                    serde_json::json!({"agent":agent,"prompt":task}),
+                )]
+            } else if let Some(agent) = prompt.strip_prefix("parallel:") {
+                vec![
+                    invoke(
+                        "delegate",
+                        serde_json::json!({"agent":agent,"prompt":"first task"}),
+                    ),
+                    invoke(
+                        "delegate",
+                        serde_json::json!({"agent":agent,"prompt":"second task"}),
+                    ),
+                ]
+            } else if (original.starts_with("delegate:") || original.starts_with("parallel:"))
+                && tool
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .is_some_and(|result| {
+                        result.get("run_id").is_some() && result.get("status").is_none()
+                    })
+            {
+                blocks
+                    .iter()
+                    .filter_map(|block| {
+                        let ContentBlock::ToolResult(result) = block else {
+                            return None;
+                        };
+                        let result: serde_json::Value =
+                            serde_json::from_str(&result.content).ok()?;
+                        Some(invoke(
+                            "wait",
+                            serde_json::json!({"run_id":result["run_id"]}),
+                        ))
+                    })
+                    .collect()
+            } else if let Some(input) = prompt.strip_prefix("tool:") {
                 vec![ContentBlock::ToolUse(ToolUseBlock {
                     id: "fixture-tool".into(),
                     name: "fixture".into(),

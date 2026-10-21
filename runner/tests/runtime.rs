@@ -188,12 +188,14 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 provider: "fixture".into(),
                 model: "fixture".into(),
                 tools: vec!["fixture".into()],
+                delegates: vec![],
             },
             host::AgentInfo {
                 name: "notools".into(),
                 provider: "fixture".into(),
                 model: "fixture-small".into(),
                 tools: vec![],
+                delegates: vec![],
             },
         ]
     );
@@ -1190,4 +1192,228 @@ async fn connection_failure_during_catch_up_does_not_offer_an_idle_prompt() {
         text.ends_with("resume with: runner chat --session lost\n"),
         "{text}"
     );
+}
+
+fn delegation_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str(
+        r#"
+[agents.coordinator]
+provider = "fixture"
+delegates = ["leaf", "lead"]
+[agents.lead]
+provider = "fixture"
+delegates = ["leaf"]
+[agents.leaf]
+provider = "fixture"
+system_prompt = "Leaf specialist instructions."
+"#,
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+    fixture
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn configured_specialists_delegate_in_parallel_and_nested_at_concurrency_one() {
+    let fixture = delegation_fixture();
+    let runtime = fixture.runtime().await;
+    let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(runtime)),
+        1,
+        stop.clone(),
+    ));
+    for (prompt, count) in [
+        ("delegate:leaf:hello", 2),
+        ("delegate:lead:delegate:leaf:hello", 3),
+        ("parallel:leaf", 3),
+        ("delegate:leaf:system-prompt", 2),
+    ] {
+        let root = db
+            .submit(None, "coordinator".into(), prompt.into(), 10)
+            .unwrap();
+        let root = wait(&db, &root.id, "completed").await;
+        let tree: Vec<_> = db
+            .runs(None)
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.root_run_id == root.id)
+            .collect();
+        assert_eq!(tree.len(), count, "{tree:?}");
+        assert!(tree.iter().all(|run| run.status == "completed"), "{tree:?}");
+        for child in tree.iter().filter(|run| run.agent == "leaf") {
+            let result = db
+                .child_result(child.parent_run_id.as_deref().unwrap(), &child.id)
+                .unwrap()
+                .unwrap();
+            let expected = if prompt.ends_with("system-prompt") {
+                "Leaf specialist instructions."
+            } else if prompt == "parallel:leaf" {
+                if child.prompt == "first task" {
+                    "turn 1: first task"
+                } else {
+                    "turn 1: second task"
+                }
+            } else {
+                "turn 1: hello"
+            };
+            assert_eq!(result["output"], expected);
+            assert_ne!(child.session_id, root.session_id);
+            assert!(child.deadline_at <= root.deadline_at);
+        }
+        let starts: Vec<_> = db
+            .events(&root.id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.data["kind"] == "tool_started")
+            .map(|event| event.data["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            starts,
+            if prompt == "parallel:leaf" {
+                vec!["delegate", "delegate", "wait", "wait"]
+            } else {
+                vec!["delegate", "wait"]
+            }
+        );
+    }
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn guest_requested_delegation_cannot_bypass_host_permissions_or_service_context() {
+    let fixture = delegation_fixture();
+    let runtime = fixture.runtime().await;
+    let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(runtime.clone())),
+        1,
+        stop.clone(),
+    ));
+    for (agent, prompt) in [
+        ("default", "delegate:leaf:hello"),
+        ("coordinator", "delegate:notools:hello"),
+        ("coordinator", r#"named-tool:wait:{"run_id":"unrelated"}"#),
+    ] {
+        let root = db.submit(None, agent.into(), prompt.into(), 10).unwrap();
+        wait(&db, &root.id, "completed").await;
+        assert_eq!(
+            db.runs(None)
+                .unwrap()
+                .iter()
+                .filter(|run| run.root_run_id == root.id)
+                .count(),
+            1
+        );
+        let text: String = db
+            .events(&root.id, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|event| event.data["text"].as_str())
+            .collect();
+        assert!(text.contains("error:"), "{text}");
+    }
+    let failed_parent = db
+        .submit(None, "coordinator".into(), "delegate:leaf:fail".into(), 10)
+        .unwrap();
+    wait(&db, &failed_parent.id, "completed").await;
+    let failed_child = db
+        .runs(None)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.as_deref() == Some(&failed_parent.id))
+        .unwrap();
+    let result = db
+        .child_result(&failed_parent.id, &failed_child.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["status"], "failed");
+    assert!(result["output"].is_null());
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("fixture failure")
+    );
+    let captured = Arc::new(Mutex::new(String::new()));
+    let sink = captured.clone();
+    runtime
+        .run_turn(
+            "coordinator",
+            "standalone",
+            "delegate:leaf:hello",
+            Arc::new(move |event| {
+                if let Some(text) = event["text"].as_str() {
+                    sink.lock().unwrap().push_str(text);
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .contains("requires the runner service")
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
+    let fixture = delegation_fixture();
+    let runtime = fixture.runtime().await;
+    let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(runtime)),
+        1,
+        stop.clone(),
+    ));
+    let unawaited = db
+        .submit(None, "coordinator".into(), "spawn:leaf:wait".into(), 10)
+        .unwrap();
+    wait(&db, &unawaited.id, "completed").await;
+    let child = db
+        .runs(None)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.as_deref() == Some(&unawaited.id))
+        .unwrap();
+    assert_eq!(child.status, "cancelled");
+    let parent = db
+        .submit(None, "coordinator".into(), "delegate:leaf:wait".into(), 10)
+        .unwrap();
+    let child = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = db.runs(None).unwrap().into_iter().find(|run| {
+                run.parent_run_id.as_deref() == Some(&parent.id) && run.status == "running"
+            }) {
+                break child;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    db.cancel(&parent.id).unwrap();
+    wait(&db, &parent.id, "cancelled").await;
+    wait(&db, &child.id, "cancelled").await;
+    let next = db
+        .submit(None, "coordinator".into(), "delegate:leaf:hello".into(), 10)
+        .unwrap();
+    wait(&db, &next.id, "completed").await;
+    stop.cancel();
+    task.await.unwrap().unwrap();
 }

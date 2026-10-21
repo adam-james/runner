@@ -78,6 +78,29 @@ impl Ui {
 
     pub fn event(&mut self, data: &Value) {
         match data["kind"].as_str() {
+            Some("delegated" | "delegation_waiting" | "delegation_finished") => {
+                self.stop_thinking(false);
+                self.end_text();
+                if self.tool.take().is_some() {
+                    println!();
+                }
+                let label = match data["kind"].as_str() {
+                    Some("delegated") => format!(
+                        "delegated to {} · run {}",
+                        data["agent"].as_str().unwrap_or("agent"),
+                        data["run_id"].as_str().unwrap_or("")
+                    ),
+                    Some("delegation_waiting") => {
+                        format!("waiting for run {}", data["run_id"].as_str().unwrap_or(""))
+                    }
+                    _ => format!(
+                        "child {} · {}",
+                        data["run_id"].as_str().unwrap_or(""),
+                        data["status"].as_str().unwrap_or("finished")
+                    ),
+                };
+                println!("{}", style(self.stdout_tty, DIM, &label));
+            }
             Some("status") if self.live => match data["status"].as_str() {
                 Some("queued") if !self.running => {
                     self.stop_thinking(false);
@@ -261,10 +284,14 @@ fn agent_details(agent: &host::AgentInfo) -> String {
     } else {
         agent.tools.join(", ")
     };
-    format!(
+    let mut details = format!(
         "provider {} · model {} · tools {tools}",
         agent.provider, agent.model
-    )
+    );
+    if !agent.delegates.is_empty() {
+        details.push_str(&format!(" · delegates {}", agent.delegates.join(", ")));
+    }
+    details
 }
 
 /// Says a saved conversation was picked up; its turns are replayed after.
@@ -572,6 +599,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5".into(),
             tools: vec!["get_scores".into(), "get_weather".into()],
+            delegates: vec![],
         };
         assert_eq!(
             agent_details(&agent),

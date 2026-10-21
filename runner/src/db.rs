@@ -38,6 +38,14 @@ pub struct Run {
     pub deadline_secs: u64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub root_run_id: String,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub deadline_at: Option<i64>,
 }
 
 impl Run {
@@ -61,7 +69,7 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -79,11 +87,14 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         deadline_secs: row.get(6)?,
         cancel_requested: row.get(7)?,
         error: row.get(8)?,
+        parent_run_id: row.get(9)?,
+        root_run_id: row.get(10)?,
+        depth: row.get(11)?,
+        deadline_at: row.get(12)?,
     })
 }
 
-const RUN_COLUMNS: &str =
-    "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error";
+const RUN_COLUMNS: &str = "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error, parent_run_id, root_run_id, depth, deadline_at";
 
 fn append_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
     tx.execute(
@@ -176,7 +187,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 1 {
+        if version > 2 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -192,8 +203,24 @@ impl Database {
                 run_id TEXT NOT NULL REFERENCES runs(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, id);
             CREATE INDEX IF NOT EXISTS queued_runs ON runs(status, created_at);
-            PRAGMA user_version=1;",
+            ",
         )?;
+        if version < 2 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE runs ADD COLUMN parent_run_id TEXT REFERENCES runs(id);
+                 ALTER TABLE runs ADD COLUMN root_run_id TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE runs ADD COLUMN deadline_at INTEGER;
+                 UPDATE runs SET root_run_id=id;
+                 CREATE INDEX runs_by_parent ON runs(parent_run_id);
+                 CREATE INDEX runs_by_root ON runs(root_run_id);
+                 CREATE TABLE run_results (
+                     run_id TEXT PRIMARY KEY REFERENCES runs(id), output TEXT NOT NULL);
+                 PRAGMA user_version=2;",
+            )?;
+            tx.commit()?;
+        }
         Ok(Self(
             Arc::new(Mutex::new(conn)),
             Arc::new(Signals {
@@ -275,8 +302,13 @@ impl Database {
                 id
             }
         };
+        let id = new_id();
         let run = Run {
-            id: new_id(),
+            id: id.clone(),
+            parent_run_id: None,
+            root_run_id: id,
+            depth: 0,
+            deadline_at: None,
             session_id,
             agent,
             prompt,
@@ -286,7 +318,7 @@ impl Database {
             cancel_requested: false,
             error: None,
         };
-        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs, root_run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?1)",
             params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs])?;
         append_event(&tx, &run.id, json!({"kind":"status", "status":"queued"}))?;
         tx.commit()?;
@@ -321,16 +353,31 @@ impl Database {
 
     /// Claim the oldest runnable job. One writer per session, including queued turns.
     pub fn claim(&self) -> Result<Option<Run>> {
+        self.claim_for_worker(true)
+    }
+
+    pub fn claim_for_worker(&self, allow_roots: bool) -> Result<Option<Run>> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         let run = tx.query_row(&format!("SELECT {RUN_COLUMNS} FROM runs AS candidate
-            WHERE status='queued' AND NOT EXISTS (
+            WHERE status='queued' AND (parent_run_id IS NOT NULL OR ?1)
+            AND (parent_run_id IS NULL OR EXISTS (
+                SELECT 1 FROM runs parent WHERE parent.id=candidate.parent_run_id
+                AND parent.status='running' AND parent.cancel_requested=0))
+            AND NOT EXISTS (
                 SELECT 1 FROM runs AS active WHERE active.session_id=candidate.session_id AND active.status='running')
-            ORDER BY created_at, rowid LIMIT 1"), [], read_run).optional()?;
+            ORDER BY (parent_run_id IS NULL), created_at, rowid LIMIT 1"), [allow_roots], read_run).optional()?;
         let Some(mut run) = run else {
             return Ok(None);
         };
-        tx.execute("UPDATE runs SET status='running' WHERE id=?1", [&run.id])?;
+        let deadline_at = run
+            .deadline_at
+            .unwrap_or_else(|| now() + run.deadline_secs as i64 * 1000);
+        tx.execute(
+            "UPDATE runs SET status='running', deadline_at=?2 WHERE id=?1",
+            params![run.id, deadline_at],
+        )?;
+        run.deadline_at = Some(deadline_at);
         append_event(&tx, &run.id, json!({"kind":"status", "status":"running"}))?;
         tx.commit()?;
         self.notify(&run.id);
@@ -343,8 +390,19 @@ impl Database {
         Ok(Some(run))
     }
 
-    pub fn event(&self, id: &str, data: Value) -> Result<()> {
-        append_event(&self.0.lock().unwrap(), id, data)?;
+    pub fn event(&self, id: &str, mut data: Value) -> Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        if data["kind"] == "turn_saved"
+            && let Some(output) = data.as_object_mut().and_then(|data| data.remove("output"))
+        {
+            tx.execute(
+                "INSERT OR REPLACE INTO run_results VALUES (?1,?2)",
+                params![id, output.as_str().unwrap_or_default()],
+            )?;
+        }
+        append_event(&tx, id, data)?;
+        tx.commit()?;
         self.notify(id);
         Ok(())
     }
@@ -368,6 +426,137 @@ impl Database {
         .collect()
     }
 
+    /// Atomically create a fresh child session, run, and parent relationship.
+    pub fn delegate(
+        &self,
+        parent_id: &str,
+        agent: &str,
+        prompt: &str,
+        deadline_secs: Option<u64>,
+    ) -> Result<Run> {
+        if prompt.trim().is_empty() || prompt.len() > 256 * 1024 {
+            bail!("prompt must contain 1–262144 bytes");
+        }
+        if deadline_secs.is_some_and(|value| !(1..=86400).contains(&value)) {
+            bail!("invalid child deadline");
+        }
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let parent = tx.query_row(
+            &format!("SELECT {RUN_COLUMNS} FROM runs WHERE id=?1"),
+            [parent_id],
+            read_run,
+        )?;
+        if parent.status != "running" || parent.cancel_requested {
+            bail!("parent is no longer running");
+        }
+        if parent.depth >= 3 {
+            bail!("delegation depth limit reached");
+        }
+        let children: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM runs WHERE parent_run_id=?1",
+            [parent_id],
+            |r| r.get(0),
+        )?;
+        let descendants: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM runs WHERE root_run_id=?1 AND id!=?1",
+            [&parent.root_run_id],
+            |r| r.get(0),
+        )?;
+        if children >= 16 || descendants >= 64 {
+            bail!("delegation child limit reached");
+        }
+        let timestamp = now();
+        let parent_deadline = parent.deadline_at.context("parent deadline unavailable")?;
+        if parent_deadline <= timestamp {
+            bail!("parent deadline exceeded");
+        }
+        let deadline_secs = deadline_secs.unwrap_or(parent.deadline_secs);
+        let deadline_at = parent_deadline.min(timestamp + deadline_secs as i64 * 1000);
+        let run = Run {
+            id: new_id(),
+            session_id: new_id(),
+            agent: agent.into(),
+            prompt: prompt.into(),
+            status: "queued".into(),
+            created_at: timestamp,
+            deadline_secs,
+            cancel_requested: false,
+            error: None,
+            parent_run_id: Some(parent_id.into()),
+            root_run_id: parent.root_run_id,
+            depth: parent.depth + 1,
+            deadline_at: Some(deadline_at),
+        };
+        tx.execute(
+            "INSERT INTO sessions VALUES (?1,?2)",
+            params![run.session_id, timestamp],
+        )?;
+        tx.execute("INSERT INTO runs (id,session_id,agent,prompt,status,created_at,deadline_secs,parent_run_id,root_run_id,depth,deadline_at)
+            VALUES (?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9,?10)",
+            params![run.id,run.session_id,agent,prompt,timestamp,deadline_secs,parent_id,run.root_run_id,run.depth,deadline_at])?;
+        append_event(&tx, &run.id, json!({"kind":"status","status":"queued"}))?;
+        append_event(
+            &tx,
+            parent_id,
+            json!({"kind":"delegated","run_id":run.id,"agent":agent}),
+        )?;
+        tx.commit()?;
+        self.notify(parent_id);
+        self.notify(&run.id);
+        Ok(run)
+    }
+
+    pub fn child_result(&self, parent: &str, id: &str) -> Result<Option<Value>> {
+        let conn = self.0.lock().unwrap();
+        let run = conn
+            .query_row(
+                &format!("SELECT {RUN_COLUMNS} FROM runs WHERE id=?1 AND parent_run_id=?2"),
+                params![id, parent],
+                read_run,
+            )
+            .optional()?
+            .context("run is not a direct child")?;
+        if !run.terminal() {
+            return Ok(None);
+        }
+        let output: Option<String> = if run.status == "completed" {
+            conn.query_row(
+                "SELECT output FROM run_results WHERE run_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let mut result = json!({"run_id":id,"agent":run.agent,"status":run.status,
+            "output":output,"error":run.error,"truncated":false});
+        // Truncate text before encoding, preserving a valid JSON envelope.
+        while result.to_string().len() > 64 * 1024 {
+            let output = result["output"].as_str().unwrap_or_default();
+            if output.is_empty() {
+                bail!("child result metadata exceeds size limit");
+            }
+            let mut end = output.len() * 3 / 4;
+            while !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            result["output"] = Value::String(output[..end].to_owned());
+            result["truncated"] = json!(true);
+        }
+        Ok(Some(result))
+    }
+
+    fn signal_cancelled(&self, ids: Vec<String>) {
+        for id in ids {
+            self.notify(&id);
+            if let Some(token) = self.1.cancellations.lock().unwrap().get(&id) {
+                token.cancel();
+            }
+        }
+    }
+
     pub fn finish(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
         if !is_terminal(status) {
             bail!("invalid terminal status");
@@ -384,6 +573,7 @@ impl Database {
         } else {
             status
         };
+        let mut descendants = Vec::new();
         if tx.execute(
             "UPDATE runs SET status=?2, error=?3 WHERE id=?1 AND status='running'",
             params![id, status, error],
@@ -395,7 +585,9 @@ impl Database {
                 json!({"kind":"status", "status":status, "error":error}),
             )?;
         }
+        descendants.extend(cancel_descendants(&tx, id)?);
         tx.commit()?;
+        self.signal_cancelled(descendants);
         self.notify(id);
         self.1.cancellations.lock().unwrap().remove(id);
         Ok(())
@@ -426,7 +618,9 @@ impl Database {
                 append_event(&tx, id, json!({"kind":"status", "status":"cancelled"}))?;
             }
         }
+        let descendants = cancel_descendants(&tx, id)?;
         tx.commit()?;
+        self.signal_cancelled(descendants);
         self.notify(&run.id);
         if run.cancel_requested
             && let Some(token) = self.1.cancellations.lock().unwrap().get(id)
@@ -444,7 +638,9 @@ impl Database {
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let mut descendants = Vec::new();
         for id in &ids {
+            descendants.extend(cancel_descendants(&tx, id)?);
             tx.execute("UPDATE runs SET status='interrupted', error='daemon stopped during execution' WHERE id=?1", [id])?;
             append_event(
                 &tx,
@@ -452,10 +648,49 @@ impl Database {
                 json!({"kind":"status", "status":"interrupted", "error":"daemon stopped during execution"}),
             )?;
         }
+        // Also clean up queued descendants whose parent was terminal before a crash.
+        let orphan_parents = {
+            let mut stmt = tx.prepare("SELECT DISTINCT parent_run_id FROM runs WHERE status='queued'
+                AND parent_run_id IN (SELECT id FROM runs WHERE status NOT IN ('running','queued'))")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in orphan_parents {
+            descendants.extend(cancel_descendants(&tx, &id)?);
+        }
         tx.commit()?;
+        self.signal_cancelled(descendants);
         for id in ids {
             self.notify(&id);
         }
         Ok(())
     }
+}
+
+fn cancel_descendants(conn: &Connection, parent: &str) -> Result<Vec<String>> {
+    let ids = {
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendants(id) AS (
+            SELECT id FROM runs WHERE parent_run_id=?1 UNION ALL
+            SELECT runs.id FROM runs JOIN descendants ON runs.parent_run_id=descendants.id)
+            SELECT runs.id FROM runs JOIN descendants USING(id)
+            WHERE status IN ('queued','running') AND cancel_requested=0",
+        )?;
+        stmt.query_map([parent], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in &ids {
+        conn.execute(
+            "UPDATE runs SET cancel_requested=1,
+            status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END WHERE id=?1",
+            [id],
+        )?;
+        append_event(conn, id, json!({"kind":"cancellation_requested"}))?;
+        let status: String =
+            conn.query_row("SELECT status FROM runs WHERE id=?1", [id], |r| r.get(0))?;
+        if status == "cancelled" {
+            append_event(conn, id, json!({"kind":"status","status":"cancelled"}))?;
+        }
+    }
+    Ok(ids)
 }

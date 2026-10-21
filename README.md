@@ -85,6 +85,12 @@ Queue additional turns while detached with
 picks a named agent definition from the config's `[agents.<name>]` tables (see
 `runner.toml`); without it, runs use `default`.
 
+Agents can delegate to explicitly allowed configured specialists using host
+`delegate` and `wait` tools. Try `runner chat --agent coordinator` for sports and
+weather, or `runner chat --agent research_coordinator` for local notes plus web
+research. Children get fresh sessions and their own configured capabilities.
+See [delegation examples and limits](docs/delegation.md).
+
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;
 set `run --deadline-secs N` or `chat --deadline-secs N` (1–86400 seconds). The
