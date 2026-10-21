@@ -75,6 +75,11 @@ tools = ["fixture"]
 provider = "fixture"
 model = "fixture-small"
 system_prompt = "Answer without tools."
+[agents.limited]
+provider = "fixture"
+tools = ["fixture"]
+max_tokens = 99
+max_model_calls = 1
 "#,
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
@@ -188,12 +193,24 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 provider: "fixture".into(),
                 model: "fixture".into(),
                 tools: vec!["fixture".into()],
+                max_tokens: host::DEFAULT_MAX_TOKENS,
+                max_model_calls: None,
+            },
+            host::AgentInfo {
+                name: "limited".into(),
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                tools: vec!["fixture".into()],
+                max_tokens: 99,
+                max_model_calls: Some(1),
             },
             host::AgentInfo {
                 name: "notools".into(),
                 provider: "fixture".into(),
                 model: "fixture-small".into(),
                 tools: vec![],
+                max_tokens: host::DEFAULT_MAX_TOKENS,
+                max_model_calls: None,
             },
         ]
     );
@@ -513,7 +530,7 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("unknown agent 'nope'; the daemon has: default, notools"),
+        stderr.contains("unknown agent 'nope'; the daemon has: default, limited, notools"),
         "{stderr}"
     );
     // Rejected before the chat started, so no session was made for it.
@@ -575,6 +592,49 @@ async fn ctrl_c_at_the_prompt_ends_the_chat() {
         rest.contains("resume with: runner chat --session interrupted"),
         "{rest}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn agent_limits_cap_reply_tokens_and_model_calls() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let turn = async |agent: &str, session: &str, prompt: &str| {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = events.clone();
+        let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+        let result = runtime.run_turn(agent, session, prompt, sink).await;
+        (result, events.lock().unwrap().clone())
+    };
+    let text =
+        |events: &[Value]| -> String { events.iter().filter_map(|e| e["text"].as_str()).collect() };
+    // The provider is asked for the agent's own token limit, and usage reports it.
+    let (result, events) = turn("limited", "tokens", "max-tokens").await;
+    result.unwrap();
+    assert_eq!(text(&events), "99");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "usage" && e["max_tokens"] == 99)
+    );
+    let (result, events) = turn("default", "default-tokens", "max-tokens").await;
+    result.unwrap();
+    assert_eq!(text(&events), host::DEFAULT_MAX_TOKENS.to_string());
+
+    // A tool call needs a second model call, which `limited` doesn't allow.
+    let (result, events) = turn("limited", "calls", "tool:probe").await;
+    let error = result.unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<host::TurnFailed>()
+            .map(|e| e.0.as_str()),
+        Some("stopped after 1 model call without a final reply, so this turn wasn't saved")
+    );
+    // The requested tool still ran; the turn just wasn't saved.
+    assert!(events.iter().any(|e| e["kind"] == "tool_finished"));
+    assert!(!events.iter().any(|e| e["kind"] == "turn_saved"));
+    let (result, _) = turn("default", "calls-default", "tool:probe").await;
+    result.unwrap();
 }
 
 #[tokio::test]

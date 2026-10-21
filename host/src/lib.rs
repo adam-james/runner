@@ -87,6 +87,12 @@ struct AgentConfig {
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
+    /// The most tokens one model reply may use, hidden reasoning included;
+    /// `DEFAULT_MAX_TOKENS` if omitted.
+    max_tokens: Option<u32>,
+    /// The most model requests one turn may make before it's given up.
+    /// Omitted means no limit beyond the run's deadline.
+    max_model_calls: Option<u32>,
 }
 
 /// A definition resolved against the top-level config.
@@ -96,6 +102,8 @@ struct AgentDefinition {
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
     system_prompt: Option<String>,
+    max_tokens: u32,
+    max_model_calls: Option<u32>,
 }
 
 impl AgentDefinition {
@@ -115,6 +123,8 @@ pub struct AgentInfo {
     pub provider: String,
     pub model: String,
     pub tools: Vec<String>,
+    pub max_tokens: u32,
+    pub max_model_calls: Option<u32>,
 }
 
 /// Tool and provider table keys: what agent definitions refer to them by.
@@ -145,6 +155,9 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
     let mut agents = BTreeMap::new();
     for (name, agent) in &config.agents {
         validate_name("agent name", name)?;
+        if agent.max_tokens == Some(0) || agent.max_model_calls == Some(0) {
+            bail!("agent '{name}': `max_tokens` and `max_model_calls` must be at least 1");
+        }
         if agent
             .system_prompt
             .as_ref()
@@ -188,6 +201,8 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 provider,
                 tools,
                 system_prompt: agent.system_prompt.clone(),
+                max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+                max_model_calls: agent.max_model_calls,
             },
         );
     }
@@ -742,9 +757,10 @@ fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
 
 /// The system prompt for definitions that don't set `system_prompt`.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-/// Per request, and it covers a reasoning model's hidden reasoning as well
-/// as the reply, so it needs headroom. Only tokens actually used are billed.
-const MAX_TOKENS: u32 = 16384;
+/// `max_tokens` for definitions that don't set one. It's per request, and it
+/// covers a reasoning model's hidden reasoning as well as the reply, so it
+/// needs headroom. Only tokens actually used are billed.
+pub const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 impl SessionComponents {
     /// Runs one turn to completion: loads the session, calls the model and
@@ -752,24 +768,36 @@ impl SessionComponents {
     /// error is why the turn was given up, written for the user.
     async fn turn(
         &mut self,
-        system: &str,
+        definition: &AgentDefinition,
         prompt: String,
         events: &EventSink,
     ) -> Result<(), String> {
+        let system = definition
+            .system_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        let max_tokens = definition.max_tokens;
         let mut history = self.load().await?.unwrap_or_default();
         history.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text(prompt)],
         });
-        loop {
+        for calls in 0.. {
+            if definition.max_model_calls.is_some_and(|max| calls >= max) {
+                return Err(format!(
+                    "stopped after {calls} model {} without a final reply, so this turn \
+                     wasn't saved",
+                    if calls == 1 { "call" } else { "calls" }
+                ));
+            }
             let request = ChatRequest {
                 system: Some(system.to_string()),
-                max_tokens: MAX_TOKENS,
+                max_tokens,
                 messages: history.clone(),
             };
             let response = self.chat(request, events).await.map_err(|e| describe(&e))?;
             events(serde_json::json!({"kind":"usage",
-                "reasoning_tokens":response.reasoning_tokens, "max_tokens":MAX_TOKENS,
+                "reasoning_tokens":response.reasoning_tokens, "max_tokens":max_tokens,
                 "prompt_tokens":response.prompt_tokens,
                 "cache_read_tokens":response.cache_read_tokens,
                 "cache_creation_tokens":response.cache_creation_tokens}));
@@ -781,7 +809,7 @@ impl SessionComponents {
                 Some("length" | "max_tokens")
             ) {
                 return Err(format!(
-                    "reply cut off: hit the {MAX_TOKENS} token limit, so this turn wasn't saved"
+                    "reply cut off: hit the {max_tokens} token limit, so this turn wasn't saved"
                 ));
             }
             let mut tool_results = Vec::new();
@@ -1130,6 +1158,8 @@ impl Runtime {
                 provider: definition.provider_name.clone(),
                 model: definition.model().to_string(),
                 tools: definition.tools.keys().cloned().collect(),
+                max_tokens: definition.max_tokens,
+                max_model_calls: definition.max_model_calls,
             })
             .collect()
     }
@@ -1178,11 +1208,9 @@ impl Runtime {
             Some((cached_agent, components)) if cached_agent == agent => components,
             _ => self.load_session(definition, session_id).await?,
         };
-        let system = definition
-            .system_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
-        let result = components.turn(system, prompt.to_string(), &events).await;
+        let result = components
+            .turn(definition, prompt.to_string(), &events)
+            .await;
         if components.session.healthy {
             *cached = Some((agent.to_string(), components));
         }
@@ -1635,6 +1663,8 @@ mod tests {
             model = "small"
             tools = ["docs"]
             system_prompt = "Cite your sources."
+            max_tokens = 4096
+            max_model_calls = 8
             [agents.bare]
             provider = "main"
             [agents.elsewhere]
@@ -1657,6 +1687,15 @@ mod tests {
             Some("Cite your sources.")
         );
         assert_eq!(agents["bare"].system_prompt, None);
+        assert_eq!(
+            (researcher.max_tokens, researcher.max_model_calls),
+            (4096, Some(8))
+        );
+        // Without limits: the default token cap, and no cap on model calls.
+        assert_eq!(
+            (agents["bare"].max_tokens, agents["bare"].max_model_calls),
+            (DEFAULT_MAX_TOKENS, None)
+        );
         // Tools are opt-in for a named definition.
         assert!(agents["bare"].tools.is_empty());
         assert_eq!(
@@ -1694,6 +1733,13 @@ mod tests {
             err(&format!("{main}\nsystem_prompt = \" \""), tools)
                 .contains("`system_prompt` is empty")
         );
+        for zero in ["max_tokens = 0", "max_model_calls = 0"] {
+            assert!(
+                err(&format!("{main}\n{zero}"), tools).contains("must be at least 1"),
+                "{zero}"
+            );
+        }
+        assert!(err(&format!("{main}\nmax_tokens = -1"), tools).contains("invalid value"));
         // Every agent names its provider, and it has to exist.
         assert!(err("[agents.r]", tools).contains("missing field `provider`"));
         assert!(
@@ -1754,6 +1800,7 @@ mod tests {
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");
+        assert_eq!(agents["researcher"].max_model_calls, Some(20));
         assert_eq!(agents["default"].provider_name, "anthropic");
         assert_eq!(agents["default"].model(), "claude-sonnet-5");
         assert_eq!(
