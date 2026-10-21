@@ -15,7 +15,6 @@
 - name the file when a component fails to load - preloading uses a bare `Component::from_file(..)?` and `Runtime::component` says only "component not preloaded", so a bad path in runner.toml gives no hint which one
 - close the late-cancel race - a cancel that lands after the agent saves the turn but before it returns can still record `cancelled`; needs the agent to report when it saves
 - retry failed terminal-state writes - `contain` (runner/src/service.rs) forgets a finished job even if its fallback `db.finish` fails, leaving the run `running` and blocking later turns in that session until restart; retain pending terminal updates and retry them
-- make SQLite files private in existing data directories - an existing `0755` data directory with a `022` umask produces `0644` state.sqlite3, WAL and SHM files, exposing prompts and events to other local users; enforce private database and sidecar permissions without chmodding a user-supplied directory
 
 ## Long term
 
