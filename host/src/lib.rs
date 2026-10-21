@@ -859,7 +859,9 @@ impl Runtime {
             .chain(config.tools.iter().map(|tool| &tool.path))
             .chain(config.session_store.iter().map(|store| &store.path));
         for path in paths {
-            components.insert(path.clone(), Component::from_file(&engine, path)?);
+            let component = Component::from_file(&engine, path)
+                .map_err(|e| e.context(format!("loading component {path}")))?;
+            components.insert(path.clone(), component);
         }
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
@@ -882,7 +884,7 @@ impl Runtime {
         self.components
             .get(path)
             .cloned()
-            .ok_or_else(|| Error::msg("component not preloaded"))
+            .ok_or_else(|| Error::msg(format!("component {path} not preloaded")))
     }
 
     /// Yielding at each epoch lets Tokio poll timeouts and drop a cancelled
@@ -1139,6 +1141,36 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("'api.exmaple.com' is not in allowed_hosts")
+        );
+    }
+
+    #[test]
+    fn component_load_errors_name_the_file() {
+        let load = |tool: &str| {
+            let config: RunnerConfig = toml::from_str(&format!(
+                "agent = {tool:?}\n[provider]\npath = {tool:?}\nmodel = \"m\""
+            ))
+            .unwrap();
+            format!("{:#}", Runtime::from_config(config).err().unwrap())
+        };
+
+        let missing = env::temp_dir().join(format!("runner-missing-{}.wasm", std::process::id()));
+        let missing = missing.to_string_lossy().into_owned();
+        let err = load(&missing);
+        assert!(
+            err.contains(&format!("loading component {missing}")),
+            "{err}"
+        );
+
+        // Wasmtime's own error for a corrupt binary doesn't mention the file.
+        let corrupt = env::temp_dir().join(format!("runner-corrupt-{}.wasm", std::process::id()));
+        std::fs::write(&corrupt, b"\0asm\x0d\0\x01\0garbage").unwrap();
+        let corrupt_path = corrupt.to_string_lossy().into_owned();
+        let err = load(&corrupt_path);
+        std::fs::remove_file(&corrupt).unwrap();
+        assert!(
+            err.contains(&format!("loading component {corrupt_path}")),
+            "{err}"
         );
     }
 
