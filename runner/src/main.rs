@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
             deadline_secs,
         } => {
             let run = client.submit(session, agent, prompt, deadline_secs).await?;
-            ui::session(&run.session_id);
+            ui::run_header(&run.agent, &run.session_id);
             if detach {
                 println!("{}", run.id);
             } else {
@@ -136,6 +136,16 @@ async fn main() -> Result<()> {
             agent,
             deadline_secs,
         } => {
+            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            // Checked up front, so a typo doesn't wait for the first prompt to fail.
+            let agents = client.agents().await?;
+            if !agents.iter().any(|known| known.name == agent) {
+                let names: Vec<_> = agents.iter().map(|known| known.name.as_str()).collect();
+                bail!(
+                    "unknown agent '{agent}'; the daemon has: {}",
+                    names.join(", ")
+                );
+            }
             let (session, existing) = match session {
                 Some(id) => {
                     let existing = client
@@ -150,7 +160,7 @@ async fn main() -> Result<()> {
                 }
                 None => (client.create_session(None).await?.id, false),
             };
-            ui::banner(&session);
+            ui::banner(&agent, &session);
             if existing {
                 resumed(&client, &session).await?;
             }
@@ -172,7 +182,8 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
             Runs::Watch { id, after, json } => {
-                ui::session(&client.run(&id).await?.session_id);
+                let run = client.run(&id).await?;
+                ui::run_header(&run.agent, &run.session_id);
                 attach(&client, &id, after, json).await?
             }
         },
@@ -194,12 +205,7 @@ async fn main() -> Result<()> {
 }
 
 /// Takes prompts until the user leaves, running each as a turn in `session`.
-async fn chat(
-    client: &Client,
-    session: &str,
-    agent: Option<String>,
-    deadline_secs: u64,
-) -> Result<()> {
+async fn chat(client: &Client, session: &str, agent: String, deadline_secs: u64) -> Result<()> {
     let mut lines = stdin_lines();
     loop {
         ui::prompt();
@@ -220,7 +226,7 @@ async fn chat(
         let run = client
             .submit(
                 Some(session.to_string()),
-                agent.clone(),
+                Some(agent.clone()),
                 prompt.to_string(),
                 deadline_secs,
             )
