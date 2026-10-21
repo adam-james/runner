@@ -43,8 +43,8 @@ Instances remain in memory until the runtime stops. They are not restored after
 a daemon restart; saved conversation history is. A cancelled turn discards that
 session's instances, since interrupted component calls cannot safely resume.
 Tool timeouts and traps recreate that tool before its next call; provider traps
-similarly recreate the provider. Normal application errors, including a failed
-transcript load or save, retain state. Filesystem mounts remain shared according
+similarly recreate the provider. Normal application errors, including an
+unreadable transcript, retain state. Filesystem mounts remain shared according
 to their configured paths and permissions; separate stores do not isolate
 changes made to a shared writable directory.
 
@@ -62,19 +62,21 @@ not published to clients because they may include reflected request data; those
 runs say only `agent execution failed`.
 
 SQLite stores sessions, submitted runs, ordered events, and each session's
-transcript: its conversation as of its last completed turn, which the turn loop
-loads before calling the model and replaces after a completed turn. The host
-reaches it through `host::Transcripts`, which the service implements over its
-database. A transcript that can't be loaded or saved fails the turn with `could
-not load this session's history` or `could not save this turn`; the underlying
-error is only logged. Submission and its initial event are one transaction;
-terminal status and its event are another. A transcript write is not in the same
-transaction as operational state. SQLite operations run on blocking tasks,
-preserving `synchronous=FULL` durability without blocking Tokio threads. Each
-active run queues output to a blocking consumer; its final events drain before
-terminal status is committed. SSE watchers wake on per-run commit notifications
-and replay from SQLite; active cancellation uses an in-memory token after the
-durable request commits.
+transcript: its conversation as of its last completed turn, The service loads it
+before a run executes and hands it to the host's turn loop, which returns the
+conversation with the turn added; the host stores nothing itself. A transcript
+that can't be read fails the turn with `could not load this session's history`,
+and the underlying error is only logged. Submission and its initial event are
+one transaction; terminal status and its event are another. For a completed run,
+that same transaction also replaces the session's transcript and records
+`turn_saved`, so a session's history includes exactly its completed runs: a run
+that fails, is cancelled, misses its deadline, or is interrupted saves nothing,
+and a crash can't leave a saved turn on a run that isn't completed. SQLite
+operations run on blocking tasks, preserving `synchronous=FULL` durability
+without blocking Tokio threads. Each active run queues output to a blocking
+consumer; its final events drain before terminal status is committed. SSE
+watchers wake on per-run commit notifications and replay from SQLite; active
+cancellation uses an in-memory token after the durable request commits.
 
 The queue executes the oldest eligible run, respecting global capacity and
 one active run per session. Capacity defaults to four. Text is batched at 8 KiB
@@ -84,14 +86,14 @@ client cannot block execution or lose previously recorded output.
 
 Run states are `queued`, `running`, `completed`, `failed`, `cancelled`, and
 `interrupted`. Cancellation is a durable request; active runs become terminal
-after execution is dropped. Queued cancellations take effect immediately.
-A successful agent session save emits `turn_saved` before returning to the agent.
-Once observed, the run completes even if cancellation, shutdown, or a deadline
-wins before the agent returns; event persistence failures still fail the run.
+after execution is dropped. Queued cancellations take effect immediately. A turn
+that returns before cancellation, shutdown, or its deadline takes effect
+completes, even if cancellation was requested meanwhile; one that hasn't
+returned by then saves nothing. Event persistence failures still fail the run.
 Deadlines include component setup and all model/tool work, starting at claim.
-Epoch yields make CPU-bound components interruptible; provider tasks are aborted
-when the agent store is dropped. Tool-specific timeouts and fresh-instance
-settings continue to apply.
+Epoch yields make CPU-bound components interruptible; dropping a turn drops its
+in-flight provider call. Tool-specific timeouts and fresh-instance settings
+continue to apply.
 
 On shutdown, active executions stop and become interrupted. On restart, the
 service also marks any remaining running records interrupted, preserving queued
@@ -184,13 +186,13 @@ uses color. Client and chat commands do not install a logging subscriber.
 
 Run spans identify the run, session, and agent. Tool records identify the
 configured tool name and call ID, outcome, elapsed time, and result byte count.
-Provider spans identify the component; transcript spans record the operation
-(`load` or `save`) and outcome. Outbound HTTP records identify the component,
-request ID, method, scheme, host, port, and allow/deny decision. Allowed
-requests report status and time to response headers, a transport-error category,
-or interruption before headers. They do not measure response body completion.
-API requests log method, matched route template, status, and time to headers,
-including authentication rejections; unmatched routes use a fixed label.
+Provider spans identify the component. Outbound HTTP records identify the
+component, request ID, method, scheme, host, port, and allow/deny decision.
+Allowed requests report status and time to response headers, a transport-error
+category, or interruption before headers. They do not measure response body
+completion. API requests log method, matched route template, status, and time to
+headers, including authentication rejections; unmatched routes use a fixed
+label.
 
 These host-generated records omit prompts, tool arguments/results, raw errors,
 headers, bodies, URL paths, and query strings. Existing SQLite events still serve

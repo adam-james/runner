@@ -98,11 +98,10 @@ session's conversation history there too.
 
 Queued work survives daemon restarts. Work that was running becomes
 `interrupted`; Runner never automatically retries it, because a tool may already
-have changed external state. Only completed turns are saved to the transcript.
-A transcript save and a run-status update are separate operations, so an
-interrupted run may have saved its final turn immediately before the daemon
-stopped. Local background work requires the machine to be awake and the daemon
-running.
+have changed external state. A turn is saved to its session's conversation only
+together with its run's completion, so an interrupted, failed, or cancelled run
+leaves the conversation as it was. Local background work requires the machine to
+be awake and the daemon running.
 
 See [service architecture and roadmap](docs/service.md) for the API and the
 next milestones: scheduling, explicit delegation, and desktop clients.

@@ -1,23 +1,8 @@
-//! Where a session's conversation is kept between turns, and its format.
-
-use std::future::Future;
-use std::pin::Pin;
+//! A session's conversation as the service stores it between turns.
 
 use crate::provider_guest::local::agent::messages::{
     ContentBlock, Message, Role, ToolResultBlock, ToolUseBlock,
 };
-
-pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-/// Stores each session's conversation as an opaque transcript, written by
-/// `encode`. The service implements it over its database. Errors are for
-/// the host's logs, not for clients.
-pub trait Transcripts: Send + Sync + 'static {
-    /// `None` if nothing is saved for `session` yet.
-    fn load(&self, session: &str) -> BoxFuture<Result<Option<String>, String>>;
-    /// Replaces whatever was saved for `session`.
-    fn save(&self, session: &str, transcript: String) -> BoxFuture<Result<(), String>>;
-}
 
 // The stored format: serde's representation of the messages, the same JSON
 // the old session-store component wrote. Kept apart from the WIT bindings,

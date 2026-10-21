@@ -4,10 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::future::IntoFuture;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
@@ -29,12 +26,15 @@ use tokio_util::sync::CancellationToken;
 use crate::db::{Database, Run};
 
 pub trait Executor: Send + Sync + 'static {
+    /// Runs `run`'s turn on `transcript`, its session's conversation so far,
+    /// and returns the conversation with the turn added.
     fn execute(
         &self,
         run: Run,
+        transcript: Option<String>,
         events: host::EventSink,
         cancel: CancellationToken,
-    ) -> BoxFuture<'static, Result<()>>;
+    ) -> BoxFuture<'static, Result<String>>;
 }
 
 pub struct WasmExecutor(pub host::Runtime);
@@ -43,14 +43,15 @@ impl Executor for WasmExecutor {
     fn execute(
         &self,
         run: Run,
+        transcript: Option<String>,
         events: host::EventSink,
         cancel: CancellationToken,
-    ) -> BoxFuture<'static, Result<()>> {
+    ) -> BoxFuture<'static, Result<String>> {
         let runtime = self.0.clone();
         Box::pin(async move {
             // Dropping the losing branch's future stops the guest at its next epoch yield.
             tokio::select! {
-                result = runtime.run_turn(&run.agent, &run.session_id, &run.prompt, events) => result.map_err(Into::into),
+                result = runtime.run_turn(&run.agent, &run.session_id, transcript.as_deref(), &run.prompt, events) => result.map_err(Into::into),
                 _ = cancel.cancelled() => bail!("run cancelled"),
             }
         })
@@ -438,6 +439,12 @@ async fn execute(
     executor: Arc<dyn Executor>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let transcript = db
+        .blocking({
+            let session = run.session_id.clone();
+            move |db| db.transcript(&session)
+        })
+        .await?;
     let (send, receive) = std::sync::mpsc::channel();
     let writer_db = db.clone();
     let writer_id = run.id.clone();
@@ -474,13 +481,7 @@ async fn execute(
         buffer.flush();
         buffer.failed
     });
-    let saved = Arc::new(AtomicBool::new(false));
-    let turn_saved = saved.clone();
     let sink: host::EventSink = Arc::new(move |value| {
-        if value["kind"] == "turn_saved" {
-            // Observe the save synchronously, before the blocking writer persists its event.
-            turn_saved.store(true, Ordering::Release);
-        }
         let _ = send.send(value);
     });
     tracing::info!("run started");
@@ -492,20 +493,25 @@ async fn execute(
     let mut future = Box::pin(
         std::panic::AssertUnwindSafe(async move {
             executor
-                .execute(execution_run, sink, execution_cancel)
+                .execute(execution_run, transcript, sink, execution_cancel)
                 .await
         })
         .catch_unwind(),
     );
     let deadline = tokio::time::sleep(Duration::from_secs(run.deadline_secs));
     tokio::pin!(deadline);
+    // The finished turn's transcript, saved only together with the run's completion.
+    let mut transcript = None;
     let (status, error): (&str, Option<String>) = {
         tokio::select! {
             biased;
-            // A finished turn has already been saved, so it wins over cancel, deadline and shutdown.
+            // A turn that has finished wins over cancel, deadline and shutdown.
             result = &mut future => match result {
                 Err(_) => ("failed", Some("internal error".into())),
-                Ok(Ok(())) => ("completed", None),
+                Ok(Ok(finished)) => {
+                    transcript = Some(finished);
+                    ("completed", None)
+                }
                 Ok(Err(error)) => ("failed", Some(match error.downcast_ref::<host::TurnFailed>() {
                     // The agent's own message for the user, with credentials redacted by the host.
                     Some(failed) => failed.0.clone(),
@@ -523,19 +529,14 @@ async fn execute(
     // Drop all guest execution before publishing a terminal status.
     drop(future);
     let failed = writer.await?;
-    // Cancellation can win the select after session.save succeeds but before the
-    // agent returns. Its transcript is already committed, so keep the run completed.
-    let (status, error) = if saved.load(Ordering::Acquire) {
-        ("completed", None)
-    } else {
-        (status, error)
-    };
     tracing::info!(
         outcome = if failed { "failed" } else { status },
         "run finished"
     );
-    db.blocking(move |db| {
-        db.finish(
+    db.blocking(move |db| match transcript {
+        // Every event has drained, so the turn's are all before `turn_saved`.
+        Some(transcript) if !failed => db.complete(&run.id, &transcript),
+        _ => db.finish(
             &run.id,
             if failed { "failed" } else { status },
             if failed {
@@ -543,7 +544,7 @@ async fn execute(
             } else {
                 error.as_deref()
             },
-        )
+        ),
     })
     .await?;
     Ok(())
@@ -652,8 +653,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         Ok::<_, anyhow::Error>(db)
     })
     .await??;
-    // Conversations live in the same database as the runs that produce them.
-    let runtime = host::Runtime::new(config, Arc::new(db.clone())).await?;
+    let runtime = host::Runtime::new(config).await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {

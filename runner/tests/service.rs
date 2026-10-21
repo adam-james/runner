@@ -23,12 +23,15 @@ struct FakeExecutor {
 }
 
 impl Executor for FakeExecutor {
+    /// The transcript it returns is the previous one plus `prompt|`, so a
+    /// session's saved transcript lists the turns that were committed.
     fn execute(
         &self,
         run: Run,
+        transcript: Option<String>,
         events: host::EventSink,
         _: CancellationToken,
-    ) -> BoxFuture<'static, Result<()>> {
+    ) -> BoxFuture<'static, Result<String>> {
         let active = self.active.clone();
         let peak = self.peak.clone();
         let sessions = self.sessions.clone();
@@ -50,10 +53,7 @@ impl Executor for FakeExecutor {
                 *count
             };
             events(json!({"kind":"text", "text":format!("turn {turn}: ")}));
-            if run.prompt == "saved then wait" {
-                events(json!({"kind":"turn_saved"}));
-                futures_util::future::pending::<()>().await;
-            }
+            let transcript = format!("{}{}|", transcript.unwrap_or_default(), run.prompt);
             if run.prompt == "wait" {
                 futures_util::future::pending::<()>().await;
             }
@@ -69,10 +69,10 @@ impl Executor for FakeExecutor {
             }
             if run.prompt == "which agent" {
                 events(json!({"kind":"text", "text":run.agent}));
-                return Ok(());
+                return Ok(transcript);
             }
             events(json!({"kind":"text", "text":run.prompt}));
-            Ok(())
+            Ok(transcript)
         })
     }
 }
@@ -719,46 +719,73 @@ fn database_files_are_private_in_a_shared_directory() {
 }
 
 #[tokio::test]
-async fn a_cancel_after_save_before_execution_returns_preserves_completion() {
+async fn only_completed_runs_save_their_turn_in_the_same_commit() {
     let h = Harness::new(1).await;
-    let run = h.submit(None, "saved then wait", 5).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let id = run.id.clone();
-            let events = h.db.blocking(move |db| db.events(&id, 0)).await.unwrap();
-            if events
-                .iter()
-                .any(|event| event.data["kind"] == "turn_saved")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    // The executor has saved but is deliberately unable to return successfully.
-    assert_eq!(h.executor.active.load(Ordering::SeqCst), 1);
-    let response = h
-        .client
-        .post(format!("{}/v1/runs/{}/cancel", h.url, run.id))
+    let session = h.db.create_session(Some("kept".into())).unwrap();
+    let transcript = || h.db.transcript(&session.id).unwrap();
+    let first = h.submit(Some(&session.id), "first", 5).await;
+    h.wait_status(&first.id, "completed").await;
+    assert_eq!(transcript().as_deref(), Some("first|"));
+    // The turn's events, then turn_saved, then completion, all committed together.
+    let kinds: Vec<_> =
+        h.db.events(&first.id, 0)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.data)
+            .collect();
+    let saved = kinds
+        .iter()
+        .position(|e| e["kind"] == "turn_saved")
+        .unwrap();
+    assert_eq!(kinds[saved + 1]["status"], "completed");
+    assert_eq!(saved + 2, kinds.len());
+    assert!(kinds[..saved].iter().any(|e| e["kind"] == "text"));
+
+    // A cancelled turn never reaches the commit, so the conversation is as it was.
+    let cancelled = h.submit(Some(&session.id), "wait", 5).await;
+    h.wait_status(&cancelled.id, "running").await;
+    h.client
+        .post(format!("{}/v1/runs/{}/cancel", h.url, cancelled.id))
         .bearer_auth("test-token")
         .send()
         .await
+        .unwrap()
+        .error_for_status()
         .unwrap();
-    assert!(response.status().is_success());
-    let completed = h.wait_status(&run.id, "completed").await;
-    assert!(completed.cancel_requested);
-    assert!(completed.error.is_none());
-    assert_eq!(h.executor.active.load(Ordering::SeqCst), 0);
-    let events = h.db.events(&run.id, 0).unwrap();
-    assert_eq!(events.last().unwrap().data["status"], "completed");
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.data["status"] == "cancelled")
-    );
+    h.wait_status(&cancelled.id, "cancelled").await;
+    // So do a turn that hits its deadline and one that fails.
+    let timed_out = h.submit(Some(&session.id), "wait", 1).await;
+    h.wait_status(&timed_out.id, "failed").await;
+    let failed = h.submit(Some(&session.id), "fail", 5).await;
+    h.wait_status(&failed.id, "failed").await;
+    for run in [&cancelled, &timed_out, &failed] {
+        assert!(
+            !h.db
+                .events(&run.id, 0)
+                .unwrap()
+                .iter()
+                .any(|e| e.data["kind"] == "turn_saved")
+        );
+    }
+    assert_eq!(transcript().as_deref(), Some("first|"));
+    // The next completed turn continues from the last saved one.
+    let second = h.submit(Some(&session.id), "second", 5).await;
+    h.wait_status(&second.id, "completed").await;
+    assert_eq!(transcript().as_deref(), Some("first|second|"));
     h.close().await;
+}
+
+#[test]
+fn completing_a_run_that_already_ended_saves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    let run = db
+        .submit(None, "default".into(), "queued".into(), 60)
+        .unwrap();
+    db.cancel(&run.id).unwrap();
+    db.complete(&run.id, "late|").unwrap();
+    assert_eq!(db.run(&run.id).unwrap().unwrap().status, "cancelled");
+    assert_eq!(db.transcript(&run.session_id).unwrap(), None);
 }
 
 #[tokio::test]
