@@ -42,16 +42,9 @@ impl Executor for WasmExecutor {
         events: host::EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<()>> {
-        let runtime = self.0.execution();
+        let runtime = self.0.clone();
         Box::pin(async move {
-            struct CancelOnDrop(host::Runtime);
-
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    self.0.cancel();
-                }
-            }
-            let _guard = CancelOnDrop(runtime.clone());
+            // Dropping the losing branch's future stops the guest at its next epoch yield.
             tokio::select! {
                 result = runtime.run_turn(&run.session_id, &run.prompt, events) => result.map_err(Into::into),
                 _ = cancel.cancelled() => bail!("run cancelled"),
