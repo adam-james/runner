@@ -12,11 +12,13 @@ headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = [
     "api.openai.com",
 ] } }
 
-# [providers.anthropic]
-# path = "target/wasm32-wasip2/release/anthropic.wasm"
-# model = "claude-sonnet-5"
-# allowed_hosts = ["api.anthropic.com"]
-# headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = ["api.anthropic.com"] } }
+[providers.anthropic]
+path = "target/wasm32-wasip2/release/anthropic.wasm"
+model = "claude-sonnet-5"
+allowed_hosts = ["api.anthropic.com"]
+headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = [
+    "api.anthropic.com",
+] } }
 
 [tools.get_weather]
 path = "target/wasm32-wasip2/release/weather.wasm"
@@ -29,7 +31,9 @@ allowed_hosts = ["site.api.espn.com"]
 [tools.web_search]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
-headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = [
+    "api.tavily.com",
+] } }
 
 [tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
@@ -81,7 +85,7 @@ dir_writable = true
 # table keys (read_file, web_search, ...); a definition without `tools` has none.
 # `system_prompt` replaces the agent's built-in "You are a helpful assistant."
 [agents.default]
-provider = "openai"
+provider = "anthropic"
 tools = ["get_scores", "get_weather"]
 
 # Read-only access to files under the configured read_file directory.
