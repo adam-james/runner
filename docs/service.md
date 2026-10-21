@@ -36,6 +36,11 @@ SQLite stores sessions, submitted runs, and ordered events. The existing
 session-store component stores completed conversation turns. Submission and its
 initial event are one transaction; terminal status and its event are another.
 A transcript write is not in the same transaction as operational state.
+SQLite operations run on blocking tasks, preserving `synchronous=FULL` durability
+without blocking Tokio threads. Each active run queues output to a blocking
+consumer; its final events drain before terminal status is committed. SSE watchers
+wake on per-run commit notifications and replay from SQLite; active cancellation
+uses an in-memory token after the durable request commits.
 
 The queue executes the oldest eligible run, respecting global capacity and
 one active run per session. Capacity defaults to four. Text is batched at 8 KiB
