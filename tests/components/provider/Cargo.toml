@@ -8,4 +8,4 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-wasip3 = { version = "=0.9.0", features = ["wit-bindgen-macros"] }
+wasip3 = { version = "=0.9.0", features = ["wit-bindgen-macros", "async-spawn"] }

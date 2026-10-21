@@ -39,21 +39,6 @@ impl Guest for FsStore {
         fs::write(&tmp, text).map_err(|e| format!("writing session {id}: {e}"))?;
         fs::rename(&tmp, &path).map_err(|e| format!("writing session {id}: {e}"))
     }
-
-    fn ids() -> Result<Vec<String>, String> {
-        let entries = fs::read_dir(ROOT).map_err(|e| format!("listing sessions: {e}"))?;
-        let mut ids: Vec<String> = entries
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                if path.extension()? != EXTENSION {
-                    return None;
-                }
-                Some(path.file_stem()?.to_str()?.to_string())
-            })
-            .collect();
-        ids.sort();
-        Ok(ids)
-    }
 }
 
 fn path(id: &str) -> PathBuf {

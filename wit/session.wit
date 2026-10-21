@@ -19,8 +19,6 @@ interface session-store {
     load: func(id: string) -> result<option<list<message>>, string>;
     // Replaces whatever was saved under `id`.
     save: func(id: string, messages: list<message>) -> result<_, string>;
-    // Every saved session's id.
-    ids: func() -> result<list<string>, string>;
 }
 
 world session-store-guest {

@@ -123,20 +123,6 @@ impl Database {
         Ok(session)
     }
 
-    pub fn import_sessions(&self, ids: Vec<String>) -> Result<()> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
-        for id in ids {
-            host::check_session_id(&id)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO sessions VALUES (?1, ?2)",
-                params![id, now()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn sessions(&self) -> Result<Vec<Session>> {
         let conn = self.0.lock().unwrap();
         let mut stmt =

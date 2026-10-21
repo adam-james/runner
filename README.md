@@ -76,8 +76,8 @@ Service state lives in `~/.runner/service` by default. Override it with
 `--data-dir PATH` on any command or `RUNNER_DATA_DIR`. The directory is private
 on macOS/Linux and contains SQLite state, a daemon lock, and a private connection
 file with a generated local API token. Only one daemon can use a data directory.
-Conversation history still lives in the configured session store; existing
-sessions are discovered when the daemon starts. Use this daemon as the sole
+The service registers sessions in SQLite when they are created. Conversation
+history lives in the configured session store. Use this daemon as the sole
 writer to that store while it is running.
 
 Queued work survives daemon restarts. Work that was running becomes
@@ -133,7 +133,7 @@ Fixtures are test components and should not be included in normal configs.
 - `wit/session.wit` — sessions. The agent imports `session` (`load()` and
   `save(messages)`, with no session id: the host decides which session
   this run is); a session store exports `session-store` (`load`/`save` by
-  id, plus `ids()`), and the host passes the agent's calls through to it.
+  id), and the host passes the agent's calls through to it.
 - `runner/` — local daemon, durable run queue, HTTP/SSE API, and CLI client.
 - `host/` — runtime library. Loads the agent, the provider, and every tool
   from a TOML config file, restricts each provider/tool's outbound
@@ -311,7 +311,7 @@ runner chat --session trip           # create or resume a named session
 New sessions receive UUIDs. `chat --session ID` creates a named session if it
 isn't saved yet, while `run --session ID` requires an existing session. IDs
 use letters, digits, `-`, `_` and `.`, up to 64 characters, and cannot start
-with a dot. Existing saved sessions are discovered when the daemon starts.
+with a dot. Session listing uses the service's SQLite records.
 
 The store is a sandboxed component like any other. `dir` gives it one
 directory on the host, mounted as its `/`, and it can't see anything

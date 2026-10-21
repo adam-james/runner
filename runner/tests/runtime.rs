@@ -116,7 +116,6 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         .collect();
     assert_eq!(output, "turn 1: helloturn 2: againturn 1: separate");
     assert!(events.lock().unwrap().iter().any(|e| e["kind"] == "usage"));
-    assert_eq!(runtime.session_ids().await.unwrap().len(), 2);
     events.lock().unwrap().clear();
     runtime
         .execution()

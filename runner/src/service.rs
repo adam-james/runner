@@ -427,7 +427,6 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let runtime = host::Runtime::new(config)?;
     let db = Database::open(&data_dir.join("state.sqlite3"))?;
     db.recover()?;
-    db.import_sessions(runtime.session_ids().await?)?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {

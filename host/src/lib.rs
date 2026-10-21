@@ -904,21 +904,6 @@ impl Runtime {
         store.set_epoch_deadline(1);
     }
 
-    pub async fn session_ids(&self) -> Result<Vec<String>> {
-        let config = self
-            .config
-            .session_store
-            .as_ref()
-            .ok_or_else(|| Error::msg("session store required"))?;
-        let mut session = load_session_store(self, config).await?;
-        session
-            .instance
-            .local_agent_session_store()
-            .call_ids(&mut session.store)
-            .await?
-            .map_err(Error::msg)
-    }
-
     pub async fn run_turn(&self, session_id: &str, prompt: &str, events: EventSink) -> Result<()> {
         validate_session_id(session_id)?;
         let config = &self.config;

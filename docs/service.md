@@ -54,8 +54,9 @@ submission, not exactly-once external side effects or resumption of a suspended
 WASM stack. Runs and events are retained until the data directory is removed;
 retention management is a later addition.
 
-The daemon imports existing session IDs at startup. Do not run a second daemon
-with a different data directory against the same writable
+Sessions are registered in SQLite when created; the transcript store only
+loads and saves history for those sessions. Do not run a second daemon with a
+different data directory against the same writable
 session store at the same time: the service's session serialization only covers
 its own queue. Changing a daemon's config requires restarting it; queued work
 uses the config active when it starts.
