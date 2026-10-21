@@ -9,6 +9,7 @@ use exports::local::agent::provider_api::{Guest, ToolDefinition};
 use local::agent::messages::{ContentBlock, Role, ToolUseBlock};
 use local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
 struct Provider;
+
 impl Guest for Provider {
     async fn chat(_: String, _: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
         let (mut writer, text) = wit_stream::new::<String>();

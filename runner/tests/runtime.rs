@@ -16,6 +16,7 @@ struct Fixture {
     dir: tempfile::TempDir,
     config: PathBuf,
 }
+
 impl Fixture {
     fn new() -> Self {
         Self::with_tool_timeout(1)
@@ -212,6 +213,7 @@ async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs()
 }
 
 struct Daemon(Child);
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();

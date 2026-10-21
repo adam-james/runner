@@ -44,6 +44,7 @@ impl Executor for WasmExecutor {
         let runtime = self.0.execution();
         Box::pin(async move {
             struct CancelOnDrop(host::Runtime);
+
             impl Drop for CancelOnDrop {
                 fn drop(&mut self) {
                     self.0.cancel();
@@ -146,6 +147,7 @@ struct Cursor {
 }
 
 struct ApiError(StatusCode, String);
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({"error":self.1}))).into_response()
@@ -305,6 +307,7 @@ struct BufferedEvents {
     last_flush: Instant,
     failed: bool,
 }
+
 impl BufferedEvents {
     fn flush(&mut self) {
         if self.text.is_empty() {

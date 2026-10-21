@@ -810,6 +810,7 @@ pub struct Runtime {
 }
 
 struct EpochTicker(Arc<AtomicBool>);
+
 impl Drop for EpochTicker {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
@@ -973,6 +974,7 @@ struct Diagnostics {
     stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
     events: EventSink,
 }
+
 impl Diagnostics {
     fn new(events: EventSink) -> Self {
         Self {

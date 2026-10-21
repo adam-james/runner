@@ -21,6 +21,7 @@ struct FakeExecutor {
     peak: Arc<AtomicUsize>,
     sessions: Arc<Mutex<HashMap<String, usize>>>,
 }
+
 impl Executor for FakeExecutor {
     fn execute(
         &self,
@@ -33,6 +34,7 @@ impl Executor for FakeExecutor {
         let sessions = self.sessions.clone();
         Box::pin(async move {
             struct Guard(Arc<AtomicUsize>);
+
             impl Drop for Guard {
                 fn drop(&mut self) {
                     self.0.fetch_sub(1, Ordering::SeqCst);
@@ -71,6 +73,7 @@ struct Harness {
     worker: tokio::task::JoinHandle<Result<()>>,
     http: tokio::task::JoinHandle<()>,
 }
+
 impl Harness {
     async fn new(concurrency: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();

@@ -2,6 +2,7 @@
 wit_bindgen::generate!({ world: "tool-guest", path: "../../../wit" });
 use exports::local::agent::tool_api::{Guest, ToolDescription};
 struct Tool;
+
 impl Guest for Tool {
     fn describe() -> ToolDescription {
         ToolDescription {
