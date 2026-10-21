@@ -7,7 +7,7 @@ use runner::{
     service,
     ui::{self, Ui},
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(about = "Run sandboxed agents through a local service")]
@@ -200,14 +200,16 @@ async fn chat(
     agent: Option<String>,
     deadline_secs: u64,
 ) -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = stdin_lines();
     loop {
         ui::prompt();
-        let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
+        let line =
+            tokio::select! { line = lines.recv() => line, _ = tokio::signal::ctrl_c() => break };
         ui::end_input();
         let Some(line) = line else {
             break;
         };
+        let line = line?;
         let prompt = line.trim();
         if matches!(prompt, "exit" | "quit") {
             break;
@@ -228,6 +230,22 @@ async fn chat(
         }
     }
     Ok(())
+}
+
+/// Stdin's lines, read on a thread of their own. Tokio's stdin reads on its
+/// blocking pool, which the runtime waits for on exit, so leaving with Ctrl-C
+/// while a read was pending hung until the user pressed Enter. A plain thread
+/// doesn't hold up the process's exit.
+fn stdin_lines() -> mpsc::UnboundedReceiver<std::io::Result<String>> {
+    let (send, receive) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    receive
 }
 
 /// Replays a picked-up session's conversation: each completed turn's prompt

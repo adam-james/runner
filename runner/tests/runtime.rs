@@ -433,6 +433,62 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn ctrl_c_at_the_prompt_ends_the_chat() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    connect(&data).await;
+    // Stdin stays open with nothing typed, like a terminal waiting at the prompt.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["chat", "--session", "interrupted"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take();
+    // Wait for the prompt, so the chat is reading stdin and handling Ctrl-C.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("> ") {
+        let mut byte = [0];
+        std::io::Read::read_exact(&mut stdout, &mut byte).unwrap();
+        seen.push(byte[0]);
+    }
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exited = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        child.kill().unwrap();
+        None
+    })
+    .await
+    .unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+    assert!(
+        exited.is_some(),
+        "chat didn't exit within 5s of Ctrl-C: {rest}"
+    );
+    assert!(
+        rest.contains("resume with: runner chat --session interrupted"),
+        "{rest}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn failed_turns_explain_why_without_leaking_credentials() {
