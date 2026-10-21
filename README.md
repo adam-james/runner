@@ -42,7 +42,8 @@ runner serve --config runner.toml
 
 Keep `serve` running in a separate terminal (or under your system's service
 manager). The daemon requires a `[session_store]`. Configuration paths are
-relative to the daemon's working directory. Provider credentials come from the daemon's environment; clients do not need them.
+relative to the daemon's working directory. It also requires an
+`[agents.default]` table listing the tools runs may use. Provider credentials come from the daemon's environment; clients do not need them.
 
 ```bash
 runner chat                         # new conversation

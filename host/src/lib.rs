@@ -83,8 +83,7 @@ struct RunnerConfig {
     /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
     /// Named agent definitions, each picking from the top-level agent,
-    /// provider and tools. Without a `default` entry, `default` is the
-    /// top-level config with every tool.
+    /// provider and tools. Must include `default`.
     #[serde(default)]
     agents: BTreeMap<String, AgentConfig>,
 }
@@ -126,17 +125,10 @@ fn resolve_agents(
             bail!("two tools are both named '{name}'");
         }
     }
-    let mut agents = BTreeMap::new();
     if !config.agents.contains_key(DEFAULT_AGENT) {
-        agents.insert(
-            DEFAULT_AGENT.to_string(),
-            AgentDefinition {
-                agent: config.agent.clone(),
-                provider: config.provider.clone(),
-                tools: config.tools.clone(),
-            },
-        );
+        bail!("no [agents.{DEFAULT_AGENT}]: runs that don't name an agent use it");
     }
+    let mut agents = BTreeMap::new();
     for (name, agent) in &config.agents {
         validate_name("agent name", name)?;
         let mut provider = match &agent.provider {
@@ -1378,6 +1370,7 @@ mod tests {
         assert!(err.to_string().contains("`hosts` is empty"));
     }
 
+    /// `extra` added to a config with two tools, and no agents of its own.
     fn agents(extra: &str, tools: &[&str]) -> Result<BTreeMap<String, AgentDefinition>> {
         let config: RunnerConfig = toml::from_str(&format!(
             r#"
@@ -1402,22 +1395,25 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_is_the_top_level_config_unless_declared() {
-        let implicit = agents("", &["files", "docs"]).unwrap();
-        assert_eq!(implicit.keys().collect::<Vec<_>>(), ["default"]);
-        let default = &implicit["default"];
-        assert_eq!(default.agent, "agent.wasm");
-        assert_eq!(default.provider.model, "big");
-        assert_eq!(tool_paths(default), ["files.wasm", "docs.wasm"]);
+    fn a_default_agent_must_be_declared() {
+        let err = agents("[agents.researcher]", &["files", "docs"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no [agents.default]"), "{err}");
 
         let declared = agents("[agents.default]\ntools = [\"docs\"]", &["files", "docs"]).unwrap();
-        assert_eq!(tool_paths(&declared["default"]), ["docs.wasm"]);
+        let default = &declared["default"];
+        assert_eq!(default.agent, "agent.wasm");
+        assert_eq!(default.provider.model, "big");
+        assert_eq!(tool_paths(default), ["docs.wasm"]);
     }
 
     #[test]
     fn named_agents_pick_tools_and_override_the_provider() {
         let agents = agents(
             r#"
+            [agents.default]
             [agents.researcher]
             model = "small"
             tools = ["docs"]
@@ -1452,6 +1448,7 @@ mod tests {
     fn bad_agent_definitions_are_rejected() {
         let err = |extra: &str, tools: &[&str]| agents(extra, tools).err().unwrap().to_string();
         let tools = &["files", "docs"];
+        let err = |extra: &str, tools: &[&str]| err(&format!("[agents.default]\n{extra}"), tools);
         assert!(
             err("[agents.r]\ntools = [\"wether\"]", tools)
                 .contains("agent 'r': no tool named 'wether'")

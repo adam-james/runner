@@ -13,9 +13,9 @@ An **agent definition** selects the agent component, provider, model, and tools.
 The top-level `agent`, `[provider]`, and `[[tools]]` are shared pools; each
 `[agents.<name>]` table picks from them: an optional `agent` path, either a
 `model` override or a whole `provider` table, and `tools` by the name each tool
-reports (none if omitted). Without an `[agents.default]` table, `default` is the
-top-level config with every tool. At startup the daemon instantiates each tool
-once to learn its name, and rejects duplicate tool names, unknown tool
+reports (none if omitted). The config must declare `[agents.default]`, which runs
+use when they don't name a definition. At startup the daemon instantiates each
+tool once to learn its name, and rejects duplicate tool names, unknown tool
 references, and agent names that break the session ID rules. A run names its
 definition; a session is not bound to one, so turns of one conversation may use
 different definitions.

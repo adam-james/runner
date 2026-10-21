@@ -69,6 +69,8 @@ fresh_per_call = true
 path = {}
 dir = {}
 dir_writable = true
+[agents.default]
+tools = ["fixture"]
 [agents.notools]
 model = "fixture"
 "#,
