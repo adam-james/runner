@@ -2,6 +2,7 @@
 wit_bindgen::generate!({ world: "tool-guest", path: "../../../wit" });
 use exports::local::agent::tool_api::{Guest, ToolDescription};
 struct Tool;
+static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Guest for Tool {
     fn describe() -> ToolDescription {
@@ -14,6 +15,10 @@ impl Guest for Tool {
 
     fn call(input: String) -> Result<String, String> {
         match input.as_str() {
+            "counter" => {
+                Ok((CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).to_string())
+            }
+            "trap" => panic!("fixture tool trap"),
             "spin" => loop {
                 std::hint::black_box(42);
             },

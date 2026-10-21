@@ -9,9 +9,11 @@ use exports::local::agent::provider_api::{Guest, ToolDefinition};
 use local::agent::messages::{ContentBlock, Role, ToolUseBlock};
 use local::agent::types::{ApiErrorDetail, ChatError, ChatRequest, ChatResponse, ChatStream};
 struct Provider;
+static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Guest for Provider {
     async fn chat(_: String, _: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (mut writer, text) = wit_stream::new::<String>();
         let (result, response) =
             wit_future::new(|| Err(ChatError::Internal("fixture dropped".into())));
@@ -24,6 +26,9 @@ impl Guest for Provider {
                     _ => None,
                 })
                 .unwrap_or_default();
+            if prompt == "provider-trap" {
+                panic!("fixture provider trap");
+            }
             if prompt == "cpu" {
                 loop {
                     std::hint::black_box(42);
@@ -72,7 +77,13 @@ impl Guest for Provider {
                             && m.content.iter().any(|b| matches!(b, ContentBlock::Text(_)))
                     })
                     .count();
-                let text = tool.unwrap_or_else(|| format!("turn {turns}: {prompt}"));
+                let text = tool.unwrap_or_else(|| {
+                    if prompt == "provider-counter" {
+                        call.to_string()
+                    } else {
+                        format!("turn {turns}: {prompt}")
+                    }
+                });
                 // Multiple pieces exercise streaming across the component boundary.
                 for word in text.split_inclusive(' ') {
                     writer.write_all(vec![word.to_string()]).await;

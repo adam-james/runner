@@ -1,9 +1,5 @@
 # TODO
 
-### From the PR #7 review (local agent service)
-
-- keep tool and provider instances per session - `Runtime::run_turn` (host/src/lib.rs) instantiates the provider, every tool and the session store each turn, so tool state (e.g. python variables) no longer carries over between turns, and the instantiation cost is paid every turn
-
 ## Long term
 
 - explicit delegation between agent definitions - host-provided `delegate`/`wait` tools; see docs/service.md roadmap
