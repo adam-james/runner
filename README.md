@@ -238,12 +238,13 @@ To migrate an existing config, replace each `[[tools]]` header with
 stay in that table. The same component may appear under several names with
 different directories or permissions.
 
-The included `runner.toml` also defines two agents you can try after restarting
-the server:
+An agent definition may set `system_prompt` to replace the agent component's
+built-in one ("You are a helpful assistant."). The included `runner.toml` also
+defines two agents you can try after restarting the server:
 
 ```bash
 runner chat --agent reader       # read_file only, using the default model
-runner chat --agent researcher   # web_search only, using gpt-5-mini
+runner chat --agent researcher   # web_search only, gpt-5-mini, its own system prompt
 ```
 
 All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single

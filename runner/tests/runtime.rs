@@ -73,6 +73,7 @@ dir_writable = true
 tools = ["fixture"]
 [agents.notools]
 model = "fixture"
+system_prompt = "Answer without tools."
 "#,
                 quote(target.join("agent.wasm")),
                 quote(target.join("test_provider.wasm")),
@@ -202,6 +203,24 @@ async fn agent_definitions_only_get_the_tools_they_name() {
         .find(|e| e["kind"] == "tool_finished")
         .unwrap();
     assert_eq!(finished["error"], "no such tool: fixture");
+    // A definition's system prompt replaces the agent component's own.
+    let system = async |agent: &str| {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = events.clone();
+        let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+        runtime
+            .run_turn(agent, &format!("{agent}-system"), "system-prompt", sink)
+            .await
+            .unwrap();
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect::<String>()
+    };
+    assert_eq!(system("notools").await, "Answer without tools.");
+    assert_eq!(system("default").await, "You are a helpful assistant.");
     let error = runtime
         .run_turn("nope", "s", "hello", Arc::new(|_| {}))
         .await
