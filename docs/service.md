@@ -14,11 +14,21 @@ This milestone exposes the existing config as the single `default` definition.
 A **session** identifies a conversation. A **run** performs one turn within a
 session and has a durable ID, prompt, deadline, status, and event history.
 
-`host::Runtime` shares its Wasmtime engine and compiled components. Each run
-creates independent stores and component instances, including providers and
-tools; a run never waits for another run's provider mutex. Filesystem mounts
-remain shared according to their configured paths and permissions. Separate
-execution stores do not isolate changes made to a shared writable directory.
+`host::Runtime` shares its Wasmtime engine and compiled components. Each session
+retains its own provider, tools, and session-store instances across turns, so tool
+memory (such as Python variables) survives. Runtime clones share this session
+state. Turns within a session are serialized; different sessions use independent
+stores and provider mutexes. The agent and its diagnostic capture are fresh each
+turn. `fresh_per_call` tools still start with a new instance on every call.
+
+Instances remain in memory until the runtime stops. They are not restored after
+a daemon restart; saved conversation history is. A cancelled turn or an agent
+trap discards that session's instances, since interrupted component calls cannot
+safely resume. Tool timeouts and traps recreate that tool before its next call;
+provider traps similarly recreate the provider. Normal application errors retain
+state. A session-store trap discards the session's instances. Filesystem mounts
+remain shared according to their configured paths and permissions; separate
+stores do not isolate changes made to a shared writable directory.
 
 The guest exports `agent-api.run-turn(prompt)` and imports typed `run-events`
 for text and usage. It retains its model/tool loop and session load/save calls.
