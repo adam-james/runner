@@ -176,7 +176,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 1 {
+        if version > 2 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -192,7 +192,11 @@ impl Database {
                 run_id TEXT NOT NULL REFERENCES runs(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, id);
             CREATE INDEX IF NOT EXISTS queued_runs ON runs(status, created_at);
-            PRAGMA user_version=1;",
+            -- Each session's conversation, as the host's turn loop encodes it. Not a
+            -- foreign key: the runtime can be driven directly, without the queue.
+            CREATE TABLE IF NOT EXISTS transcripts (session_id TEXT PRIMARY KEY,
+                messages TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            PRAGMA user_version=2;",
         )?;
         Ok(Self(
             Arc::new(Mutex::new(conn)),
@@ -436,6 +440,29 @@ impl Database {
         Ok(run)
     }
 
+    pub fn transcript(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT messages FROM transcripts WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_transcript(&self, session_id: &str, messages: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO transcripts (session_id, messages, updated_at) VALUES (?1, ?2, ?3)
+            ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages,
+                updated_at=excluded.updated_at",
+            params![session_id, messages, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn recover(&self) -> Result<()> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
@@ -457,5 +484,27 @@ impl Database {
             self.notify(&id);
         }
         Ok(())
+    }
+}
+
+/// The host keeps each session's conversation here, off the async runtime
+/// like every other database operation.
+impl host::Transcripts for Database {
+    fn load(&self, session: &str) -> host::BoxFuture<Result<Option<String>, String>> {
+        let (db, session) = (self.clone(), session.to_string());
+        Box::pin(async move {
+            db.blocking(move |db| db.transcript(&session))
+                .await
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+
+    fn save(&self, session: &str, transcript: String) -> host::BoxFuture<Result<(), String>> {
+        let (db, session) = (self.clone(), session.to_string());
+        Box::pin(async move {
+            db.blocking(move |db| db.save_transcript(&session, &transcript))
+                .await
+                .map_err(|e| format!("{e:#}"))
+        })
     }
 }
