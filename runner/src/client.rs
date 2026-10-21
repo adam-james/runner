@@ -1,4 +1,3 @@
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::db::{Event, Run, Session};
 use crate::service::ConnectionInfo;
+use crate::ui::Ui;
 
 pub struct Client {
     http: HttpClient,
@@ -101,10 +101,30 @@ impl Client {
             .await
     }
 
+    /// The model text of a finished run, read from its event replay.
+    pub async fn reply(&self, id: &str) -> Result<String> {
+        let mut bytes = self
+            .request(Method::GET, &format!("/v1/runs/{id}/events"), None)
+            .await?
+            .bytes_stream();
+        let mut pending = Vec::new();
+        let mut text = String::new();
+        while let Some(chunk) = bytes.next().await {
+            pending.extend_from_slice(&chunk?);
+            for event in frames(&mut pending)? {
+                if event.data["kind"] == "text" {
+                    text.push_str(event.data["text"].as_str().unwrap_or_default());
+                }
+            }
+        }
+        Ok(text)
+    }
+
     pub async fn watch(&self, id: &str, mut after: i64, json_output: bool) -> Result<()> {
         if after < 0 {
             bail!("event cursor must be nonnegative");
         }
+        let mut ui = (!json_output).then(Ui::start);
         loop {
             let response = self
                 .request(
@@ -125,25 +145,22 @@ impl Client {
                     }
                 };
                 pending.extend_from_slice(&chunk);
-                while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
-                    let frame = String::from_utf8(pending.drain(..end + 2).collect())?;
-                    let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: "))
-                    else {
-                        continue;
-                    };
-                    let event: Event = serde_json::from_str(data)?;
+                for event in frames(&mut pending)? {
                     if event.id <= after {
                         continue;
                     }
-                    render(&event, json_output)?;
+                    match &mut ui {
+                        Some(ui) => ui.event(&event.data),
+                        None => println!("{}", serde_json::to_string(&event)?),
+                    }
                     after = event.id;
                 }
             }
             if !disconnected {
                 let run = self.run(id).await?;
                 if run.terminal() {
-                    if !json_output {
-                        println!();
+                    if let Some(ui) = &mut ui {
+                        ui.finish();
                     }
                     if run.status != "completed" {
                         bail!("run {}: {}", run.status, run.error.as_deref().unwrap_or(""));
@@ -156,32 +173,14 @@ impl Client {
     }
 }
 
-fn render(event: &Event, json_output: bool) -> Result<()> {
-    if json_output {
-        println!("{}", serde_json::to_string(event)?);
-        return Ok(());
+/// Takes the complete SSE frames off the front of `pending`.
+fn frames(pending: &mut Vec<u8>) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
+        let frame = String::from_utf8(pending.drain(..end + 2).collect())?;
+        if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+            events.push(serde_json::from_str(data)?);
+        }
     }
-    let data = &event.data;
-    match data["kind"].as_str() {
-        Some("text") => {
-            print!("{}", data["text"].as_str().unwrap_or_default());
-            std::io::stdout().flush()?;
-        }
-        Some("tool_started") => {
-            let name = data["name"].as_str().unwrap_or("tool");
-            if std::io::stderr().is_terminal() {
-                eprintln!("\x1b[2m⚙ {name}\x1b[0m");
-            } else {
-                eprintln!("tool: {name}");
-            }
-        }
-        Some("tool_finished") if data["ok"] == false => eprintln!("tool failed: {}", data["name"]),
-        Some("usage") => {
-            if let Some(tokens) = data["prompt_tokens"].as_u64() {
-                eprintln!("{tokens} prompt tokens");
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    Ok(events)
 }

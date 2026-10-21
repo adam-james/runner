@@ -612,12 +612,16 @@ impl WasiView for HostState {
 impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
         (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
+        let start = std::time::Instant::now();
         let result = match self.tools.get_mut(&name) {
             Some(tool) => tool.call(&input).await,
             None => Err(format!("no such tool: {name}")),
         };
+        // The error is what the model sees as the tool result, so it is no more private than the session.
         (self.events)(
-            serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok()}),
+            serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok(),
+            "elapsed_ms":start.elapsed().as_millis() as u64,
+            "bytes":result.as_ref().map_or(0, String::len), "error":result.as_ref().err()}),
         );
         result
     }

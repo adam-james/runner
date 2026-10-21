@@ -105,7 +105,8 @@ new connection descriptor.
 
 Other event kinds are `status`, `usage`, `tool_started`, `tool_finished`,
 `diagnostic`, and `cancellation_requested`. Tool-start events contain name and
-input; tool-finish events contain name and success. Diagnostic events contain
+input; tool-finish events contain name, success, `elapsed_ms`, output `bytes`,
+and the tool's `error` (the same text the model receives). Diagnostic events contain
 source (`stdout`/`stderr`) and text. These records may contain private task data,
 so they are stored inside the private service directory.
 

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use runner::{client::Client, service};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use runner::{client::Client, service, ui};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
 #[command(about = "Run sandboxed agents through a local service")]
@@ -113,27 +113,29 @@ async fn main() -> Result<()> {
             session,
             deadline_secs,
         } => {
-            let session = match session {
+            let (session, existing) = match session {
                 Some(id) => {
-                    if !client
+                    let existing = client
                         .sessions()
                         .await?
                         .iter()
-                        .any(|session| session.id == id)
-                    {
+                        .any(|session| session.id == id);
+                    if !existing {
                         client.create_session(Some(id.clone())).await?;
                     }
-                    id
+                    (id, existing)
                 }
-                None => client.create_session(None).await?.id,
+                None => (client.create_session(None).await?.id, false),
             };
-            eprintln!("session: {session} · type exit or quit, or Ctrl-D, to leave");
+            ui::banner(&session);
+            if existing {
+                resumed(&client, &session).await?;
+            }
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             loop {
-                let mut out = tokio::io::stdout();
-                out.write_all(b"\n> ").await?;
-                out.flush().await?;
+                ui::prompt();
                 let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
+                ui::end_input();
                 let Some(line) = line else {
                     break;
                 };
@@ -148,7 +150,7 @@ async fn main() -> Result<()> {
                     .submit(Some(session.clone()), prompt.to_string(), deadline_secs)
                     .await?;
                 if let Err(error) = attach(&client, &run.id, 0, false).await {
-                    eprintln!("{error}");
+                    ui::error(&error.to_string());
                 }
             }
         }
@@ -174,6 +176,25 @@ async fn main() -> Result<()> {
             ),
         },
     }
+    Ok(())
+}
+
+/// Says where a picked-up session left off: its completed turns and last reply.
+async fn resumed(client: &Client, session: &str) -> Result<()> {
+    let turns: Vec<_> = client
+        .runs()
+        .await?
+        .into_iter()
+        .filter(|run| run.session_id == session && run.status == "completed")
+        .collect();
+    let Some(last) = turns.last() else {
+        return Ok(());
+    };
+    let reply = client.reply(&last.id).await?;
+    ui::resumed(
+        turns.len(),
+        (!reply.trim().is_empty()).then_some(reply.as_str()),
+    );
     Ok(())
 }
 
