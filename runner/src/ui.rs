@@ -271,7 +271,7 @@ pub fn goodbye(session: &str) {
         style(
             tty,
             DIM,
-            &format!("session {session} · resume with: runner chat --session {session}")
+            &format!("resume with: runner chat --session {session}")
         )
     );
 }

@@ -66,11 +66,11 @@ run ID on stdout. Without `--detach`, `run` streams output until completion.
 Ctrl-C while watching detaches; use `runs cancel` to stop the run. Failed,
 cancelled, and interrupted runs produce a nonzero watcher exit status. `chat`
 submits one turn at a time in the same session. When it ends, it prints the
-session's ID and the command to resume it. Resuming a session with `chat
---session` first replays its completed turns: each prompt, the reply, and its
-tool calls. Failed and cancelled turns aren't replayed, since they weren't saved
-to the conversation. `--session` on `run` requires an existing session.
-`--agent` on `run` and `chat` picks a named agent definition from the config's
+command to resume the session. Resuming a session with `chat --session` first
+replays its completed turns: each prompt, the reply, and its tool calls. Failed
+and cancelled turns aren't replayed, since they weren't saved to the
+conversation. `--session` on `run` requires an existing session. `--agent` on
+`run` and `chat` picks a named agent definition from the config's
 `[agents.<name>]` tables (see `runner.toml`); without it, runs use `default`.
 
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while

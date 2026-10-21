@@ -400,7 +400,7 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
     assert!(first.contains("turn 1: hello"), "{first}");
     // Ending a chat says how to resume it, with the whole session ID.
     assert!(
-        first.ends_with("session trip · resume with: runner chat --session trip\n"),
+        first.ends_with("\nresume with: runner chat --session trip\n"),
         "{first}"
     );
     let resumed = chat(&data, &["--session", "trip"], "");
