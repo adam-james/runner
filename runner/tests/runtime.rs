@@ -325,6 +325,8 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
         String::from_utf8_lossy(&output.stderr)
     );
     let id = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("agent default · session "), "{stderr}");
     client.watch(&id, 0, false).await.unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_runner"))
         .arg("--data-dir")
@@ -431,6 +433,44 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
         fresh.ends_with(&format!("resume with: runner chat --session {id}\n")),
         "{fresh}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn chat_names_its_agent_and_rejects_unknown_ones() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let named = chat(&data, &["--session", "a", "--agent", "notools"], "hi\n");
+    assert!(
+        named.starts_with("runner · agent notools · session a · "),
+        "{named}"
+    );
+    let default = chat(&data, &["--session", "b"], "");
+    assert!(
+        default.starts_with("runner · agent default · session b · "),
+        "{default}"
+    );
+    let run = client.runs(Some("a")).await.unwrap();
+    assert_eq!(run[0].agent, "notools");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["chat", "--session", "c", "--agent", "nope"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("unknown agent 'nope'; the daemon has: default, notools"),
+        "{stderr}"
+    );
+    // Rejected before the chat started, so no session was made for it.
+    let sessions = client.sessions().await.unwrap();
+    assert!(!sessions.iter().any(|session| session.id == "c"));
 }
 
 #[cfg(unix)]

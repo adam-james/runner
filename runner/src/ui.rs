@@ -213,7 +213,7 @@ impl Drop for Ui {
     }
 }
 
-pub fn banner(session: &str) {
+pub fn banner(agent: &str, session: &str) {
     let tty = io::stdout().is_terminal();
     println!(
         "{}{}",
@@ -221,7 +221,9 @@ pub fn banner(session: &str) {
         style(
             tty,
             DIM,
-            &format!(" · session {session} · type exit or quit, or Ctrl-D, to leave")
+            &format!(
+                " · agent {agent} · session {session} · type exit or quit, or Ctrl-D, to leave"
+            )
         )
     );
 }
@@ -276,13 +278,14 @@ pub fn goodbye(session: &str) {
     );
 }
 
-/// The session a `run` or `runs watch` belongs to. On stderr, so stdout
-/// stays the run's output (or its ID, with `--detach`).
-pub fn session(session: &str) {
+/// The agent a `run` or `runs watch` is for, and its session. On stderr, so
+/// stdout stays the run's output (or its ID, with `--detach`).
+pub fn run_header(agent: &str, session: &str) {
+    let line = format!("agent {agent} · session {session}");
     if io::stderr().is_terminal() {
-        eprintln!("{DIM}session {session}{RESET}");
+        eprintln!("{DIM}{line}{RESET}");
     } else {
-        eprintln!("session: {session}");
+        eprintln!("{line}");
     }
 }
 
