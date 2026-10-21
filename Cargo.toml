@@ -5,7 +5,6 @@ members = [
     "runner",
     "tests/components/provider",
     "tests/components/tool",
-    "agent",
     "providers/anthropic",
     "providers/openai",
     "tools/weather",

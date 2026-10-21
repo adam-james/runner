@@ -1,14 +1,14 @@
 # runner
 
-A sandboxed agent runner. Everything that runs is a WASM component — the
-agent, the model provider, and each tool — and a persistent local daemon
-wires them together. The host is the only thing that ever touches API keys
-or decides which provider/model/tools are in use.
+A sandboxed agent runner. Model providers, tools, and the session store are
+WASM components, and a persistent local daemon wires them together. The host
+is the only thing that ever touches API keys or decides which
+provider/model/tools are in use.
 
-- The **agent** (conversation loop, system prompt) has no network access at
-  all. It calls the host for chat, tools, and session history, and emits
-  structured output events. It has no say in which provider, model, or
-  tools serve its requests.
+- The **agent loop** is the host's own code: for each turn it loads the
+  session, sends the conversation to the agent's provider, runs the tool calls
+  the model asks for, and saves the session. An agent definition in the config
+  picks its provider, model, tools, and system prompt.
 - A **provider** translates a `chat` call into one vendor's API (Anthropic,
   OpenAI, …). It gets `wasi:http`, but can only reach the hosts its config
   allow-lists, and never sees an API key: the host adds the credential
@@ -22,7 +22,7 @@ components need recompiling.
 Replies stream: text is printed as the model generates it. That's built on
 WASI 0.3 (Component Model async): `chat` is an `async func` returning a
 `stream<string>` of text pieces plus a `future` of the complete response,
-both across the agent/host and host/provider boundaries. Tools are plain
+across the host/provider boundary. Tools are plain
 synchronous WASI 0.2 components. Everything still builds for the
 `wasm32-wasip2` Rust target; the async parts come from the `wasip3` crate.
 
@@ -30,7 +30,7 @@ synchronous WASI 0.2 components. Everything still builds for the
 
 Runner runs as a persistent local daemon. The daemon owns execution;
 closing a client leaves its runs going. CLI and future desktop clients use the
-same authenticated local API. The agent emits structured events; the CLI owns
+same authenticated local API. The host emits structured events; the CLI owns
 terminal input and rendering.
 
 Build the components as described below, then install the CLI:
@@ -89,9 +89,7 @@ The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;
 set `run --deadline-secs N` or `chat --deadline-secs N` (1–86400 seconds). The
 deadline starts when execution starts, excluding queue time. Text, usage, tool
-activity, and status events are saved and replayable. The host captures guest
-stdout/stderr as bounded diagnostic events at the end of execution, separately
-from reply text.
+activity, and status events are saved and replayable.
 
 Service state lives in `~/.runner/service` by default. Override it with
 `--data-dir PATH` on any command or `RUNNER_DATA_DIR`. The directory is private
@@ -115,12 +113,12 @@ next milestones: scheduling, explicit delegation, and desktop clients.
 ### Verify the service
 
 The standard tests use deterministic execution without API keys. The additional
-runtime tests use the real agent and session store with a fixture provider and
-tool, and also exercise CLI/daemon processes and crash recovery:
+runtime tests use the real turn loop and session store with a fixture provider
+and tool, and also exercise CLI/daemon processes and crash recovery:
 
 ```bash
 cargo test -p host -p runner
-cargo build -p agent -p fs-store -p test-provider -p test-tool --target wasm32-wasip2
+cargo build -p fs-store -p test-provider -p test-tool --target wasm32-wasip2
 cargo test -p runner --test runtime -- --ignored
 cargo clippy -p host -p runner --all-targets -- -D warnings
 ```
@@ -130,41 +128,31 @@ Fixtures are test components and should not be included in normal configs.
 ## Layout
 
 - `wit/messages.wit` — the conversation itself (messages and their content
-  blocks: text, tool uses, tool results), shared by the agent, providers,
+  blocks: text, tool uses, tool results), shared by the host, providers,
   and session stores.
 - `wit/types.wit` — the types around a `chat` call (`chat-request`/
   `chat-response`, errors, and `chat-stream`: a reply in progress) shared
-  by the agent and providers.
-- `wit/chat.wit` — the agent/host interface. `chat` is async and returns
-  a `chat-stream`. `chat-request` has no
-  `provider`/`model`/`tools` field — the host supplies all of that. The
-  agent only sees `tool-use` content blocks in responses and a generic
-  `call-tool(name, input)` import to act on them; it never knows what a tool
-  actually does.
+  by the host and providers.
 - `wit/provider.wit` — the provider/host interface. A provider exports an
   async `chat(model, tools, request)` returning a `chat-stream`; the host
-  fills in `model` and `tools` from its config, passes the agent's request
-  through unchanged, and copies the stream back to the agent as it arrives
-  (each component has its own store, so streams can't be handed across
-  directly).
+  fills in `model` and `tools` from the agent definition and reads the
+  stream's text as it arrives.
 - `wit/tool.wit` — the tool/host interface. A tool exports `describe()`
   (name, description, JSON input schema) and `call(input-json)`. The host
   calls `describe()` once at startup to learn what's available and to build
   the provider's native tool-calling schema; `call()` runs it.
-- `wit/session.wit` — sessions. The agent imports `session` (`load()` and
-  `save(messages)`, with no session id: the host decides which session
-  this run is); a session store exports `session-store` (`load`/`save` by
-  id), and the host passes the agent's calls through to it.
+- `wit/session.wit` — sessions. A session store exports `session-store`
+  (`load`/`save` by id); the host loads the session before each turn and
+  saves it after a completed one.
 - `runner/` — local daemon, durable run queue, HTTP/SSE API, and CLI client.
-- `host/` — runtime library. Loads the agent, the provider, and every tool
+- `host/` — runtime library. Loads the providers, tools, and session store
   from a TOML config file, restricts each provider/tool's outbound
   `wasi:http` to its own allow-list, injects configured headers
-  (credentials) into those requests, and runs the show under Wasmtime. It
-  has no provider-specific code.
-- `agent/` — the guest. Exports async `agent-api.run-turn`, loads the session,
-  calls `chat`, and emits typed text and usage events. When the model requests
-  tools, it calls them via `call-tool` and feeds the results back. Saves the
-  session after a completed turn. All terminal interaction lives in the CLI.
+  (credentials) into those requests, and runs them under Wasmtime. Its turn
+  loop calls the agent's provider, emits typed text, usage, and tool events,
+  feeds tool results back to the model, and saves the session after a
+  completed turn. It has no provider-specific code, and all terminal
+  interaction lives in the CLI.
 - `providers/anthropic/`, `providers/openai/` — the provider components,
   for the Messages API and Chat Completions API respectively. Each sends a
   streaming request over WASI 0.3's `wasi:http/client`, forwards text
@@ -218,8 +206,6 @@ The daemon takes a TOML config file with `runner serve --config PATH`
 (default `runner.toml`).
 
 ```toml
-agent = "target/wasm32-wasip2/release/agent.wasm"
-
 [providers.anthropic]
 path = "target/wasm32-wasip2/release/anthropic.wasm"
 model = "claude-sonnet-5"
@@ -529,12 +515,10 @@ read on: `Iterator`'s page alone runs to over 4000 lines.
 
 ## Switching provider or adding tools
 
-Edit the TOML, no recompiling needed — the same agent and tool binaries work
-against any provider/model/tool-set the config points them at:
+Edit the TOML, no recompiling needed — the same tool binaries work against any
+provider/model the config points them at:
 
 ```toml
-agent = "target/wasm32-wasip2/release/agent.wasm"
-
 [providers.openai]
 path = "target/wasm32-wasip2/release/openai.wasm"
 model = "gpt-5"
@@ -551,22 +535,10 @@ tools = ["get_weather"]
 ```
 
 A new tool is a new `[tools.<name>]` table pointing at its own component, with
-its own allow-list — the agent's code never changes. A new provider is a
+its own allow-list — the host's code never changes. A new provider is a
 new component exporting `provider-api` — the host's code never changes.
 
 ## Verify the sandboxing
-
-```bash
-wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/agent.wasm"
-```
-
-The agent's imports should be limited to `local:agent/chat-api` and
-`local:agent/session` (and the type-only `local:agent/messages` and
-`local:agent/types`) plus the
-standard `wasi:cli`/`wasi:io`/`wasi:clocks` set — no `wasi:http`, no
-`wasi:sockets`, no inherited environment. Its agent entry point is
-`local:agent/agent-api`; it has no `wasi:cli/run` export.
-It also imports `local:agent/run-events` for structured text and usage events.
 
 ```bash
 wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/weather.wasm"

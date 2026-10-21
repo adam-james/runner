@@ -36,7 +36,7 @@ impl Fixture {
             root.join(target)
         }
         .join("wasm32-wasip2/debug");
-        for name in ["agent", "test_provider", "test_tool", "fs_store"] {
+        for name in ["test_provider", "test_tool", "fs_store"] {
             assert!(
                 target.join(format!("{name}.wasm")).exists(),
                 "build WASM fixtures first; see README"
@@ -54,7 +54,6 @@ impl Fixture {
             &config,
             format!(
                 r#"
-agent = {}
 [providers.fixture]
 path = {}
 model = "fixture"
@@ -77,7 +76,6 @@ provider = "fixture"
 model = "fixture-small"
 system_prompt = "Answer without tools."
 "#,
-                quote(target.join("agent.wasm")),
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
                 quote(tools),
