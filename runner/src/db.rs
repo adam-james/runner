@@ -85,6 +85,16 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
 const RUN_COLUMNS: &str =
     "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error";
 
+fn upsert_transcript(tx: &Connection, session_id: &str, messages: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO transcripts (session_id, messages, updated_at) VALUES (?1, ?2, ?3)
+        ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages,
+            updated_at=excluded.updated_at",
+        params![session_id, messages, now()],
+    )?;
+    Ok(())
+}
+
 fn append_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
     tx.execute(
         "INSERT INTO events (run_id, data) VALUES (?1, ?2)",
@@ -372,17 +382,38 @@ impl Database {
         .collect()
     }
 
+    /// Ends a running run without saving a turn. A no-op for a run that is
+    /// already terminal.
     pub fn finish(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        self.end(id, status, error, None)
+    }
+
+    /// Completes a running run and saves its turn's transcript in the same
+    /// transaction, so a session's history only ever includes completed
+    /// runs. A no-op, saving nothing, for a run that is already terminal.
+    pub fn complete(&self, id: &str, transcript: &str) -> Result<()> {
+        self.end(id, "completed", None, Some(transcript))
+    }
+
+    fn end(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+        transcript: Option<&str>,
+    ) -> Result<()> {
         if !is_terminal(status) {
             bail!("invalid terminal status");
         }
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
-        let cancelled =
-            tx.query_row("SELECT cancel_requested FROM runs WHERE id=?1", [id], |r| {
-                r.get::<_, bool>(0)
-            })?;
-        // A completed turn is already in the session history; a late cancel must not hide it.
+        let (session_id, cancelled) = tx.query_row(
+            "SELECT session_id, cancel_requested FROM runs WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
+        )?;
+        // A turn that finished before execution was stopped stays completed,
+        // even if cancellation was requested meanwhile.
         let status = if cancelled && status != "completed" {
             "cancelled"
         } else {
@@ -393,6 +424,10 @@ impl Database {
             params![id, status, error],
         )? == 1
         {
+            if let Some(transcript) = transcript {
+                upsert_transcript(&tx, &session_id, transcript)?;
+                append_event(&tx, id, json!({"kind":"turn_saved"}))?;
+            }
             append_event(
                 &tx,
                 id,
@@ -454,13 +489,7 @@ impl Database {
     }
 
     pub fn save_transcript(&self, session_id: &str, messages: &str) -> Result<()> {
-        self.0.lock().unwrap().execute(
-            "INSERT INTO transcripts (session_id, messages, updated_at) VALUES (?1, ?2, ?3)
-            ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages,
-                updated_at=excluded.updated_at",
-            params![session_id, messages, now()],
-        )?;
-        Ok(())
+        upsert_transcript(&self.0.lock().unwrap(), session_id, messages)
     }
 
     pub fn recover(&self) -> Result<()> {
@@ -484,27 +513,5 @@ impl Database {
             self.notify(&id);
         }
         Ok(())
-    }
-}
-
-/// The host keeps each session's conversation here, off the async runtime
-/// like every other database operation.
-impl host::Transcripts for Database {
-    fn load(&self, session: &str) -> host::BoxFuture<Result<Option<String>, String>> {
-        let (db, session) = (self.clone(), session.to_string());
-        Box::pin(async move {
-            db.blocking(move |db| db.transcript(&session))
-                .await
-                .map_err(|e| format!("{e:#}"))
-        })
-    }
-
-    fn save(&self, session: &str, transcript: String) -> host::BoxFuture<Result<(), String>> {
-        let (db, session) = (self.clone(), session.to_string());
-        Box::pin(async move {
-            db.blocking(move |db| db.save_transcript(&session, &transcript))
-                .await
-                .map_err(|e| format!("{e:#}"))
-        })
     }
 }
