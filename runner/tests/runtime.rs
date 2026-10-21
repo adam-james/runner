@@ -115,6 +115,15 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         .collect();
     assert_eq!(output, "turn 1: helloturn 2: againturn 1: separate");
     assert!(events.lock().unwrap().iter().any(|e| e["kind"] == "usage"));
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "turn_saved")
+            .count(),
+        3
+    );
     events.lock().unwrap().clear();
     runtime.run_turn("probe", "tool:probe", sink).await.unwrap();
     let events = events.lock().unwrap();
@@ -326,6 +335,12 @@ async fn failed_turns_explain_why_without_leaking_credentials() {
             wait(&db, &run.id, "failed").await.error.as_deref(),
             Some(error)
         );
+        assert!(
+            !db.events(&run.id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event.data["kind"] == "turn_saved")
+        );
     }
     stop.cancel();
     task.await.unwrap().unwrap();
@@ -350,4 +365,31 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
     );
     stop.cancel();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn a_failed_session_save_does_not_report_a_saved_turn() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.dir.path().join("sessions")).unwrap();
+    let config = std::fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("dir_writable = true", "dir_writable = false");
+    std::fs::write(&fixture.config, config).unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = events.clone();
+    let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+    let error = fixture
+        .runtime()
+        .run_turn("read-only", "hello", sink)
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<host::TurnFailed>().is_some(),
+        "{error:#}"
+    );
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| event["kind"] == "text"));
+    assert!(!events.iter().any(|event| event["kind"] == "turn_saved"));
+    assert!(!fixture.dir.path().join("sessions/read-only.json").exists());
 }

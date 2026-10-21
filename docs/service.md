@@ -51,6 +51,9 @@ client cannot block execution or lose previously recorded output.
 Run states are `queued`, `running`, `completed`, `failed`, `cancelled`, and
 `interrupted`. Cancellation is a durable request; active runs become terminal
 after execution is dropped. Queued cancellations take effect immediately.
+A successful agent session save emits `turn_saved` before returning to the agent.
+Once observed, the run completes even if cancellation, shutdown, or a deadline
+wins before the agent returns; event persistence failures still fail the run.
 Deadlines include component setup and all model/tool work, starting at claim.
 Epoch yields make CPU-bound components interruptible; provider tasks are aborted
 when the agent store is dropped. Tool-specific timeouts and fresh-instance
@@ -113,7 +116,7 @@ rendered cursor; restarting the daemon requires reconnecting the CLI with its
 new connection descriptor.
 
 Other event kinds are `status`, `usage`, `tool_started`, `tool_finished`,
-`diagnostic`, and `cancellation_requested`. Tool-start events contain name and
+`diagnostic`, `turn_saved`, and `cancellation_requested`. Tool-start events contain name and
 input; tool-finish events contain name, success, `elapsed_ms`, output `bytes`,
 and the tool's `error` (the same text the model receives). Diagnostic events contain
 source (`stdout`/`stderr`) and text. These records may contain private task data,

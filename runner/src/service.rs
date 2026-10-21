@@ -4,7 +4,10 @@ use std::fs::{File, OpenOptions};
 use std::future::IntoFuture;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -417,7 +420,13 @@ async fn execute(
         buffer.flush();
         buffer.failed
     });
+    let saved = Arc::new(AtomicBool::new(false));
+    let turn_saved = saved.clone();
     let sink: host::EventSink = Arc::new(move |value| {
+        if value["kind"] == "turn_saved" {
+            // Observe the save synchronously, before the blocking writer persists its event.
+            turn_saved.store(true, Ordering::Release);
+        }
         let _ = send.send(value);
     });
     let cancel = CancellationToken::new();
@@ -459,6 +468,13 @@ async fn execute(
     // Drop all guest execution before publishing a terminal status.
     drop(future);
     let failed = writer.await?;
+    // Cancellation can win the select after session.save succeeds but before the
+    // agent returns. Its transcript is already committed, so keep the run completed.
+    let (status, error) = if saved.load(Ordering::Acquire) {
+        ("completed", None)
+    } else {
+        (status, error)
+    };
     db.blocking(move |db| {
         db.finish(
             &run.id,
