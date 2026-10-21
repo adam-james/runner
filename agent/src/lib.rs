@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead};
 use std::time::Instant;
 
 use wasip3::wit_bindgen;
@@ -22,6 +22,25 @@ use local::agent::{chat_api, session};
 wasip3::cli::command::export!(Agent);
 
 struct Agent;
+
+export!(Agent);
+
+impl exports::local::agent::agent_api::Guest for Agent {
+    async fn run_turn(prompt: String) -> Result<(), String> {
+        let mut history = session::load()?.unwrap_or_default();
+        history.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(prompt)],
+        });
+        run_turn(&Ui::events(), &mut history)
+            .await
+            .map_err(|error| match error {
+                TurnError::Chat(error) => format!("{error:?}"),
+                TurnError::TokenLimit => "reply exceeded token limit".to_string(),
+            })?;
+        session::save(&history)
+    }
+}
 
 impl wasip3::exports::cli::run::Guest for Agent {
     async fn run() -> Result<(), ()> {
@@ -129,12 +148,11 @@ async fn run_turn(ui: &Ui, history: &mut Vec<Message>) -> Result<(), TurnError> 
             if let Some(thinking) = thinking.take() {
                 ui.stop_thinking(thinking);
             }
-            print!("{piece}");
-            io::stdout().flush().ok();
+            ui.text(&piece);
         }
         match thinking {
             Some(thinking) => ui.stop_thinking(thinking),
-            None => println!(),
+            None => ui.end_text(),
         }
         let response = response.await?;
         ui.token_usage(

@@ -37,6 +37,7 @@ pub struct Thinking {
 }
 
 pub struct Ui {
+    event_mode: bool,
     stdout_tty: bool,
     stderr_tty: bool,
 }
@@ -44,8 +45,34 @@ pub struct Ui {
 impl Ui {
     pub fn new() -> Self {
         Self {
+            event_mode: false,
             stdout_tty: io::stdout().is_terminal(),
             stderr_tty: io::stderr().is_terminal(),
+        }
+    }
+
+    pub fn events() -> Self {
+        Self {
+            event_mode: true,
+            stdout_tty: false,
+            stderr_tty: false,
+        }
+    }
+
+    pub fn text(&self, text: &str) {
+        if self.event_mode {
+            crate::local::agent::run_events::emit(&crate::local::agent::run_events::Event::Text(
+                text.to_string(),
+            ));
+        } else {
+            print!("{text}");
+            flush();
+        }
+    }
+
+    pub fn end_text(&self) {
+        if !self.event_mode {
+            println!();
         }
     }
 
@@ -132,6 +159,9 @@ impl Ui {
     /// Replaces the indicator with how long the wait took.
     pub fn stop_thinking(&self, thinking: Thinking) {
         thinking.done.set(true);
+        if self.event_mode {
+            return;
+        }
         if self.stdout_tty {
             print!("{CLEAR_LINE}");
         }
@@ -148,6 +178,17 @@ impl Ui {
         cache_read_tokens: Option<u32>,
         cache_creation_tokens: Option<u32>,
     ) {
+        if self.event_mode {
+            use crate::local::agent::run_events::{self, Event, Usage};
+            run_events::emit(&Event::Usage(Usage {
+                reasoning_tokens,
+                max_tokens,
+                prompt_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            }));
+            return;
+        }
         if let Some(line) = token_usage_line(
             reasoning_tokens,
             max_tokens,
@@ -162,6 +203,9 @@ impl Ui {
     /// Shows a tool call as `⚙ name(args)` while it runs. Finished by
     /// `tool_done`.
     pub fn tool_start(&self, name: &str, input_json: &str) {
+        if self.event_mode {
+            return;
+        }
         print!("{}", self.style(DIM, &tool_call(name, input_json)));
         if self.stdout_tty {
             print!("{}", self.style(DIM, " …"));
@@ -182,6 +226,9 @@ impl Ui {
                 "{CLEAR_LINE}{}",
                 self.style(DIM, &tool_call(name, input_json))
             );
+        }
+        if self.event_mode {
+            return;
         }
         let secs = elapsed.as_secs_f32();
         match result {

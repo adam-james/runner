@@ -26,6 +26,86 @@ both across the agent/host and host/provider boundaries. Tools are plain
 synchronous WASI 0.2 components. Everything still builds for the
 `wasm32-wasip2` Rust target; the async parts come from the `wasip3` crate.
 
+## Local service and CLI
+
+Runner can also run as a persistent local daemon. The daemon owns execution;
+closing a client leaves its runs going. CLI and future desktop clients use the
+same authenticated local API. The original direct host REPL remains available.
+
+Build the components as described below, then install the CLI:
+
+```bash
+cargo install --path runner
+runner serve --config runner.toml
+```
+
+Keep `serve` running in a separate terminal (or under your system's service
+manager). Daemon mode requires a `[session_store]`. Configuration paths are
+relative to the daemon's working directory, as with the direct host. Provider
+credentials come from the daemon's environment; clients do not need them.
+
+```bash
+runner chat                         # new conversation
+runner chat --session research       # create or resume a named conversation
+runner run "Summarize today's news" --detach
+runner runs list
+runner runs inspect RUN_ID
+runner runs watch RUN_ID
+runner runs watch RUN_ID --after EVENT_ID --json
+runner runs cancel RUN_ID
+runner sessions list
+runner sessions create trip
+runner run --session trip "Plan a weekend in Seattle"
+```
+
+`run --detach` prints a run ID on stdout and the session ID on stderr. Without
+`--detach`, `run` streams output until completion. Ctrl-C while watching detaches;
+use `runs cancel` to stop the run. Failed, cancelled, and interrupted runs produce
+a nonzero watcher exit status. `chat` submits one turn at a time in the same
+session. `--session` on `run` requires an existing session.
+
+The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
+serializing turns within a session. Runs have a ten-minute deadline by default;
+set `run --deadline-secs N` or `chat --deadline-secs N` (1–86400 seconds). The
+deadline starts when execution starts, excluding queue time. Text, usage, tool
+activity, and status events are saved and replayable. The host captures guest
+stdout/stderr as bounded diagnostic events at the end of execution, separately
+from reply text.
+
+Service state lives in `~/.runner/service` by default. Override it with
+`--data-dir PATH` on any command or `RUNNER_DATA_DIR`. The directory is private
+on macOS/Linux and contains SQLite state, a daemon lock, and a private connection
+file with a generated local API token. Only one daemon can use a data directory.
+Conversation history still lives in the configured session store; existing
+sessions are discovered when the daemon starts. Use this daemon as the sole
+writer to that store while it is running.
+
+Queued work survives daemon restarts. Work that was running becomes
+`interrupted`; Runner never automatically retries it, because a tool may already
+have changed external state. Only completed turns are saved to the transcript.
+A transcript save and a run-status update are separate operations, so an
+interrupted run may have saved its final turn immediately before the daemon
+stopped. Local background work requires the machine to be awake and the daemon
+running.
+
+See [service architecture and roadmap](docs/service.md) for the API and the
+next milestones: scheduling, explicit delegation, and desktop clients.
+
+### Verify the service
+
+The standard tests use deterministic execution without API keys. The additional
+runtime tests use the real agent and session store with a fixture provider and
+tool, and also exercise CLI/daemon processes and crash recovery:
+
+```bash
+cargo test -p host -p runner
+cargo build -p agent -p fs-store -p test-provider -p test-tool --target wasm32-wasip2
+cargo test -p runner --test runtime -- --ignored
+cargo clippy -p host -p runner --all-targets -- -D warnings
+```
+
+Fixtures are test components and should not be included in normal configs.
+
 ## Layout
 
 - `wit/messages.wit` — the conversation itself (messages and their content
@@ -54,7 +134,8 @@ synchronous WASI 0.2 components. Everything still builds for the
   `save(messages)`, with no session id: the host decides which session
   this run is); a session store exports `session-store` (`load`/`save` by
   id, plus `ids()`), and the host passes the agent's calls through to it.
-- `host/` — native binary. Loads the agent, the provider, and every tool
+- `runner/` — local daemon, durable run queue, HTTP/SSE API, and CLI client.
+- `host/` — runtime library and original native binary. Loads the agent, the provider, and every tool
   from a TOML config file, restricts each provider/tool's outbound
   `wasi:http` to its own allow-list, injects configured headers
   (credentials) into those requests, and runs the show under Wasmtime. It
@@ -379,8 +460,8 @@ The agent's imports should be limited to `local:agent/chat-api` and
 `local:agent/session` (and the type-only `local:agent/messages` and
 `local:agent/types`) plus the
 standard `wasi:cli`/`wasi:io`/`wasi:clocks` set — no `wasi:http`, no
-`wasi:sockets`, no way to read env vars. Its one export is
-`wasi:cli/run@0.3.0`.
+`wasi:sockets`, no way to read env vars. Its exports are `wasi:cli/run@0.3.0` and `local:agent/agent-api`.
+It also imports `local:agent/run-events` for structured text and usage events.
 
 ```bash
 wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/weather.wasm"
