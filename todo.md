@@ -4,7 +4,6 @@
 
 - explicit delegation between agent definitions - host-provided `delegate`/`wait` tools; see docs/service.md roadmap
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
-- can we get rid of the session store since that's in sqlite now
 - agent to agent communication
 - memory
 - component registry

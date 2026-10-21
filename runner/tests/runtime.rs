@@ -36,7 +36,7 @@ impl Fixture {
             root.join(target)
         }
         .join("wasm32-wasip2/debug");
-        for name in ["test_provider", "test_tool", "fs_store"] {
+        for name in ["test_provider", "test_tool"] {
             assert!(
                 target.join(format!("{name}.wasm")).exists(),
                 "build WASM fixtures first; see README"
@@ -64,10 +64,6 @@ path = {}
 dir = {}
 timeout_secs = {tool_timeout}
 fresh_per_call = true
-[session_store]
-path = {}
-dir = {}
-dir_writable = true
 [agents.default]
 provider = "fixture"
 tools = ["fixture"]
@@ -84,16 +80,20 @@ max_model_calls = 1
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
                 quote(tools),
-                quote(target.join("fs_store.wasm")),
-                quote(dir.path().join("sessions"))
             ),
         )
         .unwrap();
         Self { dir, config }
     }
 
+    /// With conversations kept in the fixture's database, as the daemon does.
     async fn runtime(&self) -> host::Runtime {
-        host::Runtime::new(self.config.to_str().unwrap())
+        let db = Database::open(&self.dir.path().join("state.sqlite3")).unwrap();
+        self.runtime_with(Arc::new(db)).await
+    }
+
+    async fn runtime_with(&self, transcripts: Arc<dyn host::Transcripts>) -> host::Runtime {
+        host::Runtime::new(self.config.to_str().unwrap(), transcripts)
             .await
             .unwrap()
     }
@@ -699,29 +699,64 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn a_failed_session_save_does_not_report_a_saved_turn() {
+    /// A store whose saves fail with an error that mustn't reach the user.
+    struct FailingSaves;
+
+    impl host::Transcripts for FailingSaves {
+        fn load(&self, _: &str) -> host::BoxFuture<Result<Option<String>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn save(&self, _: &str, _: String) -> host::BoxFuture<Result<(), String>> {
+            Box::pin(async { Err("disk I/O error at /private/path".into()) })
+        }
+    }
+
     let fixture = Fixture::new();
-    std::fs::create_dir(fixture.dir.path().join("sessions")).unwrap();
-    let config = std::fs::read_to_string(&fixture.config)
-        .unwrap()
-        .replace("dir_writable = true", "dir_writable = false");
-    std::fs::write(&fixture.config, config).unwrap();
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
     let error = fixture
-        .runtime()
+        .runtime_with(Arc::new(FailingSaves))
         .await
-        .run_turn("default", "read-only", "hello", sink)
+        .run_turn("default", "unsaved", "hello", sink)
         .await
         .unwrap_err();
-    assert!(
-        error.downcast_ref::<host::TurnFailed>().is_some(),
+    assert_eq!(
+        error
+            .downcast_ref::<host::TurnFailed>()
+            .map(|e| e.0.as_str()),
+        Some("could not save this turn"),
         "{error:#}"
     );
     let events = events.lock().unwrap();
     assert!(events.iter().any(|event| event["kind"] == "text"));
     assert!(!events.iter().any(|event| event["kind"] == "turn_saved"));
-    assert!(!fixture.dir.path().join("sessions/read-only.json").exists());
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn conversations_are_kept_in_the_service_database() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    assert_eq!(
+        turn_output(&runtime, "kept", "hello").await,
+        "turn 1: hello"
+    );
+    // A new runtime, as after a daemon restart, picks the conversation up again.
+    drop(runtime);
+    let runtime = fixture.runtime().await;
+    assert_eq!(
+        turn_output(&runtime, "kept", "again").await,
+        "turn 2: again"
+    );
+    let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
+    let transcript: Value = serde_json::from_str(&db.transcript("kept").unwrap().unwrap()).unwrap();
+    assert_eq!(transcript.as_array().unwrap().len(), 4);
+    assert_eq!(
+        transcript[2],
+        json!({"role":"User","content":[{"Text":"again"}]})
+    );
+    assert_eq!(db.transcript("never-used").unwrap(), None);
 }
 
 async fn turn_output(runtime: &host::Runtime, session: &str, prompt: &str) -> String {
@@ -874,7 +909,7 @@ async fn configured_tool_names_control_model_definitions_dispatch_and_events() {
         .split_once("[tools.fixture]")
         .unwrap()
         .1
-        .split_once("[session_store]")
+        .split_once("[agents.default]")
         .unwrap()
         .0;
     let tool = tool_block.replace("fresh_per_call = true", "fresh_per_call = false");
@@ -978,7 +1013,6 @@ async fn activity_logs_attribute_cached_components_and_concurrent_turns_without_
         "outcome=\"interrupted\"",
         "test_provider.wasm",
         "test_tool.wasm",
-        "fs_store.wasm",
     ] {
         assert!(logs.contains(expected), "{expected}: {logs}");
     }

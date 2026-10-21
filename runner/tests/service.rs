@@ -482,6 +482,30 @@ async fn shutdown_interrupts_active_work_and_preserves_queue() {
 }
 
 #[test]
+fn a_version_1_database_gains_transcripts_and_keeps_its_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let run = Database::open(&path)
+        .unwrap()
+        .submit(None, "default".into(), "before upgrade".into(), 60)
+        .unwrap();
+    // What a daemon from before transcripts moved into SQLite left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE transcripts; PRAGMA user_version=1;")
+        .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.run(&run.id).unwrap().unwrap().prompt, "before upgrade");
+    assert_eq!(db.transcript(&run.session_id).unwrap(), None);
+    db.save_transcript(&run.session_id, "[1]").unwrap();
+    db.save_transcript(&run.session_id, "[2]").unwrap();
+    assert_eq!(
+        db.transcript(&run.session_id).unwrap().as_deref(),
+        Some("[2]")
+    );
+}
+
+#[test]
 fn crash_recovery_is_durable_and_does_not_replay_running_work() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");

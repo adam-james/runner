@@ -2,10 +2,10 @@
 
 The native service is the execution authority. Clients submit work and watch
 persisted events; they never own agent lifetimes or receive provider
-credentials. Providers, tools, and session stores are WASM components with the
-existing capability restrictions; the agent's turn loop is native host code. The
-CLI contains the service's terminal UI. Interactive use goes through `runner
-chat`.
+credentials. Providers and tools are WASM components with the existing
+capability restrictions; the agent's turn loop is native host code, and
+conversations are kept in the service's SQLite database. The CLI contains the
+service's terminal UI. Interactive use goes through `runner chat`.
 
 ## Execution and persistence
 
@@ -31,23 +31,22 @@ conversation. A **run** performs one turn within a session and has a durable ID,
 prompt, deadline, status, and event history.
 
 `host::Runtime` shares its Wasmtime engine and compiled components. Each session
-retains its own provider, tools, and session-store instances across turns, so
-tool memory (such as Python variables) survives. Runtime clones share this
-session state. Turns within a session are serialized; different sessions use
-independent stores and provider mutexes. `fresh_per_call` tools still start with
-a new instance on every call. The instances belong to the definition that
-created them: a turn that names a different definition than the session's
-previous turn starts with new instances for its own definition, and later turns
-keep those.
+retains its own provider and tool instances across turns, so tool memory (such
+as Python variables) survives. Runtime clones share this session state. Turns
+within a session are serialized; different sessions use independent stores and
+provider mutexes. `fresh_per_call` tools still start with a new instance on
+every call. The instances belong to the definition that created them: a turn
+that names a different definition than the session's previous turn starts with
+new instances for its own definition, and later turns keep those.
 
 Instances remain in memory until the runtime stops. They are not restored after
 a daemon restart; saved conversation history is. A cancelled turn discards that
 session's instances, since interrupted component calls cannot safely resume.
 Tool timeouts and traps recreate that tool before its next call; provider traps
-similarly recreate the provider. Normal application errors retain state. A
-session-store trap discards the session's instances. Filesystem mounts remain
-shared according to their configured paths and permissions; separate stores do
-not isolate changes made to a shared writable directory.
+similarly recreate the provider. Normal application errors, including a failed
+transcript load or save, retain state. Filesystem mounts remain shared according
+to their configured paths and permissions; separate stores do not isolate
+changes made to a shared writable directory.
 
 Each turn loads the session's history, appends the prompt, and calls the
 provider until a reply asks for no tools, running the requested tools in order
@@ -62,15 +61,20 @@ capped at 500 characters. Other errors, such as failing to load a component, are
 not published to clients because they may include reflected request data; those
 runs say only `agent execution failed`.
 
-SQLite stores sessions, submitted runs, and ordered events. The existing
-session-store component stores completed conversation turns. Submission and its
-initial event are one transaction; terminal status and its event are another.
-A transcript write is not in the same transaction as operational state.
-SQLite operations run on blocking tasks, preserving `synchronous=FULL` durability
-without blocking Tokio threads. Each active run queues output to a blocking
-consumer; its final events drain before terminal status is committed. SSE watchers
-wake on per-run commit notifications and replay from SQLite; active cancellation
-uses an in-memory token after the durable request commits.
+SQLite stores sessions, submitted runs, ordered events, and each session's
+transcript: its conversation as of its last completed turn, which the turn loop
+loads before calling the model and replaces after a completed turn. The host
+reaches it through `host::Transcripts`, which the service implements over its
+database. A transcript that can't be loaded or saved fails the turn with `could
+not load this session's history` or `could not save this turn`; the underlying
+error is only logged. Submission and its initial event are one transaction;
+terminal status and its event are another. A transcript write is not in the same
+transaction as operational state. SQLite operations run on blocking tasks,
+preserving `synchronous=FULL` durability without blocking Tokio threads. Each
+active run queues output to a blocking consumer; its final events drain before
+terminal status is committed. SSE watchers wake on per-run commit notifications
+and replay from SQLite; active cancellation uses an in-memory token after the
+durable request commits.
 
 The queue executes the oldest eligible run, respecting global capacity and
 one active run per session. Capacity defaults to four. Text is batched at 8 KiB
@@ -96,11 +100,9 @@ submission, not exactly-once external side effects or resumption of a suspended
 WASM stack. Runs and events are retained until the data directory is removed;
 retention management is a later addition.
 
-Sessions are registered in SQLite when created; the transcript store only
-loads and saves history for those sessions. Do not run a second daemon with a
-different data directory against the same writable
-session store at the same time: the service's session serialization only covers
-its own queue. Changing a daemon's config requires restarting it; queued work
+Sessions are registered in SQLite when created; a transcript is written for a
+session after its first completed turn. Each data directory has its own sessions
+and transcripts. Changing a daemon's config requires restarting it; queued work
 uses the config active when it starts.
 
 ## Local API v1
@@ -180,14 +182,15 @@ checkpoints, and distributed workers are outside this milestone.
 filter is `warn,host=info,runner=info`; set `RUST_LOG` to change it. Terminal output
 uses color. Client and chat commands do not install a logging subscriber.
 
-Run spans identify the run, session, and agent. Tool records identify the configured
-tool name and call ID, outcome, elapsed time, and result byte count. Provider and
-session-store spans identify the component. Outbound HTTP records identify the
-component, request ID, method, scheme, host, port, and allow/deny decision. Allowed
-requests report status and time to response headers, a transport-error category, or
-interruption before headers. They do not measure response body completion. API
-requests log method, matched route template, status, and time to headers, including
-authentication rejections; unmatched routes use a fixed label.
+Run spans identify the run, session, and agent. Tool records identify the
+configured tool name and call ID, outcome, elapsed time, and result byte count.
+Provider spans identify the component; transcript spans record the operation
+(`load` or `save`) and outcome. Outbound HTTP records identify the component,
+request ID, method, scheme, host, port, and allow/deny decision. Allowed
+requests report status and time to response headers, a transport-error category,
+or interruption before headers. They do not measure response body completion.
+API requests log method, matched route template, status, and time to headers,
+including authentication rejections; unmatched routes use a fixed label.
 
 These host-generated records omit prompts, tool arguments/results, raw errors,
 headers, bodies, URL paths, and query strings. Existing SQLite events still serve

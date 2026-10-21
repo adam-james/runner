@@ -104,8 +104,3 @@ max_model_calls = 20
 system_prompt = """
 You are a research assistant. Search the web before answering, prefer recent
 and primary sources, and end with the links you relied on."""
-
-[session_store]
-path = "target/wasm32-wasip2/release/fs_store.wasm"
-dir = "${HOME}/.runner/sessions"
-dir_writable = true
