@@ -20,7 +20,7 @@ const CLEAR_LINE: &str = "\r\x1b[K";
 
 /// Longest a tool call's arguments get on screen, and any one string
 /// argument within them.
-const ARGS_LIMIT: usize = 60;
+pub(crate) const ARGS_LIMIT: usize = 60;
 const STRING_ARG_LIMIT: usize = 30;
 
 /// How often the "Thinking…" timer redraws.
@@ -84,21 +84,7 @@ impl Ui {
                 if self.tool.take().is_some() {
                     println!();
                 }
-                let label = match data["kind"].as_str() {
-                    Some("delegated") => format!(
-                        "delegated to {} · run {}",
-                        data["agent"].as_str().unwrap_or("agent"),
-                        data["run_id"].as_str().unwrap_or("")
-                    ),
-                    Some("delegation_waiting") => {
-                        format!("waiting for run {}", data["run_id"].as_str().unwrap_or(""))
-                    }
-                    _ => format!(
-                        "child {} · {}",
-                        data["run_id"].as_str().unwrap_or(""),
-                        data["status"].as_str().unwrap_or("finished")
-                    ),
-                };
+                let label = delegation_label(data);
                 println!("{}", style(self.stdout_tty, DIM, &label));
             }
             Some("status") if self.live => match data["status"].as_str() {
@@ -279,7 +265,7 @@ pub fn banner(agent: &host::AgentInfo, session: &str) {
 
 /// `provider openai · model gpt-5 · tools get_scores, get_weather`, then
 /// any limits that aren't the defaults.
-fn agent_details(agent: &host::AgentInfo) -> String {
+pub(crate) fn agent_details(agent: &host::AgentInfo) -> String {
     let tools = if agent.tools.is_empty() {
         "none".to_string()
     } else {
@@ -351,6 +337,16 @@ pub fn goodbye(session: &str) {
     );
 }
 
+/// Says how to get back to the session `tui` was showing, once it has quit.
+pub fn goodbye_tui(session: Option<&str>) {
+    let tty = io::stdout().is_terminal();
+    let line = match session {
+        Some(session) => format!("runs keep going · reopen with: runner tui --session {session}"),
+        None => "runs keep going · reopen with: runner tui".to_string(),
+    };
+    println!("{}", style(tty, DIM, &line));
+}
+
 /// The agent a `run` or `runs watch` is for and its session, then what the
 /// agent runs with, if the daemon still has that agent. On stderr, so stdout
 /// stays the run's output (or its ID, with `--detach`).
@@ -417,7 +413,26 @@ fn style(tty: bool, code: &str, text: &str) -> String {
     }
 }
 
-fn name(data: &Value) -> &str {
+/// `delegated to NAME · run ID`, and the like, for a delegation event.
+pub(crate) fn delegation_label(data: &Value) -> String {
+    match data["kind"].as_str() {
+        Some("delegated") => format!(
+            "delegated to {} · run {}",
+            data["agent"].as_str().unwrap_or("agent"),
+            data["run_id"].as_str().unwrap_or("")
+        ),
+        Some("delegation_waiting") => {
+            format!("waiting for run {}", data["run_id"].as_str().unwrap_or(""))
+        }
+        _ => format!(
+            "child {} · {}",
+            data["run_id"].as_str().unwrap_or(""),
+            data["status"].as_str().unwrap_or("finished")
+        ),
+    }
+}
+
+pub(crate) fn name(data: &Value) -> &str {
     data["name"].as_str().unwrap_or("tool")
 }
 
@@ -435,7 +450,7 @@ fn flush() {
 
 /// `⚙ name(key: value, …)`, from the tool's JSON input. Falls back to the
 /// raw input if it isn't a JSON object.
-fn tool_call(name: &str, input_json: &str) -> String {
+pub(crate) fn tool_call(name: &str, input_json: &str) -> String {
     let args = match serde_json::from_str::<Value>(input_json) {
         Ok(Value::Object(fields)) => fields
             .iter()
@@ -454,7 +469,7 @@ fn tool_call(name: &str, input_json: &str) -> String {
 }
 
 /// Cuts `s` to at most `max` chars, ending in "…" if anything was cut.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -468,7 +483,7 @@ fn reasoning_line(tokens: u64, max_tokens: u64) -> String {
 }
 
 /// Reasoning and prompt-cache usage reported for a model call.
-fn token_usage_line(usage: &Value) -> Option<String> {
+pub(crate) fn token_usage_line(usage: &Value) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(tokens) = usage["reasoning_tokens"].as_u64() {
         parts.push(reasoning_line(
@@ -494,11 +509,11 @@ fn token_usage_line(usage: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-fn thinking_line(elapsed: Duration) -> String {
+pub(crate) fn thinking_line(elapsed: Duration) -> String {
     format!("Thinking… {:.1}s", elapsed.as_secs_f32())
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else {

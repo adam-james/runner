@@ -75,6 +75,33 @@ earlier history aren't replayed, since they weren't saved to the conversation;
 failures encountered while following pending work are displayed before continuing.
 Ctrl-C while following exits chat normally and prints a resume command.
 
+`runner tui` is a full-screen client for the same daemon. The left side lists
+sessions, most recently active first, by their first prompt: ▶ running,
+⏸ queued, ✓ or ✗ for how the latest run ended. Below that are the open
+session's runs. The right side shows the session's conversation, streaming as
+it runs, above a prompt box. Turns within a session run one at a time, so to run
+things concurrently, start each in its own session with Ctrl-N. Quitting leaves
+everything running. Reopen a session later, from the list or with `--session`,
+to see its whole history, including runs still in progress. Launching without
+`--session` starts on a new session, which its first prompt creates. It takes the
+same `--agent` and `--deadline-secs` flags as `chat`. Unlike `chat`, it also
+shows failed and cancelled turns, marked as not saved to the conversation.
+
+| Key | Does |
+| --- | --- |
+| Enter | send the prompt; open the highlighted session |
+| Ctrl-N | new session, to run something alongside the others |
+| Ctrl-O | pick a past session (↑/↓, then Enter) |
+| Ctrl-A | choose the agent for the next turns |
+| ↑/↓, PgUp/PgDn, mouse wheel | scroll the conversation (End follows new output) |
+| Tab / Shift-Tab | move between the prompt, Sessions, Runs and Conversation |
+| Esc, then c | cancel the highlighted run in the Runs pane, after a confirmation |
+| ? (outside the prompt) | show the keys |
+| Ctrl-C, or q outside the prompt | quit; runs keep going in the daemon |
+
+The TUI captures the mouse for scrolling, so hold Shift (Option in some macOS
+terminals) while dragging to select text.
+
 Queue additional turns while detached with
 `runner run --session SESSION "next prompt" --detach`. A watcher shows
 "Queued — waiting to run" until execution starts. `runner sessions list` includes
