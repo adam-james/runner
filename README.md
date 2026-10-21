@@ -249,25 +249,33 @@ Two rules keep a header from going further than intended:
 
 ## Build and run
 
-```bash
-# Build the agent, providers, and tools
-cargo build -p agent -p anthropic -p openai -p weather -p sports -p search -p files \
-    -p write-file -p edit-file -p rustdocs -p fs-store --release --target wasm32-wasip2
-
-# Build the python tool (a native program, so no --target)
-cargo run -p build-python --release
-
-# Start the daemon against a config (see runner.toml for a working example)
-export ANTHROPIC_API_KEY=sk-ant-...
-export TAVILY_API_KEY=tvly-...   # for the search tool
-cargo run -p runner --release -- serve --config runner.toml
-```
-
-In another terminal, start an interactive client:
+From the repository root, build the CLI, all Rust components, and the Python
+tool in release mode:
 
 ```bash
-cargo run -p runner --release -- chat
+./build.sh
 ```
+
+The script prints the server and chat commands when the build finishes. It
+builds everything without running tests or starting the server. Install the
+`wasm32-wasip2` target first (see [Setup](#setup)).
+
+In one terminal, start the server using the default OpenAI config:
+
+```bash
+export OPENAI_API_KEY='your-api-key'
+cargo run --release -p runner -- serve --config runner.toml
+```
+
+In another terminal, from the same repository, start an interactive client:
+
+```bash
+cargo run --release -p runner -- chat
+```
+
+To use another provider or enable more tools, edit `runner.toml` and restart
+the server. Set any credentials that config references in the server's terminal.
+Add enabled tools to `[agents.default].tools` to make them available in chat.
 
 Type `exit` or `quit`, or send EOF (Ctrl-D), to end the client session.
 The daemon continues running.
