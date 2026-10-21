@@ -100,6 +100,7 @@ impl Harness {
             http,
         }
     }
+
     async fn submit(&self, session: Option<&str>, prompt: &str, deadline: u64) -> Run {
         self.client
             .post(format!("{}/v1/runs", self.url))
@@ -114,6 +115,7 @@ impl Harness {
             .await
             .unwrap()
     }
+
     async fn wait_status(&self, id: &str, status: &str) -> Run {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -127,6 +129,7 @@ impl Harness {
         .await
         .unwrap_or_else(|_| panic!("did not reach {status}: {:?}", self.db.run(id)))
     }
+
     async fn close(self) {
         self.stop.cancel();
         self.worker.await.unwrap().unwrap();

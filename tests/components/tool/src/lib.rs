@@ -10,6 +10,7 @@ impl Guest for Tool {
             input_schema_json: "{}".into(),
         }
     }
+
     fn call(input: String) -> Result<String, String> {
         match input.as_str() {
             "spin" => loop {

@@ -68,9 +68,11 @@ impl Client {
         self.json(Method::POST, "/v1/sessions", Some(json!({"id":id})))
             .await
     }
+
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         self.json(Method::GET, "/v1/sessions", None).await
     }
+
     pub async fn submit(
         &self,
         session: Option<String>,
@@ -84,13 +86,16 @@ impl Client {
         )
         .await
     }
+
     pub async fn runs(&self) -> Result<Vec<Run>> {
         self.json(Method::GET, "/v1/runs", None).await
     }
+
     pub async fn run(&self, id: &str) -> Result<Run> {
         self.json(Method::GET, &format!("/v1/runs/{id}"), None)
             .await
     }
+
     pub async fn cancel(&self, id: &str) -> Result<Run> {
         self.json(Method::POST, &format!("/v1/runs/{id}/cancel"), None)
             .await

@@ -128,6 +128,7 @@ pub struct Submit {
     #[serde(default = "default_deadline")]
     pub deadline_secs: u64,
 }
+
 pub fn default_deadline() -> u64 {
     600
 }
@@ -150,12 +151,14 @@ impl IntoResponse for ApiError {
         (self.0, Json(json!({"error":self.1}))).into_response()
     }
 }
+
 fn internal(_: anyhow::Error) -> ApiError {
     ApiError(
         StatusCode::INTERNAL_SERVER_ERROR,
         "state operation failed".into(),
     )
 }
+
 fn bad(error: anyhow::Error) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, error.to_string())
 }
@@ -207,6 +210,7 @@ async fn list_sessions(
 ) -> Result<Json<Vec<crate::db::Session>>, ApiError> {
     Ok(Json(s.db.sessions().map_err(internal)?))
 }
+
 async fn create_session(
     State(s): State<Service>,
     Json(input): Json<CreateSession>,
@@ -216,9 +220,11 @@ async fn create_session(
         Json(s.db.create_session(input.id).map_err(bad)?),
     ))
 }
+
 async fn list_runs(State(s): State<Service>) -> Result<Json<Vec<Run>>, ApiError> {
     Ok(Json(s.db.runs().map_err(internal)?))
 }
+
 async fn submit(
     State(s): State<Service>,
     Json(input): Json<Submit>,
@@ -228,6 +234,7 @@ async fn submit(
             .map_err(bad)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
+
 async fn inspect(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
@@ -236,6 +243,7 @@ async fn inspect(
         ApiError(StatusCode::NOT_FOUND, "run not found".into())
     })?))
 }
+
 async fn cancel(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
@@ -312,6 +320,7 @@ impl BufferedEvents {
         }
         self.last_flush = Instant::now();
     }
+
     fn push(&mut self, value: Value) {
         if value["kind"] == "text" {
             self.text

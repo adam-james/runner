@@ -80,6 +80,7 @@ dir_writable = true
         .unwrap();
         Self { dir, config }
     }
+
     fn runtime(&self) -> host::Runtime {
         host::Runtime::new(self.config.to_str().unwrap()).unwrap()
     }
@@ -217,6 +218,7 @@ impl Drop for Daemon {
         let _ = self.0.wait();
     }
 }
+
 fn start(fixture: &Fixture, data: &std::path::Path) -> Daemon {
     Daemon(
         Command::new(env!("CARGO_BIN_EXE_runner"))
@@ -233,6 +235,7 @@ fn start(fixture: &Fixture, data: &std::path::Path) -> Daemon {
             .unwrap(),
     )
 }
+
 async fn connect(data: &std::path::Path) -> Client {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
