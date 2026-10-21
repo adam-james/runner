@@ -1,5 +1,13 @@
 # TODO
 
+- detach from a chat session, let it keep working in the background, and re-attach to it later
+  - today: Ctrl-C mid-reply detaches that one run (prints its run ID) and `runner runs watch RUN_ID` follows it, but `chat --session` only replays completed turns - it doesn't show or follow a turn still running
+  - re-attach: after the history, show the session's running (and queued) turns and follow them live, then give the prompt
+  - a detached session could keep taking work: queue several prompts and leave, or let a long multi-turn task run unattended
+  - a prompt typed while an earlier turn is still running queues silently behind it ("Thinking…") - say it's waiting
+  - the detach notice prints in red like an error; make it a normal dim line
+  - `runner sessions list` could show which sessions have running/queued work
+
 ## Long term
 
 - explicit delegation between agent definitions - host-provided `delegate`/`wait` tools; see docs/service.md roadmap
