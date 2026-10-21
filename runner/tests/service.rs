@@ -432,3 +432,129 @@ fn acquire_creates_a_private_directory_but_leaves_existing_ones_alone() {
         0o755
     );
 }
+
+#[tokio::test]
+async fn sqlite_write_contention_does_not_block_the_async_runtime() {
+    let h = Harness::new(1).await;
+    let path = h._dir.path().join("state.sqlite3");
+    let (locked, ready) = std::sync::mpsc::channel();
+    let lock = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        connection.execute_batch("ROLLBACK").unwrap();
+    });
+    ready.recv().unwrap();
+    let client = h.client.clone();
+    let url = h.url.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{url}/v1/runs"))
+            .bearer_auth("test-token")
+            .json(&json!({"prompt":"hello"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    let start = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "SQLite stalled Tokio"
+    );
+    assert_eq!(request.await.unwrap().status(), StatusCode::ACCEPTED);
+    lock.join().unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn live_sse_watchers_receive_all_committed_events_and_close() {
+    let h = Harness::new(1).await;
+    let run = h.submit(None, "wait", 5).await;
+    h.wait_status(&run.id, "running").await;
+    let mut watchers = Vec::new();
+    for _ in 0..3 {
+        let response = h
+            .client
+            .get(format!("{}/v1/runs/{}/events", h.url, run.id))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap();
+        watchers.push(tokio::spawn(async move { response.text().await.unwrap() }));
+    }
+    let id = run.id.clone();
+    h.db.blocking(move |db| {
+        for sequence in 0..300 {
+            db.event(&id, json!({"kind":"test", "sequence":sequence}))?;
+        }
+        db.cancel(&id)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    h.wait_status(&run.id, "cancelled").await;
+    let expected = h.db.events(&run.id, 0).unwrap();
+    for watcher in watchers {
+        let text = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        let events: Vec<Event> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.data["kind"] == "test")
+                .count(),
+            300
+        );
+        assert_eq!(events.last().unwrap().data["status"], "cancelled");
+        assert_eq!(events.first().unwrap().id, expected.first().unwrap().id);
+        assert!(events.windows(2).all(|pair| pair[0].id < pair[1].id));
+    }
+    h.close().await;
+}
+
+#[tokio::test]
+async fn cancellation_before_execution_is_remembered_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    let run = db.submit(None, "wait".into(), 60).unwrap();
+    db.claim().unwrap().unwrap();
+    db.cancel(&run.id).unwrap();
+    assert!(db.cancellation(&run.id).is_cancelled());
+}
+
+#[cfg(unix)]
+#[test]
+fn database_files_are_private_in_a_shared_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let mode = |suffix: &str| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        std::fs::metadata(file).unwrap().permissions().mode() & 0o777
+    };
+    // A database and a leftover sidecar from before permissions were enforced.
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let stale_shm = dir.path().join("state.sqlite3-shm");
+    std::fs::write(&stale_shm, b"").unwrap();
+    std::fs::set_permissions(&stale_shm, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let db = Database::open(&path).unwrap();
+    db.submit(None, "secret".into(), 60).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        assert_eq!(mode(suffix), 0o600, "state.sqlite3{suffix}");
+    }
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}

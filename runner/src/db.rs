@@ -1,5 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -7,7 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
-pub struct Database(Arc<Mutex<Connection>>);
+pub struct Database(Arc<Mutex<Connection>>, Arc<Signals>);
+
+struct Signals {
+    changes: Mutex<HashMap<String, Weak<Notify>>>,
+    cancellations: Mutex<HashMap<String, CancellationToken>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -81,8 +89,84 @@ fn append_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
     Ok(())
 }
 
+/// SQLite gives the WAL and SHM files the database file's mode, so a private
+/// database keeps its sidecars private regardless of the umask or directory.
+/// Sidecars left by an older version are tightened too.
+#[cfg(unix)]
+fn make_private(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = std::path::Path::new(&file);
+        match std::fs::metadata(file) {
+            Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("making {} private", file.display()))?;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", file.display())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 impl Database {
+    /// Keep SQLite locks, busy waits and durable commits off the async runtime.
+    pub async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || operation(db)).await?
+    }
+
+    /// Subscriptions are shared per run and disappear when their watchers disconnect.
+    pub fn changes(&self, id: &str) -> Arc<Notify> {
+        let mut changes = self.1.changes.lock().unwrap();
+        changes.retain(|_, signal| signal.strong_count() > 0);
+        if let Some(signal) = changes.get(id).and_then(Weak::upgrade) {
+            return signal;
+        }
+        let signal = Arc::new(Notify::new());
+        changes.insert(id.to_owned(), Arc::downgrade(&signal));
+        signal
+    }
+
+    fn notify(&self, id: &str) {
+        let mut changes = self.1.changes.lock().unwrap();
+        if let Some(signal) = changes.get(id).and_then(Weak::upgrade) {
+            signal.notify_waiters();
+        } else {
+            changes.remove(id);
+        }
+    }
+
+    pub fn cancellation(&self, id: &str) -> CancellationToken {
+        self.1
+            .cancellations
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .expect("claimed run has a token")
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        make_private(path)?;
         Self::from_connection(Connection::open(path)?)
     }
 
@@ -106,7 +190,13 @@ impl Database {
             CREATE INDEX IF NOT EXISTS queued_runs ON runs(status, created_at);
             PRAGMA user_version=1;",
         )?;
-        Ok(Self(Arc::new(Mutex::new(conn))))
+        Ok(Self(
+            Arc::new(Mutex::new(conn)),
+            Arc::new(Signals {
+                changes: Mutex::new(HashMap::new()),
+                cancellations: Mutex::new(HashMap::new()),
+            }),
+        ))
     }
 
     pub fn create_session(&self, id: Option<String>) -> Result<Session> {
@@ -186,6 +276,7 @@ impl Database {
             params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs])?;
         append_event(&tx, &run.id, json!({"kind":"status", "status":"queued"}))?;
         tx.commit()?;
+        self.notify(&run.id);
         Ok(run)
     }
 
@@ -226,12 +317,20 @@ impl Database {
         tx.execute("UPDATE runs SET status='running' WHERE id=?1", [&run.id])?;
         append_event(&tx, &run.id, json!({"kind":"status", "status":"running"}))?;
         tx.commit()?;
+        self.notify(&run.id);
+        self.1
+            .cancellations
+            .lock()
+            .unwrap()
+            .insert(run.id.clone(), CancellationToken::new());
         run.status = "running".into();
         Ok(Some(run))
     }
 
     pub fn event(&self, id: &str, data: Value) -> Result<()> {
-        append_event(&self.0.lock().unwrap(), id, data)
+        append_event(&self.0.lock().unwrap(), id, data)?;
+        self.notify(id);
+        Ok(())
     }
 
     pub fn events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
@@ -281,6 +380,8 @@ impl Database {
             )?;
         }
         tx.commit()?;
+        self.notify(id);
+        self.1.cancellations.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -310,6 +411,12 @@ impl Database {
             }
         }
         tx.commit()?;
+        self.notify(&run.id);
+        if run.cancel_requested
+            && let Some(token) = self.1.cancellations.lock().unwrap().get(id)
+        {
+            token.cancel();
+        }
         Ok(run)
     }
 
@@ -321,15 +428,18 @@ impl Database {
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for id in ids {
-            tx.execute("UPDATE runs SET status='interrupted', error='daemon stopped during execution' WHERE id=?1", [&id])?;
+        for id in &ids {
+            tx.execute("UPDATE runs SET status='interrupted', error='daemon stopped during execution' WHERE id=?1", [id])?;
             append_event(
                 &tx,
-                &id,
+                id,
                 json!({"kind":"status", "status":"interrupted", "error":"daemon stopped during execution"}),
             )?;
         }
         tx.commit()?;
+        for id in ids {
+            self.notify(&id);
+        }
         Ok(())
     }
 }

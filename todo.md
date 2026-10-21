@@ -9,12 +9,9 @@
 ### From the PR #7 review (local agent service)
 
 - keep tool and provider instances per session - `Runtime::run_turn` (host/src/lib.rs) instantiates the provider, every tool and the session store each turn, so tool state (e.g. python variables) no longer carries over between turns, and the instantiation cost is paid every turn
-- stop blocking tokio threads on SQLite - writes fsync (synchronous=FULL) under one `Mutex<Connection>` from the event sink, a 25ms cancel poll per run and a 50ms poll per SSE watcher. Move writes to `spawn_blocking` or a writer thread, and replace polling with in-memory notify/cancel tokens
-- remove the dead cancel flag - `CancelOnDrop`, the `cancelled` AtomicBool, `Runtime::execution()` and the check in `control_store` do nothing; dropping the future is what cancels
 - name the file when a component fails to load - preloading uses a bare `Component::from_file(..)?` and `Runtime::component` says only "component not preloaded", so a bad path in runner.toml gives no hint which one
 - close the late-cancel race - a cancel that lands after the agent saves the turn but before it returns can still record `cancelled`; needs the agent to report when it saves
 - retry failed terminal-state writes - `contain` (runner/src/service.rs) forgets a finished job even if its fallback `db.finish` fails, leaving the run `running` and blocking later turns in that session until restart; retain pending terminal updates and retry them
-- make SQLite files private in existing data directories - an existing `0755` data directory with a `022` umask produces `0644` state.sqlite3, WAL and SHM files, exposing prompts and events to other local users; enforce private database and sidecar permissions without chmodding a user-supplied directory
 
 ## Long term
 

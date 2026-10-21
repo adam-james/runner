@@ -815,7 +815,6 @@ pub struct Runtime {
     engine: Engine,
     config: Arc<RunnerConfig>,
     components: Arc<HashMap<String, Component>>,
-    cancelled: Arc<AtomicBool>,
     _ticker: Arc<EpochTicker>,
 }
 
@@ -873,20 +872,8 @@ impl Runtime {
             engine,
             config: Arc::new(config),
             components: Arc::new(components),
-            cancelled: Arc::new(AtomicBool::new(false)),
             _ticker: Arc::new(EpochTicker(stopped)),
         })
-    }
-
-    pub fn execution(&self) -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            ..self.clone()
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     fn component(&self, path: &str) -> Result<Component> {
@@ -896,14 +883,10 @@ impl Runtime {
             .ok_or_else(|| Error::msg("component not preloaded"))
     }
 
+    /// Yielding at each epoch lets Tokio poll timeouts and drop a cancelled
+    /// run's future even while guest code is CPU-bound.
     fn control_store<T: Send + 'static>(&self, store: &mut Store<T>) {
-        let cancelled = self.cancelled.clone();
-        store.epoch_deadline_callback(move |_| {
-            if cancelled.load(Ordering::Relaxed) {
-                bail!("run cancelled");
-            }
-            Ok(wasmtime::UpdateDeadline::Yield(1))
-        });
+        store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
         store.set_epoch_deadline(1);
     }
 
