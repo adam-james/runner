@@ -12,7 +12,7 @@ struct Provider;
 static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Guest for Provider {
-    async fn chat(_: String, _: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
+    async fn chat(_: String, tools: Vec<ToolDefinition>, request: ChatRequest) -> ChatStream {
         let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (mut writer, text) = wit_stream::new::<String>();
         let (result, response) =
@@ -68,6 +68,13 @@ impl Guest for Provider {
                     name: "fixture".into(),
                     input_json: input.into(),
                 })]
+            } else if let Some(call) = prompt.strip_prefix("named-tool:") {
+                let (name, input) = call.split_once(':').unwrap();
+                vec![ContentBlock::ToolUse(ToolUseBlock {
+                    id: "named-tool".into(),
+                    name: name.into(),
+                    input_json: input.into(),
+                })]
             } else {
                 let turns = request
                     .messages
@@ -78,7 +85,13 @@ impl Guest for Provider {
                     })
                     .count();
                 let text = tool.unwrap_or_else(|| {
-                    if prompt == "provider-counter" {
+                    if prompt == "tool-names" {
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    } else if prompt == "provider-counter" {
                         call.to_string()
                     } else {
                         format!("turn {turns}: {prompt}")

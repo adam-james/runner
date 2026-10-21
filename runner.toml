@@ -14,39 +14,39 @@ headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = [
     "api.openai.com",
 ] } }
 
-# [[tools]]
-# path = "target/wasm32-wasip2/release/weather.wasm"
-# allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
-#
-# [[tools]]
-# path = "target/wasm32-wasip2/release/sports.wasm"
-# allowed_hosts = ["site.api.espn.com"]
-#
-# [[tools]]
-# path = "target/wasm32-wasip2/release/search.wasm"
-# allowed_hosts = ["api.tavily.com"]
-# headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+[tools.get_weather]
+path = "target/wasm32-wasip2/release/weather.wasm"
+allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
 
-[[tools]]
+[tools.get_scores]
+path = "target/wasm32-wasip2/release/sports.wasm"
+allowed_hosts = ["site.api.espn.com"]
+
+[tools.web_search]
+path = "target/wasm32-wasip2/release/search.wasm"
+allowed_hosts = ["api.tavily.com"]
+headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+
+[tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
 allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
 
 # Runs Python the model writes, so it's boxed in more tightly than the rest.
 # Built by `cargo run -p build-python --release`.
-# [[tools]]
-# path = "target/wasm32-wasip2/release/python.wasm"
-# timeout_secs = 10
-# max_memory_mb = 256
-# fresh_per_call = true
-#
+[tools.run_python]
+path = "target/wasm32-wasip2/release/python.wasm"
+timeout_secs = 10
+max_memory_mb = 256
+fresh_per_call = true
+
 # No files by default. To give scripts a directory, seen as their `/`, use a
 # dedicated one, not your repo or home directory: scripts see everything in
 # it, and with dir_writable can change or delete any of it.
-#
+
 # Read-only, e.g. data for the model to analyze. The directory must exist:
 #   mkdir -p ~/.runner/python && cp sales.csv ~/.runner/python/
 # dir = "${HOME}/.runner/python"
-#
+
 # Or writable too, e.g. a scratch space for results that outlive the call.
 # Created if missing. Nothing limits how much scripts write:
 # dir = "${HOME}/.runner/python-scratch"
@@ -54,33 +54,40 @@ allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
 
 # Lets the model read files and list directories, under `dir` only, which
 # it sees as `/`. Read-only; the directory must exist.
-[[tools]]
+[tools.read_file]
 path = "target/wasm32-wasip2/release/files.wasm"
 dir = "."
 
 # Let the model write and edit files under `dir`, which it sees as `/`. They
 # can overwrite anything there, so use a directory you don't mind it
 # changing. Created if missing.
-# [[tools]]
-# path = "target/wasm32-wasip2/release/write_file.wasm"
-# dir = "${HOME}/.runner/files"
-# dir_writable = true
-#
-# [[tools]]
-# path = "target/wasm32-wasip2/release/edit_file.wasm"
-# dir = "${HOME}/.runner/files"
-# dir_writable = true
+[tools.write_file]
+path = "target/wasm32-wasip2/release/write_file.wasm"
+dir = "${HOME}/.runner/files"
+dir_writable = true
+
+[tools.edit_file]
+path = "target/wasm32-wasip2/release/edit_file.wasm"
+dir = "${HOME}/.runner/files"
+dir_writable = true
 
 # Agent definitions pick from the provider and tools above. Runs use
 # `default` unless they name another, e.g. `runner run --agent researcher ...`.
-# Tools go by the name each one reports (read_file, rust_docs, get_weather,
-# web_search, write_file, edit_file, ...); a definition without `tools` has none.
+# Tools use their table keys (read_file, rust_docs, ...); a definition without
+# `tools` has none.
 [agents.default]
-tools = ["read_file", "rust_docs"]
+tools = ["get_scores", "get_weather"]
 
-# [agents.researcher]
-# model = "gpt-5-mini"   # or a whole `provider = { ... }` table
-# tools = ["rust_docs"]
+# Read-only access to files under the configured read_file directory.
+# Try: runner chat --agent reader
+[agents.reader]
+tools = ["read_file"]
+
+# Rust documentation with a smaller model and no local file access.
+# Try: runner chat --agent researcher
+[agents.researcher]
+model = "gpt-5-mini"
+tools = ["rust_docs"]
 
 [session_store]
 path = "target/wasm32-wasip2/release/fs_store.wasm"

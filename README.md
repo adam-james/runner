@@ -214,18 +214,35 @@ model = "claude-sonnet-5"
 allowed_hosts = ["api.anthropic.com"]
 headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = ["api.anthropic.com"] } }
 
-[[tools]]
+[tools.get_weather]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
 
-[[tools]]
+[tools.get_scores]
 path = "target/wasm32-wasip2/release/sports.wasm"
 allowed_hosts = ["site.api.espn.com"]
 
-[[tools]]
+[tools.web_search]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
 headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = ["api.tavily.com"] } }
+```
+
+Tool table keys are the names the model sees and agent definitions select. For
+example, `[tools.read_file]` is selected with `tools = ["read_file"]`. Names must
+contain 1–64 ASCII letters, digits, underscores, or hyphens. The component's
+`describe` supplies its description and input schema; its legacy name is ignored.
+To migrate an existing config, replace each `[[tools]]` header with
+`[tools.<name>]` and use that name in agent definitions. All other tool settings
+stay in that table. The same component may appear under several names with
+different directories or permissions.
+
+The included `runner.toml` also defines two agents you can try after restarting
+the server:
+
+```bash
+runner chat --agent reader       # read_file only, using the default model
+runner chat --agent researcher   # rust_docs only, using gpt-5-mini
 ```
 
 All workspace members (`host`, `agent`, `providers/*`, `tools/*`) share a single
@@ -353,7 +370,7 @@ from us, so its config entry uses three settings no other tool needs (any
 tool can use them):
 
 ```toml
-[[tools]]
+[tools.run_python]
 path = "target/wasm32-wasip2/release/python.wasm"
 timeout_secs = 10      # a call that runs longer is cut off: "timed out after 10s"
 max_memory_mb = 256    # past this, the script gets a MemoryError
@@ -411,7 +428,7 @@ The `read_file` tool lets the model read files in one directory you
 choose:
 
 ```toml
-[[tools]]
+[tools.read_file]
 path = "target/wasm32-wasip2/release/files.wasm"
 dir = "${HOME}/notes"   # must exist; the model sees it as /
 ```
@@ -433,12 +450,12 @@ Two more tools let the model change files, as separate components so
 granting reads never grants writes:
 
 ```toml
-[[tools]]
+[tools.write_file]
 path = "target/wasm32-wasip2/release/write_file.wasm"
 dir = "${HOME}/notes"
 dir_writable = true
 
-[[tools]]
+[tools.edit_file]
 path = "target/wasm32-wasip2/release/edit_file.wasm"
 dir = "${HOME}/notes"
 dir_writable = true
@@ -465,7 +482,7 @@ The `rust_docs` tool looks up Rust documentation, so the model can check
 an API rather than go from memory:
 
 ```toml
-[[tools]]
+[tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
 allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
 ```
@@ -500,12 +517,12 @@ model = "gpt-5"
 allowed_hosts = ["api.openai.com"]
 headers = { authorization = { value = "Bearer ${OPENAI_API_KEY}", hosts = ["api.openai.com"] } }
 
-[[tools]]
+[tools.get_weather]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
 ```
 
-A new tool is a new `[[tools]]` entry pointing at its own component, with
+A new tool is a new `[tools.<name>]` table pointing at its own component, with
 its own allow-list — the agent's code never changes. A new provider is a
 new component exporting `provider-api` — the host's code never changes.
 
