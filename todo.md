@@ -4,6 +4,7 @@
 
 - explicit delegation between agent definitions - host-provided `delegate`/`wait` tools; see docs/service.md roadmap
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
+- add TUI
 - agent to agent communication
 - memory
 - component registry
@@ -20,6 +21,7 @@
   - cover tool execution, allowed and denied network/filesystem access, capability violations, and guest traps or resource-limit termination
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
+- add an agent that can audit security
 
 ## Service foundation
 
