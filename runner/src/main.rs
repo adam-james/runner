@@ -111,6 +111,20 @@ async fn main() -> Result<()> {
         concurrency,
     } = args.command
     {
+        use std::io::IsTerminal;
+        use tracing_subscriber::EnvFilter;
+        let (writer, _guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(4096)
+            .lossy(true)
+            .finish(std::io::stderr());
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("warn,host=info,runner=info")),
+            )
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_writer(writer)
+            .init();
         return service::serve(&config, &args.data_dir, concurrency).await;
     }
     let client = Client::connect(&args.data_dir)?;

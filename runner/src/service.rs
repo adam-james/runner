@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -193,6 +194,26 @@ impl Service {
             .route("/v1/runs/{id}/cancel", post(cancel))
             .route("/v1/runs/{id}/events", get(events))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http()
+                    .make_span_with(|request: &axum::extract::Request| {
+                        let route = request
+                            .extensions()
+                            .get::<axum::extract::MatchedPath>()
+                            .map_or("unmatched", |path| path.as_str());
+                        tracing::info_span!("api", method = ?request.method(), route)
+                    })
+                    .on_request(())
+                    .on_failure(())
+                    .on_response(
+                        |response: &axum::http::Response<axum::body::Body>,
+                         latency: std::time::Duration,
+                         span: &tracing::Span| {
+                            tracing::info!(parent: span, status = response.status().as_u16(),
+                        elapsed_ms = latency.as_millis() as u64, "response headers");
+                        },
+                    ),
+            )
             .with_state(self.clone())
     }
 }
@@ -472,6 +493,7 @@ async fn execute(
         }
         let _ = send.send(value);
     });
+    tracing::info!("run started");
     let cancel = CancellationToken::new();
     let requested = db.cancellation(&run.id);
     let execution_run = run.clone();
@@ -518,6 +540,10 @@ async fn execute(
     } else {
         (status, error)
     };
+    tracing::info!(
+        outcome = if failed { "failed" } else { status },
+        "run finished"
+    );
     db.blocking(move |db| {
         db.finish(
             &run.id,
@@ -562,13 +588,14 @@ pub async fn worker(
                         Ok(Some(run)) => run,
                         Ok(None) => break,
                         // Transient (e.g. SQLITE_BUSY); retry on the next tick.
-                        Err(error) => {
-                            eprintln!("could not claim run: {error:#}");
+                        Err(_error) => {
+                            tracing::error!("could not claim run");
                             break;
                         }
                     };
                     let id = run.id.clone();
-                    let job = jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone()));
+                    let span = tracing::info_span!("run", run = ?run.id, session = ?run.session_id, agent = ?run.agent);
+                    let job = jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone()).instrument(span));
                     runs.insert(job.id(), id);
                 }
             }
@@ -606,18 +633,18 @@ async fn contain(
     runs: &mut HashMap<tokio::task::Id, String>,
     completed: Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
 ) -> Option<String> {
-    let (id, error) = match completed {
+    let (id, category) = match completed {
         Ok((id, Ok(()))) => {
             runs.remove(&id);
             return None;
         }
-        Ok((id, Err(error))) => (id, format!("{error:#}")),
-        Err(error) => (error.id(), error.to_string()),
+        Ok((id, Err(_))) => (id, "execution"),
+        Err(error) => (error.id(), "task"),
     };
     let run = runs.remove(&id)?;
-    eprintln!("run {run} failed internally: {error}");
-    if let Err(error) = mark_failed(db, &run).await {
-        eprintln!("could not mark run {run} failed, will retry: {error:#}");
+    tracing::error!(run = ?run, category, "run failed internally");
+    if let Err(_error) = mark_failed(db, &run).await {
+        tracing::error!(run = ?run, "could not mark run failed; will retry");
         return Some(run);
     }
     None
@@ -655,7 +682,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     );
     let http =
         axum::serve(listener, service.router()).with_graceful_shutdown(http_stop.cancelled_owned());
-    eprintln!("runner listening on 127.0.0.1:{}", info.port);
+    tracing::info!(port = info.port, "runner listening on loopback");
     tokio::pin!(worker);
     let http = http.into_future();
     tokio::pin!(http);

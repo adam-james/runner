@@ -11,7 +11,6 @@
 ## Long term
 
 - explicit delegation between agent definitions - host-provided `delegate`/`wait` tools; see docs/service.md roadmap
-- background logging in the host - tool calls, network access (allowed and denied) - a trusted record the agent can't hide or fake
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
 - cofigure system prompt for agent
 - can the agent implementation just be native?

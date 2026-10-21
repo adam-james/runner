@@ -824,3 +824,67 @@ async fn configured_tool_names_control_model_definitions_dispatch_and_events() {
         assert_eq!(event["name"], "counter_b");
     }
 }
+
+mod support;
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn activity_logs_attribute_cached_components_and_concurrent_turns_without_payloads() {
+    use tracing::Instrument;
+    let fixture = Fixture::with_tool_timeout(10);
+    let config = std::fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("fresh_per_call = true", "fresh_per_call = false");
+    std::fs::write(&fixture.config, config).unwrap();
+    let runtime = fixture.runtime().await;
+    let capture = support::Capture::default();
+    // Provider tasks run independently; a process-wide test subscriber captures
+    // their records as well as parallel turns on other runtime threads.
+    tracing::subscriber::set_global_default(capture.subscriber()).unwrap();
+    for run in ["first", "second"] {
+        turn_output(&runtime, "cached", "tool:counter")
+            .instrument(tracing::info_span!("run", run))
+            .await;
+    }
+    tokio::join!(
+        turn_output(&runtime, "parallel-a", "tool:counter"),
+        turn_output(&runtime, "parallel-b", "tool:counter"),
+    );
+    turn_output(&runtime, "private", "tool:ARGUMENT_SECRET").await;
+    turn_output(&runtime, "private", "PROMPT_SECRET").await;
+    turn_output(&runtime, "private", "named-tool:missing:ARGUMENT_SECRET").await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        runtime.run_turn("default", "cancelled", "tool:spin", Arc::new(|_| {})),
+    )
+    .await;
+    let logs = capture.text();
+    for expected in [
+        "run=\"first\"",
+        "run=\"second\"",
+        "session=\"parallel-a\"",
+        "session=\"parallel-b\"",
+        "tool=\"fixture\"",
+        "outcome=\"ok\"",
+        "outcome=\"error\"",
+        "outcome=\"interrupted\"",
+        "test_provider.wasm",
+        "test_tool.wasm",
+        "fs_store.wasm",
+    ] {
+        assert!(logs.contains(expected), "{expected}: {logs}");
+    }
+    // Both calls used the same cached component, with the active run as parent.
+    for run in ["first", "second"] {
+        assert!(
+            logs.lines()
+                .any(|line| line.contains(&format!("run=\"{run}\""))
+                    && line.contains("tool=\"fixture\"")
+                    && line.contains("activity finished")),
+            "{logs}"
+        );
+    }
+    for secret in ["ARGUMENT_SECRET", "PROMPT_SECRET", "host-only-fixture-key"] {
+        assert!(!logs.contains(secret), "{logs}");
+    }
+}
