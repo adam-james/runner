@@ -61,6 +61,17 @@ enum Command {
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
     },
+    /// Full-screen client: sessions, their runs, and a conversation to chat in.
+    Tui {
+        #[arg(long)]
+        session: Option<String>,
+        /// The agent definition new turns run; `default` if omitted. Can be
+        /// changed from inside.
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value_t = service::default_deadline())]
+        deadline_secs: u64,
+    },
     Runs {
         #[command(subcommand)]
         command: Runs,
@@ -161,29 +172,9 @@ async fn main() -> Result<()> {
             deadline_secs,
         } => {
             let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
-            // Checked up front, so a typo doesn't wait for the first prompt to fail.
             let agents = client.agents().await?;
-            let Some(details) = agents.iter().find(|known| known.name == agent) else {
-                let names: Vec<_> = agents.iter().map(|known| known.name.as_str()).collect();
-                bail!(
-                    "unknown agent '{agent}'; the daemon has: {}",
-                    names.join(", ")
-                );
-            };
-            let (session, existing) = match session {
-                Some(id) => {
-                    let existing = client
-                        .sessions()
-                        .await?
-                        .iter()
-                        .any(|session| session.id == id);
-                    if !existing {
-                        client.create_session(Some(id.clone())).await?;
-                    }
-                    (id, existing)
-                }
-                None => (client.create_session(None).await?.id, false),
-            };
+            let details = known_agent(&agents, &agent)?;
+            let (session, existing) = open_session(&client, session).await?;
             ui::banner(details, &session);
             let result = chat(
                 &client,
@@ -197,6 +188,18 @@ async fn main() -> Result<()> {
             // However chat ends, even on an error, say how to come back to it.
             ui::goodbye(&session);
             result?;
+        }
+        Command::Tui {
+            session,
+            agent,
+            deadline_secs,
+        } => {
+            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            let agents = client.agents().await?;
+            known_agent(&agents, &agent)?;
+            let (session, _) = open_session(&client, session).await?;
+            let session = runner::tui::run(client, agents, agent, session, deadline_secs).await?;
+            ui::goodbye_tui(&session);
         }
         Command::Runs { command } => match command {
             Runs::List => println!(
@@ -230,6 +233,40 @@ async fn main() -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// The daemon's definition of `agent`, checked up front so a typo doesn't
+/// wait for the first prompt to fail.
+fn known_agent<'a>(agents: &'a [host::AgentInfo], agent: &str) -> Result<&'a host::AgentInfo> {
+    match agents.iter().find(|known| known.name == agent) {
+        Some(details) => Ok(details),
+        None => {
+            let names: Vec<_> = agents.iter().map(|known| known.name.as_str()).collect();
+            bail!(
+                "unknown agent '{agent}'; the daemon has: {}",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// The named session, created if it isn't saved yet, or a new one; and
+/// whether it already existed.
+async fn open_session(client: &Client, session: Option<String>) -> Result<(String, bool)> {
+    Ok(match session {
+        Some(id) => {
+            let existing = client
+                .sessions()
+                .await?
+                .iter()
+                .any(|session| session.id == id);
+            if !existing {
+                client.create_session(Some(id.clone())).await?;
+            }
+            (id, existing)
+        }
+        None => (client.create_session(None).await?.id, false),
+    })
 }
 
 /// Prints a run's agent, with the provider, model and tools the daemon has

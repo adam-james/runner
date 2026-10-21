@@ -75,6 +75,25 @@ earlier history aren't replayed, since they weren't saved to the conversation;
 failures encountered while following pending work are displayed before continuing.
 Ctrl-C while following exits chat normally and prints a resume command.
 
+`runner tui` is a full-screen client for the same daemon. It lists sessions
+(with running ▶ and queued ⏸ counts) and the selected session's runs on the
+left, and the session's conversation, streaming as it runs, above a prompt
+box on the right. It takes the same `--session`, `--agent` and
+`--deadline-secs` flags as `chat`. Unlike `chat`, it also shows failed and
+cancelled turns, marked as not saved to the conversation. Keys:
+
+| Key | Does |
+| --- | --- |
+| Tab / Shift-Tab | move between the prompt, Sessions, Runs and Conversation |
+| Enter | send the prompt; open the highlighted session |
+| Esc | leave the prompt box, so letter keys work as commands |
+| PgUp / PgDn, ↑ / ↓ | scroll the conversation (End follows new output) |
+| n | new session, optionally named |
+| a | choose the agent for the next turns |
+| c | cancel the highlighted run (Runs pane), after a confirmation |
+| ? | show the keys |
+| q / Ctrl-C | quit; runs keep going in the daemon |
+
 Queue additional turns while detached with
 `runner run --session SESSION "next prompt" --detach`. A watcher shows
 "Queued — waiting to run" until execution starts. `runner sessions list` includes

@@ -145,7 +145,56 @@ impl Client {
         Ok(events)
     }
 
-    pub async fn watch(&self, id: &str, mut after: i64, json_output: bool) -> Result<()> {
+    /// A run's events from after `after`, live until the run is terminal.
+    /// Reconnects from its cursor when the connection drops, skipping
+    /// events it has already yielded.
+    pub fn stream(
+        &self,
+        id: &str,
+        mut after: i64,
+    ) -> impl futures_util::Stream<Item = Result<Event>> + '_ {
+        let id = id.to_string();
+        async_stream::try_stream! {
+            if after < 0 {
+                Err(anyhow::anyhow!("event cursor must be nonnegative"))?;
+            }
+            loop {
+                let response = self
+                    .request(
+                        Method::GET,
+                        &format!("/v1/runs/{id}/events?after={after}"),
+                        None,
+                    )
+                    .await?;
+                let mut bytes = response.bytes_stream();
+                let mut pending = Vec::new();
+                let mut disconnected = false;
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            disconnected = true;
+                            break;
+                        }
+                    };
+                    pending.extend_from_slice(&chunk);
+                    for event in frames(&mut pending)? {
+                        if event.id <= after {
+                            continue;
+                        }
+                        after = event.id;
+                        yield event;
+                    }
+                }
+                if !disconnected && self.run(&id).await?.terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    pub async fn watch(&self, id: &str, after: i64, json_output: bool) -> Result<()> {
         if after < 0 {
             bail!("event cursor must be nonnegative");
         }
@@ -159,51 +208,23 @@ impl Client {
                 ui
             }
         });
-        loop {
-            let response = self
-                .request(
-                    Method::GET,
-                    &format!("/v1/runs/{id}/events?after={after}"),
-                    None,
-                )
-                .await?;
-            let mut bytes = response.bytes_stream();
-            let mut pending = Vec::new();
-            let mut disconnected = false;
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        disconnected = true;
-                        break;
-                    }
-                };
-                pending.extend_from_slice(&chunk);
-                for event in frames(&mut pending)? {
-                    if event.id <= after {
-                        continue;
-                    }
-                    match &mut ui {
-                        Some(ui) => ui.event(&event.data),
-                        None => println!("{}", serde_json::to_string(&event)?),
-                    }
-                    after = event.id;
-                }
+        let events = self.stream(id, after);
+        futures_util::pin_mut!(events);
+        while let Some(event) = events.next().await {
+            let event = event?;
+            match &mut ui {
+                Some(ui) => ui.event(&event.data),
+                None => println!("{}", serde_json::to_string(&event)?),
             }
-            if !disconnected {
-                let run = self.run(id).await?;
-                if run.terminal() {
-                    if let Some(ui) = &mut ui {
-                        ui.finish();
-                    }
-                    if run.status != "completed" {
-                        return Err(RunFailed(run).into());
-                    }
-                    return Ok(());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        if let Some(ui) = &mut ui {
+            ui.finish();
+        }
+        let run = self.run(id).await?;
+        if run.status != "completed" {
+            return Err(RunFailed(run).into());
+        }
+        Ok(())
     }
 }
 

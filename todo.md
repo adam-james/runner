@@ -3,7 +3,6 @@
 ## Long term
 
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
-- add TUI
 - agent to agent communication
 - memory
 - component registry
