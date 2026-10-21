@@ -50,6 +50,10 @@ impl Executor for FakeExecutor {
                 *count
             };
             events(json!({"kind":"text", "text":format!("turn {turn}: ")}));
+            if run.prompt == "saved then wait" {
+                events(json!({"kind":"turn_saved"}));
+                futures_util::future::pending::<()>().await;
+            }
             if run.prompt == "wait" {
                 futures_util::future::pending::<()>().await;
             }
@@ -557,4 +561,47 @@ fn database_files_are_private_in_a_shared_directory() {
         std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
         0o755
     );
+}
+
+#[tokio::test]
+async fn a_cancel_after_save_before_execution_returns_preserves_completion() {
+    let h = Harness::new(1).await;
+    let run = h.submit(None, "saved then wait", 5).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id = run.id.clone();
+            let events = h.db.blocking(move |db| db.events(&id, 0)).await.unwrap();
+            if events
+                .iter()
+                .any(|event| event.data["kind"] == "turn_saved")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The executor has saved but is deliberately unable to return successfully.
+    assert_eq!(h.executor.active.load(Ordering::SeqCst), 1);
+    let response = h
+        .client
+        .post(format!("{}/v1/runs/{}/cancel", h.url, run.id))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let completed = h.wait_status(&run.id, "completed").await;
+    assert!(completed.cancel_requested);
+    assert!(completed.error.is_none());
+    assert_eq!(h.executor.active.load(Ordering::SeqCst), 0);
+    let events = h.db.events(&run.id, 0).unwrap();
+    assert_eq!(events.last().unwrap().data["status"], "completed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.data["status"] == "cancelled")
+    );
+    h.close().await;
 }

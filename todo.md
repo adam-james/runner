@@ -9,8 +9,6 @@
 ### From the PR #7 review (local agent service)
 
 - keep tool and provider instances per session - `Runtime::run_turn` (host/src/lib.rs) instantiates the provider, every tool and the session store each turn, so tool state (e.g. python variables) no longer carries over between turns, and the instantiation cost is paid every turn
-- remove `ComponentConfig.resolved` - expand env vars once in `load_config`/`from_config` and drop `expand_env` from `SandboxHooks::new` and `mounted_dir`
-- close the late-cancel race - a cancel that lands after the agent saves the turn but before it returns can still record `cancelled`; needs the agent to report when it saves
 - retry failed terminal-state writes - `contain` (runner/src/service.rs) forgets a finished job even if its fallback `db.finish` fails, leaving the run `running` and blocking later turns in that session until restart; retain pending terminal updates and retry them
 
 ## Long term
