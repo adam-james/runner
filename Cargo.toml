@@ -15,5 +15,4 @@ members = [
     "tools/edit-file",
     "tools/rustdocs",
     "tools/python",
-    "stores/fs",
 ]

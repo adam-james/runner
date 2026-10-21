@@ -1,5 +1,8 @@
 mod activity;
 pub mod delegation;
+mod transcript;
+
+pub use transcript::{BoxFuture, Transcripts};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -46,18 +49,6 @@ use provider_guest::exports::local::agent::provider_api::ToolDefinition;
 use provider_guest::local::agent::messages::{ContentBlock, Message, Role, ToolResultBlock};
 use provider_guest::local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
 
-mod session_store_guest {
-    wasmtime::component::bindgen!({
-        world: "session-store-guest",
-        path: "../wit",
-        exports: { default: async },
-        // So the turn's messages can be handed to the store as they are.
-        with: {
-            "local:agent/messages": crate::provider_guest::local::agent::messages,
-        },
-    });
-}
-
 #[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunnerConfig {
@@ -66,8 +57,6 @@ struct RunnerConfig {
     providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     tools: BTreeMap<String, ComponentConfig>,
-    /// Required in service mode; validated when constructing the runtime.
-    session_store: Option<ComponentConfig>,
     /// Named agent definitions, each picking from the providers and tools.
     /// Must include `default`.
     #[serde(default)]
@@ -90,6 +79,12 @@ struct AgentConfig {
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
+    /// The most tokens one model reply may use, hidden reasoning included;
+    /// `DEFAULT_MAX_TOKENS` if omitted.
+    max_tokens: Option<u32>,
+    /// The most model requests one turn may make before it's given up.
+    /// Omitted means no limit beyond the run's deadline.
+    max_model_calls: Option<u32>,
 }
 
 /// A definition resolved against the top-level config.
@@ -100,6 +95,8 @@ struct AgentDefinition {
     tools: BTreeMap<String, ComponentConfig>,
     delegates: Vec<String>,
     system_prompt: Option<String>,
+    max_tokens: u32,
+    max_model_calls: Option<u32>,
 }
 
 impl AgentDefinition {
@@ -121,6 +118,8 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
     #[serde(default)]
     pub delegates: Vec<String>,
+    pub max_tokens: u32,
+    pub max_model_calls: Option<u32>,
 }
 
 /// Tool and provider table keys: what agent definitions refer to them by.
@@ -158,6 +157,9 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
             if !config.agents.contains_key(target) {
                 bail!("agent '{name}': no delegation target named '{target}'");
             }
+        }
+        if agent.max_tokens == Some(0) || agent.max_model_calls == Some(0) {
+            bail!("agent '{name}': `max_tokens` and `max_model_calls` must be at least 1");
         }
         if agent
             .system_prompt
@@ -203,6 +205,8 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 tools,
                 delegates: agent.delegates.clone(),
                 system_prompt: agent.system_prompt.clone(),
+                max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+                max_model_calls: agent.max_model_calls,
             },
         );
     }
@@ -270,7 +274,6 @@ fn load_config(path: &str) -> Result<RunnerConfig> {
         .values_mut()
         .map(|provider| &mut provider.component)
         .chain(config.tools.values_mut())
-        .chain(config.session_store.iter_mut())
     {
         for (name, header) in &mut component.headers {
             header.value = expand_env(&header.value)
@@ -698,29 +701,8 @@ async fn load_provider(runtime: &Runtime, definition: &AgentDefinition) -> Resul
     })
 }
 
-struct SessionHandle {
-    healthy: bool,
-    /// Which session this run loads and saves, picked by the host.
-    id: String,
-    instance: session_store_guest::SessionStoreGuest,
-    store: Store<SandboxState>,
-}
-
-async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Result<SessionHandle> {
-    let (component, linker, mut store) = load_sandboxed(runtime, config)?;
-    let instance =
-        session_store_guest::SessionStoreGuest::instantiate_async(&mut store, &component, &linker)
-            .await?;
-    Ok(SessionHandle {
-        healthy: true,
-        id: String::new(),
-        instance,
-        store,
-    })
-}
-
-/// Whether `id` is fine to hand a store as a session name: short, and
-/// nothing a store using it as a file name or key could misread.
+/// Whether `id` is fine as a session name: short, and nothing a store using
+/// it as a file name or key could misread.
 fn validate_session_id(id: &str) -> Result<()> {
     validate_name("session id", id)
 }
@@ -742,13 +724,11 @@ fn validate_name(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A session's retained provider, tools and session store, and the turn
-/// loop that drives them.
+/// A session's retained provider and tools, and the turn loop that drives them.
 struct SessionComponents {
     provider: ProviderHandle,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
-    session: SessionHandle,
 }
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
@@ -757,9 +737,10 @@ fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
 
 /// The system prompt for definitions that don't set `system_prompt`.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-/// Per request, and it covers a reasoning model's hidden reasoning as well
-/// as the reply, so it needs headroom. Only tokens actually used are billed.
-const MAX_TOKENS: u32 = 16384;
+/// `max_tokens` for definitions that don't set one. It's per request, and it
+/// covers a reasoning model's hidden reasoning as well as the reply, so it
+/// needs headroom. Only tokens actually used are billed.
+pub const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 impl SessionComponents {
     /// Runs one turn to completion: loads the session, calls the model and
@@ -767,21 +748,34 @@ impl SessionComponents {
     /// error is why the turn was given up, written for the user.
     async fn turn(
         &mut self,
-        system: &str,
+        definition: &AgentDefinition,
+        transcript: &Transcript<'_>,
         prompt: String,
         events: &EventSink,
         delegation: Option<&dyn delegation::Delegation>,
         targets: &[String],
     ) -> Result<(), String> {
-        let mut history = self.load().await?.unwrap_or_default();
+        let system = definition
+            .system_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        let max_tokens = definition.max_tokens;
+        let mut history = transcript.load().await?;
         history.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text(prompt)],
         });
-        loop {
+        for calls in 0.. {
+            if definition.max_model_calls.is_some_and(|max| calls >= max) {
+                return Err(format!(
+                    "stopped after {calls} model {} without a final reply, so this turn \
+                     wasn't saved",
+                    if calls == 1 { "call" } else { "calls" }
+                ));
+            }
             let request = ChatRequest {
                 system: Some(system.to_string()),
-                max_tokens: MAX_TOKENS,
+                max_tokens,
                 messages: history.clone(),
             };
             let response = self
@@ -789,7 +783,7 @@ impl SessionComponents {
                 .await
                 .map_err(|e| describe(&e))?;
             events(serde_json::json!({"kind":"usage",
-                "reasoning_tokens":response.reasoning_tokens, "max_tokens":MAX_TOKENS,
+                "reasoning_tokens":response.reasoning_tokens, "max_tokens":max_tokens,
                 "prompt_tokens":response.prompt_tokens,
                 "cache_read_tokens":response.cache_read_tokens,
                 "cache_creation_tokens":response.cache_creation_tokens}));
@@ -801,7 +795,7 @@ impl SessionComponents {
                 Some("length" | "max_tokens")
             ) {
                 return Err(format!(
-                    "reply cut off: hit the {MAX_TOKENS} token limit, so this turn wasn't saved"
+                    "reply cut off: hit the {max_tokens} token limit, so this turn wasn't saved"
                 ));
             }
             let mut tool_results = Vec::new();
@@ -834,7 +828,7 @@ impl SessionComponents {
                 content: tool_results,
             });
         }
-        self.save(&history, events).await
+        transcript.save(&history, events).await
     }
 
     /// One model request, its text emitted as `text` events as it streams in.
@@ -902,41 +896,42 @@ impl SessionComponents {
         );
         result
     }
+}
 
-    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "load", component = ?self.session.store.data().hooks.component))]
-    async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
-        let guard = activity::Activity::new(tracing::Span::current(), "session_store");
-        let handle = &mut self.session;
-        handle.healthy = false;
-        let result = handle
-            .instance
-            .local_agent_session_store()
-            .call_load(&mut handle.store, &handle.id)
-            .await;
-        handle.healthy = result.is_ok();
-        let result = result
-            .map_err(|trap| format!("session store trapped: {trap}"))
-            .and_then(|result| result);
+/// One session's transcript, for a turn to load and save.
+struct Transcript<'a> {
+    store: &'a dyn Transcripts,
+    session: &'a str,
+}
+
+impl Transcript<'_> {
+    /// The session's conversation so far; empty for a new session.
+    #[tracing::instrument(name = "transcript", skip_all, fields(operation = "load"))]
+    async fn load(&self) -> Result<Vec<Message>, String> {
+        let guard = activity::Activity::new(tracing::Span::current(), "transcript");
+        let result = match self.store.load(self.session).await {
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(text)) => transcript::decode(&text).map_err(|e| e.to_string()),
+            Err(error) => Err(error),
+        };
         guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
-        result
+        result.map_err(|error| {
+            tracing::warn!(%error, "could not load transcript");
+            "could not load this session's history".to_string()
+        })
     }
 
-    #[tracing::instrument(name = "session_store", skip_all, fields(operation = "save", component = ?self.session.store.data().hooks.component))]
-    async fn save(&mut self, messages: &[Message], events: &EventSink) -> Result<(), String> {
-        let guard = activity::Activity::new(tracing::Span::current(), "session_store");
-        let handle = &mut self.session;
-        handle.healthy = false;
-        let result = handle
-            .instance
-            .local_agent_session_store()
-            .call_save(&mut handle.store, &handle.id, messages)
-            .await;
-        handle.healthy = result.is_ok();
-        let result = result
-            .map_err(|trap| format!("session store trapped: {trap}"))
-            .and_then(|result| result);
-        guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
-        result?;
+    #[tracing::instrument(name = "transcript", skip_all, fields(operation = "save"))]
+    async fn save(&self, messages: &[Message], events: &EventSink) -> Result<(), String> {
+        let guard = activity::Activity::new(tracing::Span::current(), "transcript");
+        let text = transcript::encode(messages);
+        let bytes = text.len();
+        let result = self.store.save(self.session, text).await;
+        guard.finish(if result.is_ok() { "ok" } else { "error" }, bytes, None);
+        result.map_err(|error| {
+            tracing::warn!(%error, "could not save transcript");
+            "could not save this turn".to_string()
+        })?;
         // Reported before the turn returns: once the transcript is saved, the
         // run completes even if cancellation or a deadline wins afterwards.
         let output = messages
@@ -1101,6 +1096,7 @@ pub struct Runtime {
     components: Arc<HashMap<String, Component>>,
     _ticker: Arc<EpochTicker>,
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionSlot>>>,
+    transcripts: Arc<dyn Transcripts>,
 }
 
 /// A session's retained components, and the agent definition they were built for.
@@ -1117,16 +1113,13 @@ impl Drop for EpochTicker {
 pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
 impl Runtime {
-    /// Loads every component and resolves named tools directly from the config.
-    pub async fn new(path: &str) -> Result<Self> {
-        let config = load_config(path)?;
-        if config.session_store.is_none() {
-            bail!("daemon mode requires a [session_store]");
-        }
-        Self::from_config(config).await
+    /// Loads every component and resolves named tools directly from the
+    /// config. Conversations are loaded from and saved to `transcripts`.
+    pub async fn new(path: &str, transcripts: Arc<dyn Transcripts>) -> Result<Self> {
+        Self::from_config(load_config(path)?, transcripts).await
     }
 
-    async fn from_config(config: RunnerConfig) -> Result<Self> {
+    async fn from_config(config: RunnerConfig, transcripts: Arc<dyn Transcripts>) -> Result<Self> {
         let agents = resolve_agents(&config)?;
         for component in sandboxed_components(&config) {
             SandboxHooks::new(component)?;
@@ -1163,6 +1156,7 @@ impl Runtime {
             components: Arc::new(components),
             _ticker: Arc::new(EpochTicker(stopped)),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            transcripts,
         };
         Ok(runtime)
     }
@@ -1183,6 +1177,8 @@ impl Runtime {
                     model: definition.model().to_string(),
                     tools,
                     delegates: definition.delegates.clone(),
+                    max_tokens: definition.max_tokens,
+                    max_model_calls: definition.max_model_calls,
                 }
             })
             .collect()
@@ -1247,33 +1243,27 @@ impl Runtime {
         // own instances; it never inherits another agent's provider or tool state.
         let mut components = match cached.take() {
             Some((cached_agent, components)) if cached_agent == agent => components,
-            _ => self.load_session(definition, session_id).await?,
+            _ => self.load_session(definition).await?,
         };
-        let system = definition
-            .system_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        let transcript = Transcript {
+            store: &*self.transcripts,
+            session: session_id,
+        };
         let result = components
             .turn(
-                system,
+                definition,
+                &transcript,
                 prompt.to_string(),
                 &events,
                 delegation.as_deref(),
                 &definition.delegates,
             )
             .await;
-        if components.session.healthy {
-            *cached = Some((agent.to_string(), components));
-        }
+        *cached = Some((agent.to_string(), components));
         result.map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
     }
 
-    async fn load_session(
-        &self,
-        definition: &AgentDefinition,
-        session_id: &str,
-    ) -> Result<SessionComponents> {
-        let config = &self.config;
+    async fn load_session(&self, definition: &AgentDefinition) -> Result<SessionComponents> {
         let provider = load_provider(self, definition).await?;
         let tools = load_tools(self, &definition.tools).await?;
         let mut definitions: Vec<_> = tools
@@ -1285,33 +1275,21 @@ impl Runtime {
             })
             .collect();
         sort_tool_definitions(&mut definitions);
-        let mut session = load_session_store(
-            self,
-            config
-                .session_store
-                .as_ref()
-                .ok_or_else(|| Error::msg("session store required"))?,
-        )
-        .await?;
-        session.id = session_id.to_string();
         Ok(SessionComponents {
             provider,
             tools,
             tool_definitions: definitions,
-            session,
         })
     }
 }
 
-/// Every sandboxed component `config` declares: providers, tools and the
-/// session store.
+/// Every sandboxed component `config` declares: providers and tools.
 fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &ComponentConfig> {
     config
         .providers
         .values()
         .map(|provider| &provider.component)
         .chain(config.tools.values())
-        .chain(&config.session_store)
 }
 
 /// Strips configured credentials out of a message headed for run storage
@@ -1567,7 +1545,13 @@ mod tests {
                  [agents.default]\nprovider = \"p\""
             ))
             .unwrap();
-            format!("{:#}", Runtime::from_config(config).await.err().unwrap())
+            format!(
+                "{:#}",
+                Runtime::from_config(config, Arc::new(NoTranscripts))
+                    .await
+                    .err()
+                    .unwrap()
+            )
         };
 
         let missing = env::temp_dir().join(format!("runner-missing-{}.wasm", std::process::id()));
@@ -1734,6 +1718,8 @@ mod tests {
             model = "small"
             tools = ["docs"]
             system_prompt = "Cite your sources."
+            max_tokens = 4096
+            max_model_calls = 8
             [agents.bare]
             provider = "main"
             [agents.elsewhere]
@@ -1756,6 +1742,15 @@ mod tests {
             Some("Cite your sources.")
         );
         assert_eq!(agents["bare"].system_prompt, None);
+        assert_eq!(
+            (researcher.max_tokens, researcher.max_model_calls),
+            (4096, Some(8))
+        );
+        // Without limits: the default token cap, and no cap on model calls.
+        assert_eq!(
+            (agents["bare"].max_tokens, agents["bare"].max_model_calls),
+            (DEFAULT_MAX_TOKENS, None)
+        );
         // Tools are opt-in for a named definition.
         assert!(agents["bare"].tools.is_empty());
         assert_eq!(
@@ -1793,6 +1788,13 @@ mod tests {
             err(&format!("{main}\nsystem_prompt = \" \""), tools)
                 .contains("`system_prompt` is empty")
         );
+        for zero in ["max_tokens = 0", "max_model_calls = 0"] {
+            assert!(
+                err(&format!("{main}\n{zero}"), tools).contains("must be at least 1"),
+                "{zero}"
+            );
+        }
+        assert!(err(&format!("{main}\nmax_tokens = -1"), tools).contains("invalid value"));
         // Every agent names its provider, and it has to exist.
         assert!(err("[agents.r]", tools).contains("missing field `provider`"));
         assert!(
@@ -1853,6 +1855,7 @@ mod tests {
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");
+        assert_eq!(agents["researcher"].max_model_calls, Some(20));
         assert_eq!(agents["default"].provider_name, "anthropic");
         assert_eq!(agents["default"].model(), "claude-sonnet-5");
         assert!(agents["default"].delegates.is_empty());
@@ -1909,6 +1912,28 @@ mod tests {
             redact(&config, "bad key other-secret-key"),
             "bad key [redacted]"
         );
+    }
+
+    /// For tests that never get as far as a turn.
+    struct NoTranscripts;
+
+    impl Transcripts for NoTranscripts {
+        fn load(&self, _: &str) -> BoxFuture<Result<Option<String>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn save(&self, _: &str, _: String) -> BoxFuture<Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn session_store_config_is_rejected() {
+        // Conversations are kept by the service now, not a component.
+        let stale = toml::from_str::<RunnerConfig>(
+            "[session_store]\npath = \"fs_store.wasm\"\ndir = \"sessions\"",
+        );
+        let error = stale.err().unwrap().to_string();
+        assert!(error.contains("unknown field `session_store`"), "{error}");
     }
 
     #[test]

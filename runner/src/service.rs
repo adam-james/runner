@@ -708,7 +708,6 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         bail!("concurrency must be positive");
     }
     let instance = LocalInstance::acquire(data_dir)?;
-    let runtime = host::Runtime::new(config).await?;
     let path = data_dir.join("state.sqlite3");
     let db = tokio::task::spawn_blocking(move || {
         let db = Database::open(&path)?;
@@ -716,6 +715,8 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         Ok::<_, anyhow::Error>(db)
     })
     .await??;
+    // Conversations live in the same database as the runs that produce them.
+    let runtime = host::Runtime::new(config, Arc::new(db.clone())).await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {

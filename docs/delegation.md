@@ -113,7 +113,7 @@ Run responses include `parent_run_id`, `root_run_id`, `depth`, and `deadline_at`
 separate; the parent's normal tool results carry collected answers. Agent
 metadata includes allowed `delegates` and the host tool names.
 
-SQLite schema version 2 adds relationships, deadlines, and private saved results
+SQLite schema version 3 adds relationships, deadlines, and private saved results
 automatically. Existing runs become roots; older binaries reject the upgraded
 database. Final answers are stored separately from replay events. Activity logs
 record metadata, not delegation prompts or child answers.

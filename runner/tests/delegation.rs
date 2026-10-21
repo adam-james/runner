@@ -168,6 +168,32 @@ fn version_one_database_migrates_existing_runs_to_roots() {
     assert!(Database::open(&path).is_ok());
 }
 
+#[test]
+fn version_two_database_keeps_existing_transcripts_during_delegation_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Database::open(&path).unwrap();
+    db.save_transcript("session", "[]").unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE run_results;
+        DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
+        ALTER TABLE runs DROP COLUMN parent_run_id;
+        ALTER TABLE runs DROP COLUMN root_run_id;
+        ALTER TABLE runs DROP COLUMN depth;
+        ALTER TABLE runs DROP COLUMN deadline_at;
+        PRAGMA user_version=2;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.transcript("session").unwrap().as_deref(), Some("[]"));
+    let root = db.submit(None, "worker".into(), "task".into(), 30).unwrap();
+    db.claim().unwrap();
+    assert!(db.delegate(&root.id, "worker", "child", None).is_ok());
+}
+
 #[derive(Default)]
 struct Probe {
     active: Arc<AtomicUsize>,

@@ -1,9 +1,8 @@
 # runner
 
-A sandboxed agent runner. Model providers, tools, and the session store are
-WASM components, and a persistent local daemon wires them together. The host
-is the only thing that ever touches API keys or decides which
-provider/model/tools are in use.
+A sandboxed agent runner. Model providers and tools are WASM components, and a
+persistent local daemon wires them together. The host is the only thing that
+ever touches API keys or decides which provider/model/tools are in use.
 
 - The **agent loop** is the host's own code: for each turn it loads the
   session, sends the conversation to the agent's provider, runs the tool calls
@@ -41,9 +40,8 @@ runner serve --config runner.toml
 ```
 
 Keep `serve` running in a separate terminal (or under your system's service
-manager). The daemon requires a `[session_store]`. Configuration paths are
-relative to the daemon's working directory. It also requires an
-`[agents.default]` table listing the tools runs may use. Provider credentials come from the daemon's environment; clients do not need them.
+manager). Configuration paths are relative to the daemon's working directory.
+The daemon requires an `[agents.default]` table listing the tools runs may use. Provider credentials come from the daemon's environment; clients do not need them.
 
 ```bash
 runner chat                         # new conversation
@@ -101,9 +99,8 @@ Service state lives in `~/.runner/service` by default. Override it with
 `--data-dir PATH` on any command or `RUNNER_DATA_DIR`. The directory is private
 on macOS/Linux and contains SQLite state, a daemon lock, and a private connection
 file with a generated local API token. Only one daemon can use a data directory.
-The service registers sessions in SQLite when they are created. Conversation
-history lives in the configured session store. Use this daemon as the sole
-writer to that store while it is running.
+The service registers sessions in SQLite when they are created, and keeps each
+session's conversation history there too.
 
 Queued work survives daemon restarts. Work that was running becomes
 `interrupted`; Runner never automatically retries it, because a tool may already
@@ -119,12 +116,12 @@ next milestones: scheduling, explicit delegation, and desktop clients.
 ### Verify the service
 
 The standard tests use deterministic execution without API keys. The additional
-runtime tests use the real turn loop and session store with a fixture provider
-and tool, and also exercise CLI/daemon processes and crash recovery:
+runtime tests use the real turn loop and SQLite transcripts with a fixture
+provider and tool, and also exercise CLI/daemon processes and crash recovery:
 
 ```bash
 cargo test -p host -p runner
-cargo build -p fs-store -p test-provider -p test-tool --target wasm32-wasip2
+cargo build -p test-provider -p test-tool --target wasm32-wasip2
 cargo test -p runner --test runtime -- --ignored
 cargo clippy -p host -p runner --all-targets -- -D warnings
 ```
@@ -134,8 +131,7 @@ Fixtures are test components and should not be included in normal configs.
 ## Layout
 
 - `wit/messages.wit` — the conversation itself (messages and their content
-  blocks: text, tool uses, tool results), shared by the host, providers,
-  and session stores.
+  blocks: text, tool uses, tool results), shared by the host and providers.
 - `wit/types.wit` — the types around a `chat` call (`chat-request`/
   `chat-response`, errors, and `chat-stream`: a reply in progress) shared
   by the host and providers.
@@ -147,12 +143,9 @@ Fixtures are test components and should not be included in normal configs.
   (name, description, JSON input schema) and `call(input-json)`. The host
   calls `describe()` once at startup to learn what's available and to build
   the provider's native tool-calling schema; `call()` runs it.
-- `wit/session.wit` — sessions. A session store exports `session-store`
-  (`load`/`save` by id); the host loads the session before each turn and
-  saves it after a completed one.
 - `runner/` — local daemon, durable run queue, HTTP/SSE API, and CLI client.
-- `host/` — runtime library. Loads the providers, tools, and session store
-  from a TOML config file, restricts each provider/tool's outbound
+- `host/` — runtime library. Loads the providers and tools from a TOML config
+  file, restricts each provider/tool's outbound
   `wasi:http` to its own allow-list, injects configured headers
   (credentials) into those requests, and runs them under Wasmtime. Its turn
   loop calls the agent's provider, emits typed text, usage, and tool events,
@@ -192,8 +185,6 @@ Fixtures are test components and should not be included in normal configs.
   install. Python can't be compiled to WASM by itself, so
   this is one interpreter component that takes each script as its input,
   rather than a new component per script. See [Python](#python).
-- `stores/fs/` — a session store that keeps each session as a JSON file
-  in the one directory its config gives it.
 
 Only the keys the config actually uses need to be set — each configured
 provider's, plus `TAVILY_API_KEY` if the search tool is configured. The host only reads
@@ -252,9 +243,11 @@ To migrate an existing config, replace each `[[tools]]` header with
 stay in that table. The same component may appear under several names with
 different directories or permissions.
 
-An agent definition may set `system_prompt` to replace the agent component's
-built-in one ("You are a helpful assistant."). The included `runner.toml` also
-defines two agents you can try after restarting the server:
+An agent definition may set `system_prompt` to replace the default ("You are a
+helpful assistant."), `max_tokens` to cap each model reply (default 16384,
+hidden reasoning included), and `max_model_calls` to cap the model requests in
+one turn; a turn that hits either limit fails without being saved. The included
+`runner.toml` also defines two agents you can try after restarting the server:
 
 ```bash
 runner chat --agent reader       # read_file only, using the default model
@@ -346,15 +339,8 @@ Terminal styling lives in the client; the agent emits no terminal output.
 
 ## Sessions
 
-The daemon requires a `[session_store]` in the config. Each session's
-conversation is saved after completed turns and can be picked up later:
-
-```toml
-[session_store]
-path = "target/wasm32-wasip2/release/fs_store.wasm"
-dir = "${HOME}/.runner/sessions"
-dir_writable = true
-```
+Each session's conversation is saved in the daemon's SQLite database after
+every completed turn, and can be picked up later:
 
 ```bash
 runner chat                          # new session
@@ -366,17 +352,6 @@ New sessions receive UUIDs. `chat --session ID` creates a named session if it
 isn't saved yet, while `run --session ID` requires an existing session. IDs
 use letters, digits, `-`, `_` and `.`, up to 64 characters, and cannot start
 with a dot. Session listing uses the service's SQLite records.
-
-The store is a sandboxed component like any other. `dir` gives it one
-directory on the host, mounted as its `/`, and it can't see anything
-outside it. `dir` works the same on a provider or tool, and expands
-`${NAME}` like header values do. A `dir` is read-only unless
-`dir_writable = true` is set, as it is for the store: without that, the
-component can read the directory but not change, add or delete anything
-in it, and the directory has to exist already (a writable one is created
-if missing). A store backed by something
-else, such as a database behind an HTTP API, would use `allowed_hosts` and
-`headers` instead; the agent can't tell the difference.
 
 ## Python
 

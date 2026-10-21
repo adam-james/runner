@@ -164,6 +164,8 @@ impl Guest for Provider {
                         call.to_string()
                     } else if prompt == "system-prompt" {
                         request.system.clone().unwrap_or_default()
+                    } else if prompt == "max-tokens" {
+                        request.max_tokens.to_string()
                     } else {
                         format!("turn {turns}: {prompt}")
                     }

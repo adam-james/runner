@@ -112,6 +112,8 @@ impl Harness {
                     model: "gpt-5".into(),
                     tools: vec!["web_search".into()],
                     delegates: vec![],
+                    max_tokens: host::DEFAULT_MAX_TOKENS,
+                    max_model_calls: None,
                 })
                 .into(),
         );
@@ -225,7 +227,8 @@ async fn runs_execute_the_agent_definition_they_name() {
         agents,
         json!(
             ["default", "researcher"].map(|name| json!({"name":name, "provider":"openai",
-            "model":"gpt-5", "tools":["web_search"], "delegates":[]}))
+            "model":"gpt-5", "tools":["web_search"], "max_tokens":16384,"delegates":[],
+            "max_model_calls":null}))
         )
     );
     let run: Run = h
@@ -477,6 +480,39 @@ async fn shutdown_interrupts_active_work_and_preserves_queue() {
     assert_eq!(h.db.run(&queued.id).unwrap().unwrap().status, "queued");
     assert_eq!(h.executor.active.load(Ordering::SeqCst), 0);
     h.close().await;
+}
+
+#[test]
+fn a_version_1_database_gains_transcripts_and_keeps_its_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let run = Database::open(&path)
+        .unwrap()
+        .submit(None, "default".into(), "before upgrade".into(), 60)
+        .unwrap();
+    // What a daemon from before transcripts moved into SQLite left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE transcripts;
+        DROP TABLE run_results;
+        DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
+        ALTER TABLE runs DROP COLUMN parent_run_id;
+        ALTER TABLE runs DROP COLUMN root_run_id;
+        ALTER TABLE runs DROP COLUMN depth;
+        ALTER TABLE runs DROP COLUMN deadline_at;
+        PRAGMA user_version=1;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.run(&run.id).unwrap().unwrap().prompt, "before upgrade");
+    assert_eq!(db.transcript(&run.session_id).unwrap(), None);
+    db.save_transcript(&run.session_id, "[1]").unwrap();
+    db.save_transcript(&run.session_id, "[2]").unwrap();
+    assert_eq!(
+        db.transcript(&run.session_id).unwrap().as_deref(),
+        Some("[2]")
+    );
 }
 
 #[test]
