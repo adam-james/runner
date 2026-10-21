@@ -64,13 +64,23 @@ runner run --agent researcher "What changed in the latest Rust release?"
 `run` and `runs watch` print the run's agent and session ID on stderr, followed
 by the agent's provider, model, and tools; `run --detach` prints the run ID on
 stdout. Without `--detach`, `run` streams output until completion. Ctrl-C while
-watching detaches; use `runs cancel` to stop the run. Failed, cancelled, and
+watching detaches successfully and leaves the run working; use `runs cancel`
+to stop it. Failed, cancelled, and
 interrupted runs produce a nonzero watcher exit status. `chat` submits one turn
 at a time in the same session; its banner names the agent and session, followed
 by the agent's provider, model, and tools. When it ends, it prints the command
 to resume the session. Resuming a session with `chat --session` first replays
-its completed turns: each prompt, the reply, and its tool calls. Failed and
-cancelled turns aren't replayed, since they weren't saved to the conversation.
+its completed turns: each prompt, the reply, and its tool calls. It then follows
+active and queued turns in submission order before offering the next prompt.
+Turns added during catch-up are followed too. Failed and cancelled turns from
+earlier history aren't replayed, since they weren't saved to the conversation;
+failures encountered while following pending work are displayed before continuing.
+Ctrl-C while following exits chat normally and prints a resume command.
+
+Queue additional turns while detached with
+`runner run --session SESSION "next prompt" --detach`. A watcher shows
+"Queued — waiting to run" until execution starts. `runner sessions list` includes
+`running_runs` and `queued_runs` counts for each session.
 `--session` on `run` requires an existing session. `--agent` on `run` and `chat`
 picks a named agent definition from the config's `[agents.<name>]` tables (see
 `runner.toml`); without it, runs use `default`.

@@ -21,6 +21,10 @@ struct Signals {
 pub struct Session {
     pub id: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub running_runs: u64,
+    #[serde(default)]
+    pub queued_runs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +209,8 @@ impl Database {
         let session = Session {
             id,
             created_at: now(),
+            running_runs: 0,
+            queued_runs: 0,
         };
         self.0.lock().unwrap().execute(
             "INSERT INTO sessions VALUES (?1, ?2)",
@@ -215,13 +221,20 @@ impl Database {
 
     pub fn sessions(&self) -> Result<Vec<Session>> {
         let conn = self.0.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, created_at FROM sessions ORDER BY created_at, rowid")?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.created_at,
+                COUNT(CASE WHEN r.status='running' THEN 1 END),
+                COUNT(CASE WHEN r.status='queued' THEN 1 END)
+             FROM sessions s LEFT JOIN runs r ON r.session_id=s.id
+             GROUP BY s.id ORDER BY s.created_at, s.rowid",
+        )?;
         Ok(stmt
             .query_map([], |row| {
                 Ok(Session {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
+                    running_runs: row.get(2)?,
+                    queued_runs: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)

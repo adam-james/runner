@@ -44,6 +44,8 @@ pub struct Ui {
     /// only then are there waits to show or time.
     live: bool,
     thinking: Option<Thinking>,
+    queued: bool,
+    running: bool,
     /// Model text is on the current line and needs a newline before anything else.
     in_text: bool,
     /// The `⚙ name(args)` line of the tool running now, to redraw when it finishes.
@@ -51,11 +53,9 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Starts with "Thinking…" shown, since the run was just submitted.
+    /// Wait for persisted status events before showing an execution indicator.
     pub fn start() -> Self {
-        let mut ui = Self::new(true);
-        ui.start_thinking(false);
-        ui
+        Self::new(true)
     }
 
     /// For showing a finished run's events, with no "Thinking…" indicators
@@ -69,6 +69,8 @@ impl Ui {
             stdout_tty: io::stdout().is_terminal(),
             live,
             thinking: None,
+            queued: false,
+            running: false,
             in_text: false,
             tool: None,
         }
@@ -76,6 +78,24 @@ impl Ui {
 
     pub fn event(&mut self, data: &Value) {
         match data["kind"].as_str() {
+            Some("status") if self.live => match data["status"].as_str() {
+                Some("queued") if !self.running => {
+                    self.stop_thinking(false);
+                    if !self.queued {
+                        println!("{}", style(self.stdout_tty, DIM, "Queued — waiting to run"));
+                    }
+                    self.queued = true;
+                }
+                Some("running") => {
+                    self.running = true;
+                    self.queued = false;
+                    if self.thinking.is_none() {
+                        self.start_thinking(false);
+                    }
+                }
+                Some("completed" | "failed" | "cancelled" | "interrupted") => self.finish(),
+                _ => {}
+            },
             Some("text") => {
                 self.stop_thinking(true);
                 print!("{}", data["text"].as_str().unwrap_or_default());
@@ -145,6 +165,9 @@ impl Ui {
     pub fn finish(&mut self) {
         self.stop_thinking(false);
         self.end_text();
+        if self.tool.take().is_some() {
+            println!();
+        }
     }
 
     fn end_text(&mut self) {
@@ -209,7 +232,7 @@ impl Ui {
 
 impl Drop for Ui {
     fn drop(&mut self) {
-        self.stop_thinking(false);
+        self.finish();
     }
 }
 
@@ -306,6 +329,35 @@ pub fn run_header(agent: &str, details: Option<&host::AgentInfo>, session: &str)
     if let Some(details) = details {
         eprintln!("{}", style(tty, DIM, &agent_details(details)));
     }
+}
+
+/// Pending work shown before following its output.
+pub fn pending(run: &crate::db::Run) {
+    let tty = io::stdout().is_terminal();
+    println!(
+        "{}",
+        style(
+            tty,
+            DIM,
+            &format!("run {} · agent {} · {}", run.id, run.agent, run.status)
+        )
+    );
+}
+
+/// Detaching is a normal exit; the server continues the run.
+pub fn detached(run: &crate::db::Run) {
+    let tty = io::stderr().is_terminal();
+    eprintln!(
+        "{}",
+        style(
+            tty,
+            DIM,
+            &format!(
+                "detached; run {} continues. Resume with: runner chat --session {}",
+                run.id, run.session_id
+            )
+        )
+    );
 }
 
 pub fn end_input() {
@@ -425,6 +477,32 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn queue_wait_does_not_start_thinking_or_rewind_running_state() {
+        let mut ui = Ui::start();
+        ui.event(&json!({"kind":"status", "status":"queued"}));
+        assert!(ui.queued);
+        assert!(ui.thinking.is_none());
+        ui.event(&json!({"kind":"status", "status":"running"}));
+        assert!(!ui.queued);
+        assert!(ui.thinking.is_some());
+        // A running attachment may replay its older queued event.
+        ui.event(&json!({"kind":"status", "status":"queued"}));
+        assert!(!ui.queued);
+        ui.event(&json!({"kind":"status", "status":"completed"}));
+        assert!(ui.thinking.is_none());
+    }
+
+    #[test]
+    fn replay_ignores_execution_indicators() {
+        let mut ui = Ui::replay();
+        for status in ["queued", "running", "completed"] {
+            ui.event(&json!({"kind":"status", "status":status}));
+            assert!(ui.thinking.is_none());
+            assert!(!ui.queued);
+        }
+    }
 
     #[test]
     fn tool_call_shows_object_fields() {
