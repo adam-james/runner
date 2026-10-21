@@ -1,14 +1,14 @@
 # runner
 
 A sandboxed agent runner. Everything that runs is a WASM component — the
-agent, the model provider, and each tool — and a small native host process
+agent, the model provider, and each tool — and a persistent local daemon
 wires them together. The host is the only thing that ever touches API keys
 or decides which provider/model/tools are in use.
 
 - The **agent** (conversation loop, system prompt) has no network access at
-  all. Its only capability besides standard I/O is two typed calls into the
-  host — `chat` and `call-tool` — and it has no say in which provider,
-  model, or tools serve them.
+  all. It calls the host for chat, tools, and session history, and emits
+  structured output events. It has no say in which provider, model, or
+  tools serve its requests.
 - A **provider** translates a `chat` call into one vendor's API (Anthropic,
   OpenAI, …). It gets `wasi:http`, but can only reach the hosts its config
   allow-lists, and never sees an API key: the host adds the credential
@@ -28,7 +28,7 @@ synchronous WASI 0.2 components. Everything still builds for the
 
 ## Local service and CLI
 
-Runner can also run as a persistent local daemon. The daemon owns execution;
+Runner runs as a persistent local daemon. The daemon owns execution;
 closing a client leaves its runs going. CLI and future desktop clients use the
 same authenticated local API. The agent emits structured events; the CLI owns
 terminal input and rendering.
@@ -41,9 +41,8 @@ runner serve --config runner.toml
 ```
 
 Keep `serve` running in a separate terminal (or under your system's service
-manager). Daemon mode requires a `[session_store]`. Configuration paths are
-relative to the daemon's working directory. Provider
-credentials come from the daemon's environment; clients do not need them.
+manager). The daemon requires a `[session_store]`. Configuration paths are
+relative to the daemon's working directory. Provider credentials come from the daemon's environment; clients do not need them.
 
 ```bash
 runner chat                         # new conversation

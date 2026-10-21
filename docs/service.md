@@ -23,8 +23,8 @@ execution stores do not isolate changes made to a shared writable directory.
 The guest exports `agent-api.run-turn(prompt)` and imports typed `run-events`
 for text and usage. It retains its model/tool loop and session load/save calls.
 The host records tool execution and lifecycle transitions itself. Terminal
-formatting is not part of the service's component protocol. In daemon mode,
-guest stdout/stderr are captured separately, up to 64 KiB each, and emitted as
+formatting is not part of the service's component protocol. The host captures
+guest stdout/stderr separately, up to 64 KiB each, and emits them as
 diagnostics when execution ends. Raw component/provider errors are not published
 to clients because they may include reflected request data.
 
