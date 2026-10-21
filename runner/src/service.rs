@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::future::IntoFuture;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse},
     routing::{get, post},
 };
-use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinSet};
@@ -214,7 +214,9 @@ async fn authenticate(
 async fn list_sessions(
     State(s): State<Service>,
 ) -> Result<Json<Vec<crate::db::Session>>, ApiError> {
-    Ok(Json(s.db.sessions().map_err(internal)?))
+    Ok(Json(
+        s.db.blocking(|db| db.sessions()).await.map_err(internal)?,
+    ))
 }
 
 async fn create_session(
@@ -223,12 +225,16 @@ async fn create_session(
 ) -> Result<impl IntoResponse, ApiError> {
     Ok((
         StatusCode::CREATED,
-        Json(s.db.create_session(input.id).map_err(bad)?),
+        Json(
+            s.db.blocking(move |db| db.create_session(input.id))
+                .await
+                .map_err(bad)?,
+        ),
     ))
 }
 
 async fn list_runs(State(s): State<Service>) -> Result<Json<Vec<Run>>, ApiError> {
-    Ok(Json(s.db.runs().map_err(internal)?))
+    Ok(Json(s.db.blocking(|db| db.runs()).await.map_err(internal)?))
 }
 
 async fn submit(
@@ -236,7 +242,8 @@ async fn submit(
     Json(input): Json<Submit>,
 ) -> Result<impl IntoResponse, ApiError> {
     let run =
-        s.db.submit(input.session_id, input.prompt, input.deadline_secs)
+        s.db.blocking(move |db| db.submit(input.session_id, input.prompt, input.deadline_secs))
+            .await
             .map_err(bad)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
@@ -245,19 +252,37 @@ async fn inspect(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<Run>, ApiError> {
-    Ok(Json(s.db.run(&id).map_err(internal)?.ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, "run not found".into())
-    })?))
+    Ok(Json(
+        s.db.blocking({
+            let id = id.clone();
+            move |db| db.run(&id)
+        })
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))?,
+    ))
 }
 
 async fn cancel(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<Run>, ApiError> {
-    if s.db.run(&id).map_err(internal)?.is_none() {
+    if s.db
+        .blocking({
+            let id = id.clone();
+            move |db| db.run(&id)
+        })
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
         return Err(ApiError(StatusCode::NOT_FOUND, "run not found".into()));
     }
-    Ok(Json(s.db.cancel(&id).map_err(internal)?))
+    Ok(Json(
+        s.db.blocking(move |db| db.cancel(&id))
+            .await
+            .map_err(internal)?,
+    ))
 }
 
 async fn events(
@@ -266,7 +291,15 @@ async fn events(
     Query(cursor): Query<Cursor>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    if s.db.run(&id).map_err(internal)?.is_none() {
+    if s.db
+        .blocking({
+            let id = id.clone();
+            move |db| db.run(&id)
+        })
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
         return Err(ApiError(StatusCode::NOT_FOUND, "run not found".into()));
     }
     let header_cursor = headers
@@ -285,11 +318,16 @@ async fn events(
             "cursor must be nonnegative".into(),
         ));
     }
+    let changes = s.db.changes(&id);
     let stream = async_stream::stream! {
         loop {
+            // Register before reading so commits between the query and wait cannot be lost.
+            let notified = changes.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             // Read terminal state first: a concurrent completion must never hide its last events.
-            let terminal = match s.db.run(&id) { Ok(Some(run)) => run.terminal(), _ => break };
-            let batch = match s.db.events(&id, after) { Ok(events) => events, Err(_) => break };
+            let terminal = match s.db.blocking({ let id = id.clone(); move |db| db.run(&id) }).await { Ok(Some(run)) => run.terminal(), _ => break };
+            let batch = match s.db.blocking({ let id = id.clone(); move |db| db.events(&id, after) }).await { Ok(events) => events, Err(_) => break };
             let empty = batch.is_empty();
             for event in batch {
                 after = event.id;
@@ -298,7 +336,7 @@ async fn events(
             }
             if terminal && empty { break; }
             if !empty { continue; }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            notified.await;
         }
     };
     Ok(Sse::new(stream).keep_alive(sse::KeepAlive::default()))
@@ -350,61 +388,96 @@ async fn execute(
     executor: Arc<dyn Executor>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let buffer = Arc::new(Mutex::new(BufferedEvents {
-        db: db.clone(),
-        id: run.id.clone(),
-        text: String::new(),
-        last_flush: Instant::now(),
-        failed: false,
-    }));
-    let writer = buffer.clone();
-    let sink: host::EventSink = Arc::new(move |value| writer.lock().unwrap().push(value));
+    let (send, receive) = std::sync::mpsc::channel();
+    let writer_db = db.clone();
+    let writer_id = run.id.clone();
+    let failed = CancellationToken::new();
+    let writer_failed = failed.clone();
+    // One blocking consumer preserves event order and batches text without fsync on Tokio.
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut buffer = BufferedEvents {
+            db: writer_db,
+            id: writer_id,
+            text: String::new(),
+            last_flush: Instant::now(),
+            failed: false,
+        };
+        loop {
+            let value = if buffer.text.is_empty() {
+                receive
+                    .recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                receive.recv_timeout(
+                    Duration::from_millis(50).saturating_sub(buffer.last_flush.elapsed()),
+                )
+            };
+            match value {
+                Ok(value) => buffer.push(value),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => buffer.flush(),
+            }
+            if buffer.failed {
+                writer_failed.cancel();
+            }
+        }
+        buffer.flush();
+        buffer.failed
+    });
+    let sink: host::EventSink = Arc::new(move |value| {
+        let _ = send.send(value);
+    });
     let cancel = CancellationToken::new();
-    let mut future = executor.execute(run.clone(), sink, cancel.clone());
+    let requested = db.cancellation(&run.id);
+    let execution_run = run.clone();
+    let execution_cancel = cancel.clone();
+    // Contain executor panics here so queued events drain before the terminal status.
+    let mut future = Box::pin(
+        std::panic::AssertUnwindSafe(async move {
+            executor
+                .execute(execution_run, sink, execution_cancel)
+                .await
+        })
+        .catch_unwind(),
+    );
     let deadline = tokio::time::sleep(Duration::from_secs(run.deadline_secs));
     tokio::pin!(deadline);
-    let mut poll = tokio::time::interval(Duration::from_millis(25));
-    let (status, error): (&str, Option<String>) = loop {
+    let (status, error): (&str, Option<String>) = {
         tokio::select! {
             biased;
             // A finished turn has already been saved, so it wins over cancel, deadline and shutdown.
-            result = &mut future => break match result {
-                Ok(()) => ("completed", None),
-                Err(error) => ("failed", Some(match error.downcast_ref::<host::TurnFailed>() {
+            result = &mut future => match result {
+                Err(_) => ("failed", Some("internal error".into())),
+                Ok(Ok(())) => ("completed", None),
+                Ok(Err(error)) => ("failed", Some(match error.downcast_ref::<host::TurnFailed>() {
                     // The agent's own message for the user, with credentials redacted by the host.
                     Some(failed) => failed.0.clone(),
                     // Other component/provider errors can contain reflected request headers or secrets.
                     None => "agent execution failed".into(),
                 })),
             },
-            _ = shutdown.cancelled() => break ("interrupted", Some("daemon stopped during execution".into())),
-            _ = &mut deadline => break ("failed", Some("run deadline exceeded".into())),
-            _ = poll.tick() => {
-                let mut writer = buffer.lock().unwrap();
-                if writer.last_flush.elapsed() >= Duration::from_millis(50) { writer.flush(); }
-                if writer.failed { break ("failed", Some("could not persist run events".into())); }
-                drop(writer);
-                // A failed poll (e.g. SQLITE_BUSY) is retried on the next tick.
-                if matches!(db.run(&run.id), Ok(Some(r)) if r.cancel_requested) { break ("cancelled", None); }
-            }
+            _ = shutdown.cancelled() => ("interrupted", Some("daemon stopped during execution".into())),
+            _ = &mut deadline => ("failed", Some("run deadline exceeded".into())),
+            _ = requested.cancelled() => ("cancelled", None),
+            _ = failed.cancelled() => ("failed", Some("could not persist run events".into())),
         }
     };
     cancel.cancel();
     // Drop all guest execution before publishing a terminal status.
     drop(future);
-    let mut writer = buffer.lock().unwrap();
-    writer.flush();
-    let failed = writer.failed;
-    drop(writer);
-    db.finish(
-        &run.id,
-        if failed { "failed" } else { status },
-        if failed {
-            Some("could not persist run events")
-        } else {
-            error.as_deref()
-        },
-    )?;
+    let failed = writer.await?;
+    db.blocking(move |db| {
+        db.finish(
+            &run.id,
+            if failed { "failed" } else { status },
+            if failed {
+                Some("could not persist run events")
+            } else {
+                error.as_deref()
+            },
+        )
+    })
+    .await?;
     Ok(())
 }
 
@@ -426,11 +499,11 @@ pub async fn worker(
             biased;
             _ = shutdown.cancelled() => break,
             Some(completed) = jobs.join_next_with_id(), if !jobs.is_empty() => {
-                contain(&db, &mut runs, completed);
+                contain(&db, &mut runs, completed).await;
             }
             _ = tick.tick() => {
                 while jobs.len() < concurrency {
-                    let run = match db.claim() {
+                    let run = match db.blocking(|db| db.claim()).await {
                         Ok(Some(run)) => run,
                         Ok(None) => break,
                         // Transient (e.g. SQLITE_BUSY); retry on the next tick.
@@ -447,13 +520,13 @@ pub async fn worker(
         }
     }
     while let Some(completed) = jobs.join_next_with_id().await {
-        contain(&db, &mut runs, completed);
+        contain(&db, &mut runs, completed).await;
     }
     Ok(())
 }
 
 /// One job's error or panic must not stop the daemon or abort its sibling runs.
-fn contain(
+async fn contain(
     db: &Database,
     runs: &mut HashMap<tokio::task::Id, String>,
     completed: Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
@@ -469,7 +542,13 @@ fn contain(
     let Some(run) = runs.remove(&id) else { return };
     eprintln!("run {run} failed internally: {error}");
     // No-op if execute already published a terminal status.
-    if let Err(error) = db.finish(&run, "failed", Some("internal error")) {
+    if let Err(error) = db
+        .blocking({
+            let run = run.clone();
+            move |db| db.finish(&run, "failed", Some("internal error"))
+        })
+        .await
+    {
         eprintln!("could not mark run {run} failed: {error:#}");
     }
 }
@@ -480,8 +559,13 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     }
     let instance = LocalInstance::acquire(data_dir)?;
     let runtime = host::Runtime::new(config)?;
-    let db = Database::open(&data_dir.join("state.sqlite3"))?;
-    db.recover()?;
+    let path = data_dir.join("state.sqlite3");
+    let db = tokio::task::spawn_blocking(move || {
+        let db = Database::open(&path)?;
+        db.recover()?;
+        Ok::<_, anyhow::Error>(db)
+    })
+    .await??;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {
