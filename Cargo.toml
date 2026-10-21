@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "host",
+    "runner",
+    "tests/components/provider",
+    "tests/components/tool",
     "agent",
     "providers/anthropic",
     "providers/openai",

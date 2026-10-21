@@ -14,4 +14,26 @@ interface chat-api {
 world chat-guest {
     import chat-api;
     import session;
+    import run-events;
+    export agent-api;
+}
+
+// Structured execution, independent of terminal input/output.
+interface agent-api {
+    run-turn: async func(prompt: string) -> result<_, string>;
+}
+
+interface run-events {
+    record usage {
+        reasoning-tokens: option<u32>,
+        max-tokens: u32,
+        prompt-tokens: option<u32>,
+        cache-read-tokens: option<u32>,
+        cache-creation-tokens: option<u32>,
+    }
+    variant event {
+        text(string),
+        usage(usage),
+    }
+    emit: func(value: event);
 }

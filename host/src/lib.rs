@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use wasmtime::component::{
@@ -12,9 +15,8 @@ use wasmtime::component::{
 };
 use wasmtime::{
     Cache, Config, Engine, Error, Result, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
-    Trap, bail,
+    bail,
 };
-use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
@@ -31,7 +33,7 @@ wasmtime::component::bindgen!({
 
 use local::agent::messages::Message;
 use local::agent::types::{ChatError, ChatRequest, ChatResponse, ChatStream};
-use local::agent::{chat_api, session};
+use local::agent::{chat_api, run_events, session};
 
 // Scoped in their own modules so each world's generated types (also under
 // the `local:agent` package, since wit_bindgen requires one package per
@@ -72,17 +74,17 @@ mod session_store_guest {
     });
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct RunnerConfig {
     agent: String,
     provider: ProviderConfig,
     #[serde(default)]
     tools: Vec<ComponentConfig>,
-    /// Where sessions are saved. Without one, nothing is.
+    /// Required in service mode; validated when constructing the runtime.
     session_store: Option<ComponentConfig>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct ProviderConfig {
     model: String,
     #[serde(flatten)]
@@ -92,6 +94,8 @@ struct ProviderConfig {
 /// A sandboxed component with network access: a provider or a tool.
 #[derive(Clone, serde::Deserialize)]
 struct ComponentConfig {
+    #[serde(skip)]
+    resolved: bool,
     path: String,
     #[serde(default)]
     allowed_hosts: Vec<String>,
@@ -159,10 +163,6 @@ fn expand_env(template: &str) -> Result<String> {
 /// How often the engine's epoch advances; the precision of `timeout_secs`.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
-/// The epoch deadline of a store that has none: never reached, but small
-/// enough not to overflow when added to the current epoch.
-const NO_DEADLINE: u64 = u64::MAX / 2;
-
 /// The most of a tool's result (or error) passed on to the model, in bytes.
 /// Enforced here rather than in the tool, so a tool running untrusted code
 /// (like the python one) can't get around it to flood the model's context.
@@ -219,7 +219,11 @@ impl SandboxHooks {
                 return Err(context(&format!("host '{host}' is not in allowed_hosts")));
             }
             let name = http::HeaderName::try_from(name.as_str()).map_err(|e| context(&e))?;
-            let value = expand_env(&header.value).map_err(|e| context(&e))?;
+            let value = if config.resolved {
+                header.value.clone()
+            } else {
+                expand_env(&header.value).map_err(|e| context(&e))?
+            };
             let mut value = http::HeaderValue::try_from(value).map_err(|e| context(&e))?;
             value.set_sensitive(true);
             headers.push(InjectedHeader { name, value, hosts });
@@ -332,19 +336,18 @@ impl WasiHttpView for SandboxState {
 /// 0.2 and 0.3 versions) linked in and its outbound requests restricted to
 /// its own allow-list.
 fn load_sandboxed(
-    engine: &Engine,
+    runtime: &Runtime,
     config: &ComponentConfig,
 ) -> Result<(Component, Linker<SandboxState>, Store<SandboxState>)> {
-    let component = Component::from_file(engine, &config.path)
-        .map_err(|e| Error::msg(format!("loading component {}: {e}", config.path)))?;
+    let component = runtime.component(&config.path)?;
 
-    let mut linker = Linker::<SandboxState>::new(engine);
+    let mut linker = Linker::<SandboxState>::new(&runtime.engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
 
-    Ok((component, linker, sandbox_store(engine, config)?))
+    Ok((component, linker, sandbox_store(runtime, config)?))
 }
 
 /// The host directory `config` mounts as the component's `/`, if any, and
@@ -358,7 +361,11 @@ fn mounted_dir(config: &ComponentConfig) -> Result<Option<(String, FsPerms)>> {
         }
         return Ok(None);
     };
-    let dir = expand_env(dir).map_err(|e| context(&e))?;
+    let dir = if config.resolved {
+        dir.clone()
+    } else {
+        expand_env(dir).map_err(|e| context(&e))?
+    };
     if config.dir_writable {
         std::fs::create_dir_all(&dir).map_err(|e| context(&format!("creating {dir}: {e}")))?;
         return Ok(Some((dir, FsPerms::ReadWrite)));
@@ -387,7 +394,7 @@ fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
 
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
-fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
+fn sandbox_store(runtime: &Runtime, config: &ComponentConfig) -> Result<Store<SandboxState>> {
     let mut wasi = WasiCtx::builder();
     if let Some((dir, perms)) = mounted_dir(config)? {
         wasi.preopened_dir(&dir, "/", perms)
@@ -406,14 +413,15 @@ fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<Sand
         hooks: SandboxHooks::new(config)?,
         limits: limits.build(),
     };
-    let mut store = Store::new(engine, state);
+    let mut store = Store::new(&runtime.engine, state);
     store.limiter(|s| &mut s.limits);
     // Only a tool call with a `timeout_secs` sets a real deadline.
-    store.set_epoch_deadline(NO_DEADLINE);
+    runtime.control_store(&mut store);
     Ok(store)
 }
 
 struct ToolHandle {
+    runtime: Runtime,
     description: ToolDescription,
     config: ComponentConfig,
     // For making a new instance on every call, if `fresh_per_call` is set.
@@ -433,7 +441,7 @@ impl ToolHandle {
     async fn call_uncapped(&mut self, input: &str) -> Result<String, String> {
         if self.config.fresh_per_call {
             let mut store =
-                sandbox_store(self.store.engine(), &self.config).map_err(|e| e.to_string())?;
+                sandbox_store(&self.runtime, &self.config).map_err(|e| e.to_string())?;
             self.instance = self
                 .pre
                 .instantiate_async(&mut store)
@@ -451,32 +459,28 @@ impl ToolHandle {
                 .map_err(|e| e.to_string())?;
         };
         let timed_out = || format!("timed out after {}s", timeout.as_secs());
-        // Two limits, as neither covers both cases alone: the epoch deadline
-        // interrupts code that's busy computing (which never gives the
-        // `tokio` timer a chance to fire), and the timer catches a call
-        // that's stuck waiting on the host, e.g. sleeping or on the network.
-        self.store
-            .set_epoch_deadline(timeout.as_millis() as u64 / EPOCH_TICK.as_millis() as u64);
+        // Every store yields at each epoch, even for CPU-bound guest code.
+        // Keep that cadence independent of this tool's timeout so shorter
+        // run deadlines and cancellation can always be polled by Tokio.
         let call = self
             .instance
             .local_agent_tool_api()
             .call_call(&mut self.store, input);
         match tokio::time::timeout(timeout, call).await {
             Err(_) => Err(timed_out()),
-            Ok(Err(e)) if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) => Err(timed_out()),
             Ok(result) => result.map_err(|e| e.to_string())?,
         }
     }
 }
 
 async fn load_tools(
-    engine: &Engine,
+    runtime: &Runtime,
     configs: &[ComponentConfig],
 ) -> Result<HashMap<String, ToolHandle>> {
     let mut tools = HashMap::new();
 
     for config in configs {
-        let (component, linker, mut store) = load_sandboxed(engine, config)?;
+        let (component, linker, mut store) = load_sandboxed(runtime, config)?;
         let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
         let instance = pre.instantiate_async(&mut store).await?;
         let mut description = instance
@@ -490,6 +494,7 @@ async fn load_tools(
         tools.insert(
             description.name.clone(),
             ToolHandle {
+                runtime: runtime.clone(),
                 description,
                 config: config.clone(),
                 pre,
@@ -508,8 +513,8 @@ struct ProviderHandle {
     store: Store<SandboxState>,
 }
 
-async fn load_provider(engine: &Engine, config: &ProviderConfig) -> Result<ProviderHandle> {
-    let (component, linker, mut store) = load_sandboxed(engine, &config.component)?;
+async fn load_provider(runtime: &Runtime, config: &ProviderConfig) -> Result<ProviderHandle> {
+    let (component, linker, mut store) = load_sandboxed(runtime, &config.component)?;
     let instance =
         provider_guest::ProviderGuest::instantiate_async(&mut store, &component, &linker).await?;
     Ok(ProviderHandle {
@@ -524,12 +529,10 @@ struct SessionHandle {
     id: String,
     instance: session_store_guest::SessionStoreGuest,
     store: Store<SandboxState>,
-    /// Whether anything has been saved yet this run.
-    saved: bool,
 }
 
-async fn load_session_store(engine: &Engine, config: &ComponentConfig) -> Result<SessionHandle> {
-    let (component, linker, mut store) = load_sandboxed(engine, config)?;
+async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Result<SessionHandle> {
+    let (component, linker, mut store) = load_sandboxed(runtime, config)?;
     let instance =
         session_store_guest::SessionStoreGuest::instantiate_async(&mut store, &component, &linker)
             .await?;
@@ -537,7 +540,6 @@ async fn load_session_store(engine: &Engine, config: &ComponentConfig) -> Result
         id: String::new(),
         instance,
         store,
-        saved: false,
     })
 }
 
@@ -559,29 +561,6 @@ fn validate_session_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A fresh session's id: when it started, in UTC, e.g. `20261017-081500`.
-fn new_session_id(now: SystemTime) -> String {
-    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let (days, time) = (secs / 86_400, secs % 86_400);
-    // Days since 1970-01-01 to a civil date, from Howard Hinnant's
-    // `civil_from_days`.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60
-    )
-}
-
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
@@ -590,11 +569,35 @@ struct HostState {
     provider: Arc<Mutex<ProviderHandle>>,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
-    session: Option<SessionHandle>,
+    session: SessionHandle,
+    events: EventSink,
+    provider_tasks: Vec<tokio::task::AbortHandle>,
 }
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
     definitions.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+}
+
+impl Drop for HostState {
+    fn drop(&mut self) {
+        for task in &self.provider_tasks {
+            task.abort();
+        }
+    }
+}
+
+impl run_events::Host for HostState {
+    fn emit(&mut self, value: run_events::Event) {
+        let value = match value {
+            run_events::Event::Text(text) => serde_json::json!({"kind":"text", "text":text}),
+            run_events::Event::Usage(u) => {
+                serde_json::json!({"kind":"usage", "reasoning_tokens":u.reasoning_tokens,
+                "max_tokens":u.max_tokens, "prompt_tokens":u.prompt_tokens,
+                "cache_read_tokens":u.cache_read_tokens, "cache_creation_tokens":u.cache_creation_tokens})
+            }
+        };
+        (self.events)(value);
+    }
 }
 
 impl WasiView for HostState {
@@ -608,19 +611,25 @@ impl WasiView for HostState {
 
 impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
-        self.tools
-            .get_mut(&name)
-            .ok_or_else(|| format!("no such tool: {name}"))?
-            .call(&input)
-            .await
+        (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
+        let start = std::time::Instant::now();
+        let result = match self.tools.get_mut(&name) {
+            Some(tool) => tool.call(&input).await,
+            None => Err(format!("no such tool: {name}")),
+        };
+        // The error is what the model sees as the tool result, so it is no more private than the session.
+        (self.events)(
+            serde_json::json!({"kind":"tool_finished", "name":name, "ok":result.is_ok(),
+            "elapsed_ms":start.elapsed().as_millis() as u64,
+            "bytes":result.as_ref().map_or(0, String::len), "error":result.as_ref().err()}),
+        );
+        result
     }
 }
 
 impl session::Host for HostState {
     async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
-        let Some(handle) = &mut self.session else {
-            return Ok(None);
-        };
+        let handle = &mut self.session;
         handle
             .instance
             .local_agent_session_store()
@@ -630,16 +639,13 @@ impl session::Host for HostState {
     }
 
     async fn save(&mut self, messages: Vec<Message>) -> Result<(), String> {
-        let Some(handle) = &mut self.session else {
-            return Ok(());
-        };
+        let handle = &mut self.session;
         handle
             .instance
             .local_agent_session_store()
             .call_save(&mut handle.store, &handle.id, &messages)
             .await
             .map_err(|trap| format!("session store trapped: {trap}"))??;
-        handle.saved = true;
         Ok(())
     }
 }
@@ -658,11 +664,12 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
 
         let (text_tx, text_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = oneshot::channel();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let response = run_provider(&provider, tools, request, text_tx).await;
             let _ = response_tx.send(response);
         });
 
+        accessor.with(|mut store| store.get().provider_tasks.push(task.abort_handle()));
         accessor.with(|mut store| ChatStream {
             text: StreamReader::new(&mut store, ChannelProducer(text_rx))
                 .expect("concurrency support is enabled"),
@@ -796,154 +803,252 @@ impl<T: Lift + Send + Sync + 'static, D> FutureConsumer<D> for OneshotConsumer<T
     }
 }
 
-const USAGE: &str = "usage: host [CONFIG] [--session ID | --sessions]";
-
-struct Args {
-    config: String,
-    /// Resume (or start) this session rather than a fresh one.
-    session: Option<String>,
-    /// List saved sessions instead of running the agent.
-    list_sessions: bool,
+/// Native service runtime. Compiled code is shared; execution stores are not.
+#[derive(Clone)]
+pub struct Runtime {
+    engine: Engine,
+    config: Arc<RunnerConfig>,
+    components: Arc<HashMap<String, Component>>,
+    cancelled: Arc<AtomicBool>,
+    _ticker: Arc<EpochTicker>,
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args> {
-    let mut config = None;
-    let mut session = None;
-    let mut list_sessions = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--session" => {
-                let id = args
-                    .next()
-                    .ok_or_else(|| Error::msg(format!("--session needs an id\n{USAGE}")))?;
-                validate_session_id(&id)?;
-                session = Some(id);
+struct EpochTicker(Arc<AtomicBool>);
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
+impl Runtime {
+    pub fn new(path: &str) -> Result<Self> {
+        let config = load_config(path)?;
+        if config.session_store.is_none() {
+            bail!("daemon mode requires a [session_store]");
+        }
+        Self::from_config(config)
+    }
+
+    fn from_config(mut config: RunnerConfig) -> Result<Self> {
+        // Resolve credentials once; runs use the daemon's startup configuration.
+        for component in std::iter::once(&mut config.provider.component)
+            .chain(config.tools.iter_mut())
+            .chain(config.session_store.iter_mut())
+        {
+            for header in component.headers.values_mut() {
+                header.value = expand_env(&header.value)?;
             }
-            "--sessions" => list_sessions = true,
-            flag if flag.starts_with("--") => bail!("unknown option {flag}\n{USAGE}"),
-            _ if config.is_none() => config = Some(arg),
-            _ => bail!("unexpected argument {arg}\n{USAGE}"),
+            if let Some(dir) = &mut component.dir {
+                *dir = expand_env(dir)?;
+            }
+            component.resolved = true;
+            SandboxHooks::new(component)?;
+        }
+        let mut options = Config::new();
+        options
+            .wasm_component_model(true)
+            .wasm_component_model_async(true)
+            .epoch_interruption(true);
+        options.cache(Some(Cache::from_file(None)?));
+        let engine = Engine::new(&options)?;
+        let mut components = HashMap::new();
+        let paths = std::iter::once(&config.agent)
+            .chain(std::iter::once(&config.provider.component.path))
+            .chain(config.tools.iter().map(|tool| &tool.path))
+            .chain(config.session_store.iter().map(|store| &store.path));
+        for path in paths {
+            components.insert(path.clone(), Component::from_file(&engine, path)?);
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let ticker = engine.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
+            }
+        });
+        Ok(Self {
+            engine,
+            config: Arc::new(config),
+            components: Arc::new(components),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            _ticker: Arc::new(EpochTicker(stopped)),
+        })
+    }
+
+    pub fn execution(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
         }
     }
-    if session.is_some() && list_sessions {
-        bail!("--session and --sessions can't be used together\n{USAGE}");
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
-    Ok(Args {
-        config: config.unwrap_or_else(|| "runner.toml".to_string()),
-        session,
-        list_sessions,
-    })
+
+    fn component(&self, path: &str) -> Result<Component> {
+        self.components
+            .get(path)
+            .cloned()
+            .ok_or_else(|| Error::msg("component not preloaded"))
+    }
+
+    fn control_store<T: Send + 'static>(&self, store: &mut Store<T>) {
+        let cancelled = self.cancelled.clone();
+        store.epoch_deadline_callback(move |_| {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("run cancelled");
+            }
+            Ok(wasmtime::UpdateDeadline::Yield(1))
+        });
+        store.set_epoch_deadline(1);
+    }
+
+    pub async fn run_turn(&self, session_id: &str, prompt: &str, events: EventSink) -> Result<()> {
+        validate_session_id(session_id)?;
+        let config = &self.config;
+        let provider = load_provider(self, &config.provider).await?;
+        let tools = load_tools(self, &config.tools).await?;
+        let mut definitions: Vec<_> = tools
+            .values()
+            .map(|tool| ToolDefinition {
+                name: tool.description.name.clone(),
+                description: tool.description.description.clone(),
+                input_schema_json: tool.description.input_schema_json.clone(),
+            })
+            .collect();
+        sort_tool_definitions(&mut definitions);
+        let mut session = load_session_store(
+            self,
+            config
+                .session_store
+                .as_ref()
+                .ok_or_else(|| Error::msg("session store required"))?,
+        )
+        .await?;
+        session.id = session_id.to_string();
+        let mut linker = Linker::<HostState>::new(&self.engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        let diagnostics = Diagnostics::new(events.clone());
+        // No inherited terminal, environment, filesystem or network for the agent.
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                wasi: WasiCtx::builder()
+                    .stdout(diagnostics.stdout.clone())
+                    .stderr(diagnostics.stderr.clone())
+                    .build(),
+                table: ResourceTable::new(),
+                provider: Arc::new(Mutex::new(provider)),
+                tools,
+                tool_definitions: definitions,
+                session,
+                events,
+                provider_tasks: Vec::new(),
+            },
+        );
+        self.control_store(&mut store);
+        let guest =
+            ChatGuest::instantiate_async(&mut store, &self.component(&config.agent)?, &linker)
+                .await?;
+        let prompt = prompt.to_string();
+        store
+            .run_concurrent(async |accessor| {
+                guest
+                    .local_agent_agent_api()
+                    .call_run_turn(accessor, prompt)
+                    .await
+            })
+            .await??
+            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = parse_args(env::args().skip(1))?;
-    let config = load_config(&args.config)?;
-
-    let mut wasm_config = Config::new();
-    wasm_config.wasm_component_model(true);
-    wasm_config.wasm_component_model_async(true);
-    wasm_config.epoch_interruption(true);
-    // Compiled components are cached on disk, so a big one (like the
-    // Python interpreter) is only compiled once, not on every start.
-    wasm_config.cache(Some(Cache::from_file(None)?));
-    let engine = Engine::new(&wasm_config)?;
-
-    // Drives `timeout_secs`: every store's epoch advances once per tick,
-    // and a tool call past its deadline is interrupted.
-    let ticker = engine.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(EPOCH_TICK);
-            ticker.increment_epoch();
-        }
-    });
-
-    let mut session = match &config.session_store {
-        Some(store_config) => Some(load_session_store(&engine, store_config).await?),
-        None if args.session.is_some() || args.list_sessions => {
-            bail!("sessions need a [session_store] in {}", args.config)
-        }
-        None => None,
-    };
-
-    if args.list_sessions {
-        let handle = session.as_mut().expect("checked above");
-        let ids = handle
-            .instance
-            .local_agent_session_store()
-            .call_ids(&mut handle.store)
-            .await?
-            .map_err(Error::msg)?;
-        for id in ids {
-            println!("{id}");
-        }
-        return Ok(());
-    }
-    if let Some(handle) = &mut session {
-        handle.id = args
-            .session
-            .clone()
-            .unwrap_or_else(|| new_session_id(SystemTime::now()));
-    }
-
-    let provider = load_provider(&engine, &config.provider).await?;
-    let tools = load_tools(&engine, &config.tools).await?;
-    let mut tool_definitions: Vec<_> = tools
-        .values()
-        .map(|t| ToolDefinition {
-            name: t.description.name.clone(),
-            description: t.description.description.clone(),
-            input_schema_json: t.description.input_schema_json.clone(),
+/// Strips configured credentials out of a message headed for run storage
+/// and the user, in case a server reflected one back in an error.
+fn redact(config: &RunnerConfig, message: &str) -> String {
+    let mut secrets: Vec<&str> = std::iter::once(&config.provider.component)
+        .chain(&config.tools)
+        .chain(&config.session_store)
+        .flat_map(|component| component.headers.values())
+        // The whole value, and its parts, e.g. the token in "Bearer <token>".
+        .flat_map(|header| {
+            std::iter::once(header.value.as_str()).chain(header.value.split_whitespace())
         })
+        .filter(|secret| secret.len() >= 8)
         .collect();
-    sort_tool_definitions(&mut tool_definitions);
-
-    let component = Component::from_file(&engine, &config.agent)
-        .map_err(|e| Error::msg(format!("loading guest component at {}: {e}", config.agent)))?;
-
-    let mut linker = Linker::<HostState>::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    // Only the 0.3 clocks, for the async timer behind the agent's
-    // "Thinking…" indicator; nothing else of WASI 0.3 is needed.
-    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
-    chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-    session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-
-    let wasi = WasiCtx::builder()
-        .inherit_stdio()
-        // Deliberately NOT .inherit_env() -- the guest gets zero ambient
-        // env vars, so it has no path to the API key.
-        .build();
-
-    let mut store = Store::new(
-        &engine,
-        HostState {
-            wasi,
-            table: ResourceTable::new(),
-            provider: Arc::new(Mutex::new(provider)),
-            tool_definitions,
-            tools,
-            session,
-        },
-    );
-    store.set_epoch_deadline(NO_DEADLINE);
-
-    // The agent exports the async WASI 0.3 `wasi:cli/run`, which is run
-    // inside the store's event loop so its streaming `chat` calls work.
-    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
-    let result = store
-        .run_concurrent(async |accessor| command.wasi_cli_run().call_run(accessor).await)
-        .await??;
-    if let Some(handle) = &store.data().session
-        && handle.saved
-    {
-        eprintln!("session saved; resume with --session {}", handle.id);
+    // Longest first, so a value is redacted whole before any part of it.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let mut message = message.to_string();
+    for secret in secrets {
+        message = message.replace(secret, "[redacted]");
     }
-    if result.is_err() {
-        bail!("guest exited with a non-zero result");
+    if message.chars().count() > MAX_ERROR_CHARS {
+        message = message
+            .chars()
+            .take(MAX_ERROR_CHARS - 1)
+            .collect::<String>()
+            + "…";
     }
-    Ok(())
+    message
+}
+
+/// Longest turn error kept; API error bodies can be whole HTML pages.
+const MAX_ERROR_CHARS: usize = 500;
+
+/// A turn the agent gave up on, with a message written for the user (e.g.
+/// "API error 401: invalid x-api-key"). Credentials are already redacted.
+/// Any other `run_turn` error is internal and may contain secrets.
+#[derive(Debug)]
+pub struct TurnFailed(pub String);
+
+impl std::fmt::Display for TurnFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TurnFailed {}
+
+// Bounded diagnostic capture; dropped after execution stores on every exit path.
+struct Diagnostics {
+    stdout: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
+    stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
+    events: EventSink,
+}
+
+impl Diagnostics {
+    fn new(events: EventSink) -> Self {
+        Self {
+            stdout: wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64 * 1024),
+            stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64 * 1024),
+            events,
+        }
+    }
+}
+impl Drop for Diagnostics {
+    fn drop(&mut self) {
+        for (source, pipe) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            let bytes = pipe.contents();
+            if !bytes.is_empty() {
+                (self.events)(
+                    serde_json::json!({"kind":"diagnostic", "source":source, "text":String::from_utf8_lossy(&bytes)}),
+                );
+            }
+        }
+    }
+}
+
+pub fn check_session_id(id: &str) -> Result<()> {
+    validate_session_id(id)
 }
 
 #[cfg(test)]
@@ -965,6 +1070,38 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
             .collect()
+    }
+
+    #[test]
+    fn turn_errors_redact_configured_credentials() {
+        let config: RunnerConfig = toml::from_str(
+            r#"
+            agent = "agent.wasm"
+            [provider]
+            path = "provider.wasm"
+            model = "m"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = { value = "Bearer sk-live-12345", hosts = ["api.example.com"] } }
+            [[tools]]
+            path = "tool.wasm"
+            allowed_hosts = ["tool.example.com"]
+            headers = { x-key = { value = "tool-key-abcdef", hosts = ["tool.example.com"] }, x-client = { value = "runner", hosts = ["tool.example.com"] } }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            redact(&config, "API error 401: bad header 'Bearer sk-live-12345'"),
+            "API error 401: bad header '[redacted]'"
+        );
+        assert_eq!(
+            redact(&config, "token sk-live-12345 and tool-key-abcdef rejected"),
+            "token [redacted] and [redacted] rejected"
+        );
+        // Short values like "runner" would mangle ordinary words.
+        assert_eq!(redact(&config, "runner failed"), "runner failed");
+        let long = redact(&config, &"x".repeat(2000));
+        assert_eq!(long.chars().count(), MAX_ERROR_CHARS);
+        assert!(long.ends_with('…'));
     }
 
     const CONFIG: &str = r#"
@@ -1037,15 +1174,6 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_utc_start_time() {
-        let t = |secs| new_session_id(UNIX_EPOCH + std::time::Duration::from_secs(secs));
-        assert_eq!(t(0), "19700101-000000");
-        // 2024 is a leap year.
-        assert_eq!(t(1_709_208_000), "20240229-120000");
-        assert_eq!(t(1_792_224_000 + 29_745), "20261017-161545");
-    }
-
-    #[test]
     fn session_ids_are_validated() {
         assert!(validate_session_id("20261017-081500").is_ok());
         assert!(validate_session_id("trip_plans.v2").is_ok());
@@ -1059,34 +1187,6 @@ mod tests {
         ] {
             assert!(validate_session_id(bad).is_err(), "{bad:?} was accepted");
         }
-    }
-
-    fn args(list: &[&str]) -> Result<Args> {
-        parse_args(list.iter().map(|s| s.to_string()))
-    }
-
-    #[test]
-    fn args_parse() {
-        let a = args(&[]).unwrap();
-        assert_eq!(
-            (a.config.as_str(), a.session, a.list_sessions),
-            ("runner.toml", None, false)
-        );
-        let a = args(&["my.toml", "--session", "work"]).unwrap();
-        assert_eq!(
-            (a.config.as_str(), a.session.as_deref()),
-            ("my.toml", Some("work"))
-        );
-        assert!(args(&["--sessions"]).unwrap().list_sessions);
-    }
-
-    #[test]
-    fn bad_args_are_rejected() {
-        assert!(args(&["--session"]).is_err());
-        assert!(args(&["--session", "../x"]).is_err());
-        assert!(args(&["--session", "a", "--sessions"]).is_err());
-        assert!(args(&["--verbose"]).is_err());
-        assert!(args(&["a.toml", "b.toml"]).is_err());
     }
 
     #[test]
