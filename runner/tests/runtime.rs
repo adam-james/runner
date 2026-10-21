@@ -86,16 +86,46 @@ max_model_calls = 1
         Self { dir, config }
     }
 
-    /// With conversations kept in the fixture's database, as the daemon does.
-    async fn runtime(&self) -> host::Runtime {
-        let db = Database::open(&self.dir.path().join("state.sqlite3")).unwrap();
-        self.runtime_with(Arc::new(db)).await
+    async fn runtime(&self) -> TestRuntime {
+        TestRuntime {
+            host: host::Runtime::new(self.config.to_str().unwrap())
+                .await
+                .unwrap(),
+            transcripts: Arc::default(),
+        }
+    }
+}
+
+/// The runtime, keeping each session's transcript between turns in memory
+/// the way the service keeps it in SQLite. Clones share both.
+#[derive(Clone)]
+struct TestRuntime {
+    host: host::Runtime,
+    transcripts: Arc<Mutex<std::collections::HashMap<String, String>>>,
+}
+
+impl TestRuntime {
+    async fn run_turn(
+        &self,
+        agent: &str,
+        session: &str,
+        prompt: &str,
+        events: host::EventSink,
+    ) -> anyhow::Result<()> {
+        let transcript = self.transcripts.lock().unwrap().get(session).cloned();
+        let transcript = self
+            .host
+            .run_turn(agent, session, transcript.as_deref(), prompt, events)
+            .await?;
+        self.transcripts
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), transcript);
+        Ok(())
     }
 
-    async fn runtime_with(&self, transcripts: Arc<dyn host::Transcripts>) -> host::Runtime {
-        host::Runtime::new(self.config.to_str().unwrap(), transcripts)
-            .await
-            .unwrap()
+    fn agents(&self) -> Vec<host::AgentInfo> {
+        self.host.agents()
     }
 }
 
@@ -127,14 +157,13 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         .collect();
     assert_eq!(output, "turn 1: helloturn 2: againturn 1: separate");
     assert!(events.lock().unwrap().iter().any(|e| e["kind"] == "usage"));
-    assert_eq!(
-        events
+    // Saving is the service's job, committed with the run's completion.
+    assert!(
+        !events
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| e["kind"] == "turn_saved")
-            .count(),
-        3
+            .any(|e| e["kind"] == "turn_saved")
     );
     events.lock().unwrap().clear();
     runtime
@@ -276,7 +305,7 @@ async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs()
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(runtime)),
+        Arc::new(WasmExecutor(runtime.host)),
         2,
         stop.clone(),
     ));
@@ -648,7 +677,7 @@ async fn failed_turns_explain_why_without_leaking_credentials() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(fixture.runtime().await)),
+        Arc::new(WasmExecutor(fixture.runtime().await.host)),
         1,
         stop.clone(),
     ));
@@ -684,7 +713,7 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(fixture.runtime().await)),
+        Arc::new(WasmExecutor(fixture.runtime().await.host)),
         1,
         stop.clone(),
     ));
@@ -701,59 +730,68 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
-async fn a_failed_session_save_does_not_report_a_saved_turn() {
-    /// A store whose saves fail with an error that mustn't reach the user.
-    struct FailingSaves;
-
-    impl host::Transcripts for FailingSaves {
-        fn load(&self, _: &str) -> host::BoxFuture<Result<Option<String>, String>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn save(&self, _: &str, _: String) -> host::BoxFuture<Result<(), String>> {
-            Box::pin(async { Err("disk I/O error at /private/path".into()) })
-        }
-    }
-
+async fn an_unreadable_transcript_fails_the_turn_without_details() {
     let fixture = Fixture::new();
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
     let error = fixture
-        .runtime_with(Arc::new(FailingSaves))
+        .runtime()
         .await
-        .run_turn("default", "unsaved", "hello", sink)
+        .host
+        .run_turn(
+            "default",
+            "corrupt",
+            Some("not a transcript"),
+            "hello",
+            sink,
+        )
         .await
         .unwrap_err();
     assert_eq!(
         error
             .downcast_ref::<host::TurnFailed>()
             .map(|e| e.0.as_str()),
-        Some("could not save this turn"),
+        Some("could not load this session's history"),
         "{error:#}"
     );
-    let events = events.lock().unwrap();
-    assert!(events.iter().any(|event| event["kind"] == "text"));
-    assert!(!events.iter().any(|event| event["kind"] == "turn_saved"));
+    // Given up before the model was called.
+    assert!(events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn conversations_are_kept_in_the_service_database() {
     let fixture = Fixture::new();
-    let runtime = fixture.runtime().await;
-    assert_eq!(
-        turn_output(&runtime, "kept", "hello").await,
-        "turn 1: hello"
-    );
-    // A new runtime, as after a daemon restart, picks the conversation up again.
-    drop(runtime);
-    let runtime = fixture.runtime().await;
-    assert_eq!(
-        turn_output(&runtime, "kept", "again").await,
-        "turn 2: again"
-    );
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
-    let transcript: Value = serde_json::from_str(&db.transcript("kept").unwrap().unwrap()).unwrap();
+    let session = db.create_session(Some("kept".into())).unwrap().id;
+    let text = |run: &str| -> String {
+        db.events(run, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.data["text"].as_str().map(str::to_string))
+            .collect()
+    };
+    for (prompt, reply) in [("hello", "turn 1: hello"), ("again", "turn 2: again")] {
+        // A new runtime each turn, as after a daemon restart: the history
+        // comes from the database, not from memory.
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(worker(
+            db.clone(),
+            Arc::new(WasmExecutor(fixture.runtime().await.host)),
+            1,
+            stop.clone(),
+        ));
+        let run = db
+            .submit(Some(session.clone()), "default".into(), prompt.into(), 5)
+            .unwrap();
+        wait(&db, &run.id, "completed").await;
+        assert_eq!(text(&run.id), reply);
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+    let transcript: Value =
+        serde_json::from_str(&db.transcript(&session).unwrap().unwrap()).unwrap();
     assert_eq!(transcript.as_array().unwrap().len(), 4);
     assert_eq!(
         transcript[2],
@@ -762,7 +800,7 @@ async fn conversations_are_kept_in_the_service_database() {
     assert_eq!(db.transcript("never-used").unwrap(), None);
 }
 
-async fn turn_output(runtime: &host::Runtime, session: &str, prompt: &str) -> String {
+async fn turn_output(runtime: &TestRuntime, session: &str, prompt: &str) -> String {
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
@@ -1318,7 +1356,7 @@ async fn configured_specialists_delegate_in_parallel_and_nested_at_concurrency_o
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(runtime)),
+        Arc::new(WasmExecutor(runtime.host.clone())),
         1,
         stop.clone(),
     ));
@@ -1389,7 +1427,7 @@ async fn guest_requested_delegation_cannot_bypass_host_permissions_or_service_co
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(runtime.clone())),
+        Arc::new(WasmExecutor(runtime.host.clone())),
         1,
         stop.clone(),
     ));
@@ -1472,7 +1510,7 @@ async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(runtime)),
+        Arc::new(WasmExecutor(runtime.host.clone())),
         1,
         stop.clone(),
     ));

@@ -2,8 +2,6 @@ mod activity;
 pub mod delegation;
 mod transcript;
 
-pub use transcript::{BoxFuture, Transcripts};
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
@@ -743,24 +741,24 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 pub const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 impl SessionComponents {
-    /// Runs one turn to completion: loads the session, calls the model and
-    /// the tools it asks for until it finishes, then saves the session. An
-    /// error is why the turn was given up, written for the user.
+    /// Runs one turn to completion on `history`: calls the model and the
+    /// tools it asks for until it finishes, and returns the conversation with
+    /// the turn added. An error is why the turn was given up, written for the
+    /// user.
     async fn turn(
         &mut self,
         definition: &AgentDefinition,
-        transcript: &Transcript<'_>,
+        mut history: Vec<Message>,
         prompt: String,
         events: &EventSink,
         delegation: Option<&dyn delegation::Delegation>,
         targets: &[String],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Message>, String> {
         let system = definition
             .system_prompt
             .as_deref()
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let max_tokens = definition.max_tokens;
-        let mut history = transcript.load().await?;
         history.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text(prompt)],
@@ -828,7 +826,7 @@ impl SessionComponents {
                 content: tool_results,
             });
         }
-        transcript.save(&history, events).await
+        Ok(history)
     }
 
     /// One model request, its text emitted as `text` events as it streams in.
@@ -898,61 +896,24 @@ impl SessionComponents {
     }
 }
 
-/// One session's transcript, for a turn to load and save.
-struct Transcript<'a> {
-    store: &'a dyn Transcripts,
-    session: &'a str,
-}
-
-impl Transcript<'_> {
-    /// The session's conversation so far; empty for a new session.
-    #[tracing::instrument(name = "transcript", skip_all, fields(operation = "load"))]
-    async fn load(&self) -> Result<Vec<Message>, String> {
-        let guard = activity::Activity::new(tracing::Span::current(), "transcript");
-        let result = match self.store.load(self.session).await {
-            Ok(None) => Ok(Vec::new()),
-            Ok(Some(text)) => transcript::decode(&text).map_err(|e| e.to_string()),
-            Err(error) => Err(error),
-        };
-        guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
-        result.map_err(|error| {
-            tracing::warn!(%error, "could not load transcript");
-            "could not load this session's history".to_string()
-        })
-    }
-
-    #[tracing::instrument(name = "transcript", skip_all, fields(operation = "save"))]
-    async fn save(&self, messages: &[Message], events: &EventSink) -> Result<(), String> {
-        let guard = activity::Activity::new(tracing::Span::current(), "transcript");
-        let text = transcript::encode(messages);
-        let bytes = text.len();
-        let result = self.store.save(self.session, text).await;
-        guard.finish(if result.is_ok() { "ok" } else { "error" }, bytes, None);
-        result.map_err(|error| {
-            tracing::warn!(%error, "could not save transcript");
-            "could not save this turn".to_string()
-        })?;
-        // Reported before the turn returns: once the transcript is saved, the
-        // run completes even if cancellation or a deadline wins afterwards.
-        let output = messages
+/// Extracts a completed turn's final assistant text for supervised delegation.
+pub fn turn_output(transcript: &str) -> Result<String, serde_json::Error> {
+    let messages = transcript::decode(transcript)?;
+    Ok(cap_tool_output(
+        messages
             .last()
-            .map(|message| {
-                message
-                    .content
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .map(|m| {
+                m.content
                     .iter()
-                    .filter_map(|block| {
-                        if let ContentBlock::Text(text) = block {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.as_str()),
+                        _ => None,
                     })
                     .collect::<String>()
             })
-            .unwrap_or_default();
-        events(serde_json::json!({"kind":"turn_saved", "output":cap_tool_output(output)}));
-        Ok(())
-    }
+            .unwrap_or_default(),
+    ))
 }
 
 /// A model error as the user sees it.
@@ -1096,7 +1057,6 @@ pub struct Runtime {
     components: Arc<HashMap<String, Component>>,
     _ticker: Arc<EpochTicker>,
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionSlot>>>,
-    transcripts: Arc<dyn Transcripts>,
 }
 
 /// A session's retained components, and the agent definition they were built for.
@@ -1114,12 +1074,12 @@ pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
 impl Runtime {
     /// Loads every component and resolves named tools directly from the
-    /// config. Conversations are loaded from and saved to `transcripts`.
-    pub async fn new(path: &str, transcripts: Arc<dyn Transcripts>) -> Result<Self> {
-        Self::from_config(load_config(path)?, transcripts).await
+    /// config.
+    pub async fn new(path: &str) -> Result<Self> {
+        Self::from_config(load_config(path)?).await
     }
 
-    async fn from_config(config: RunnerConfig, transcripts: Arc<dyn Transcripts>) -> Result<Self> {
+    async fn from_config(config: RunnerConfig) -> Result<Self> {
         let agents = resolve_agents(&config)?;
         for component in sandboxed_components(&config) {
             SandboxHooks::new(component)?;
@@ -1156,7 +1116,6 @@ impl Runtime {
             components: Arc::new(components),
             _ticker: Arc::new(EpochTicker(stopped)),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            transcripts,
         };
         Ok(runtime)
     }
@@ -1203,14 +1162,21 @@ impl Runtime {
         self.sessions.lock().unwrap().remove(session);
     }
 
+    /// Runs one turn of `session_id` with `agent`, continuing the
+    /// conversation in `transcript` (from an earlier turn's return value;
+    /// `None` for a new session). Returns the transcript with this turn
+    /// added, for the caller to keep: nothing is saved here, so a turn that
+    /// fails, is cancelled or never returns leaves the conversation as it was.
+    #[tracing::instrument(name = "turn", skip_all, fields(agent = ?agent, session = ?session_id))]
     pub async fn run_turn(
         &self,
         agent: &str,
         session_id: &str,
+        transcript: Option<&str>,
         prompt: &str,
         events: EventSink,
-    ) -> Result<()> {
-        self.run_turn_with_delegation(agent, session_id, prompt, events, None)
+    ) -> Result<String> {
+        self.run_turn_with_delegation(agent, session_id, transcript, prompt, events, None)
             .await
     }
 
@@ -1219,15 +1185,25 @@ impl Runtime {
         &self,
         agent: &str,
         session_id: &str,
+        transcript: Option<&str>,
         prompt: &str,
         events: EventSink,
         delegation: Option<Arc<dyn delegation::Delegation>>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         validate_session_id(session_id)?;
         let definition = self
             .agents
             .get(agent)
             .ok_or_else(|| Error::msg(format!("unknown agent '{agent}'")))?;
+        let history = match transcript {
+            None => Vec::new(),
+            Some(text) => transcript::decode(text).map_err(|error| {
+                tracing::warn!(%error, "could not decode transcript");
+                Error::new(TurnFailed(
+                    "could not load this session's history".to_string(),
+                ))
+            })?,
+        };
         let session = self
             .sessions
             .lock()
@@ -1245,14 +1221,10 @@ impl Runtime {
             Some((cached_agent, components)) if cached_agent == agent => components,
             _ => self.load_session(definition).await?,
         };
-        let transcript = Transcript {
-            store: &*self.transcripts,
-            session: session_id,
-        };
         let result = components
             .turn(
                 definition,
-                &transcript,
+                history,
                 prompt.to_string(),
                 &events,
                 delegation.as_deref(),
@@ -1260,7 +1232,9 @@ impl Runtime {
             )
             .await;
         *cached = Some((agent.to_string(), components));
-        result.map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
+        result
+            .map(|history| transcript::encode(&history))
+            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
     }
 
     async fn load_session(&self, definition: &AgentDefinition) -> Result<SessionComponents> {
@@ -1545,13 +1519,7 @@ mod tests {
                  [agents.default]\nprovider = \"p\""
             ))
             .unwrap();
-            format!(
-                "{:#}",
-                Runtime::from_config(config, Arc::new(NoTranscripts))
-                    .await
-                    .err()
-                    .unwrap()
-            )
+            format!("{:#}", Runtime::from_config(config).await.err().unwrap())
         };
 
         let missing = env::temp_dir().join(format!("runner-missing-{}.wasm", std::process::id()));
@@ -1912,18 +1880,6 @@ mod tests {
             redact(&config, "bad key other-secret-key"),
             "bad key [redacted]"
         );
-    }
-
-    /// For tests that never get as far as a turn.
-    struct NoTranscripts;
-
-    impl Transcripts for NoTranscripts {
-        fn load(&self, _: &str) -> BoxFuture<Result<Option<String>, String>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn save(&self, _: &str, _: String) -> BoxFuture<Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[test]

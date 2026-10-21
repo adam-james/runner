@@ -115,10 +115,11 @@ metadata includes allowed `delegates` and the host tool names.
 
 SQLite schema version 3 adds relationships, deadlines, and private saved results
 automatically. Existing runs become roots; older binaries reject the upgraded
-database. Final answers are stored separately from replay events. Activity logs
+database. Final answers are stored separately from replay events in the same transaction
+as the transcript and run completion. Activity logs
 record metadata, not delegation prompts or child answers.
 
-Delegation is a service capability. Standalone `host::Runtime::run_turn` retains
-its existing interface; a delegation call without service context returns an
+Delegation is a service capability. Standalone `host::Runtime::run_turn` returns
+the completed transcript for its caller to commit; a delegation call without service context returns an
 explicit unavailable error. Dynamic definitions and per-task overrides remain
 on the TODO list.

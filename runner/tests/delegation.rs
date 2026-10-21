@@ -20,6 +20,10 @@ fn database() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
+fn answer(text: &str) -> String {
+    json!([{"role":"Assistant", "content":[{"Text":text}]}]).to_string()
+}
+
 fn root(db: &Database) -> Run {
     db.submit(None, "worker".into(), "task".into(), 30).unwrap();
     db.claim().unwrap().unwrap()
@@ -45,12 +49,7 @@ fn child_relationships_ownership_final_results_and_cancellation_are_durable() {
         json!({"kind":"text","text":"intermediate commentary"}),
     )
     .unwrap();
-    db.event(
-        &first.id,
-        json!({"kind":"turn_saved","output":"final answer"}),
-    )
-    .unwrap();
-    db.finish(&first.id, "completed", None).unwrap();
+    db.complete(&first.id, &answer("final answer")).unwrap();
     let result = db.child_result(&parent.id, &first.id).unwrap().unwrap();
     assert_eq!(result["output"], "final answer");
     assert_eq!(
@@ -71,18 +70,45 @@ fn child_relationships_ownership_final_results_and_cancellation_are_durable() {
 }
 
 #[test]
+fn child_answer_and_transcript_commit_atomically_with_completion() {
+    let (dir, db) = database();
+    let parent = root(&db);
+    let child = db.delegate(&parent.id, "worker", "task", None).unwrap();
+    db.claim().unwrap().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_result BEFORE INSERT ON run_results
+        BEGIN SELECT RAISE(ABORT, 'injected result failure'); END;",
+    )
+    .unwrap();
+    assert!(db.complete(&child.id, &answer("final")).is_err());
+    assert_eq!(db.run(&child.id).unwrap().unwrap().status, "running");
+    assert!(db.transcript(&child.session_id).unwrap().is_none());
+    assert!(db.child_result(&parent.id, &child.id).unwrap().is_none());
+    assert!(
+        !db.events(&child.id, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.data["kind"] == "turn_saved")
+    );
+    conn.execute_batch("DROP TRIGGER reject_result;").unwrap();
+    db.complete(&child.id, &answer("final")).unwrap();
+    assert!(db.transcript(&child.session_id).unwrap().is_some());
+    assert_eq!(
+        db.child_result(&parent.id, &child.id).unwrap().unwrap()["output"],
+        "final"
+    );
+}
+
+#[test]
 fn limits_count_completed_children_and_results_remain_valid_bounded_json() {
     let (_dir, db) = database();
     let parent = root(&db);
     for _ in 0..16 {
         let child = db.delegate(&parent.id, "worker", "child", None).unwrap();
         db.claim().unwrap().unwrap();
-        db.event(
-            &child.id,
-            json!({"kind":"turn_saved","output":"\"\n😀".repeat(30000)}),
-        )
-        .unwrap();
-        db.finish(&child.id, "completed", None).unwrap();
+        db.complete(&child.id, &answer(&"\"\n😀".repeat(30000)))
+            .unwrap();
         let result = db.child_result(&parent.id, &child.id).unwrap().unwrap();
         assert!(result.to_string().len() <= 64 * 1024);
         assert_eq!(result["truncated"], true);
@@ -204,18 +230,20 @@ impl Executor for Probe {
     fn execute(
         &self,
         _: Run,
+        _: Option<String>,
         _: host::EventSink,
         _: CancellationToken,
-    ) -> BoxFuture<'static, Result<()>> {
+    ) -> BoxFuture<'static, Result<String>> {
         Box::pin(async { bail!("context required") })
     }
     fn execute_with_context(
         &self,
         run: Run,
-        events: host::EventSink,
+        _: Option<String>,
+        _events: host::EventSink,
         _: CancellationToken,
         context: Arc<ExecutionContext>,
-    ) -> BoxFuture<'static, Result<()>> {
+    ) -> BoxFuture<'static, Result<String>> {
         let active = self.active.clone();
         let peak = self.peak.clone();
         Box::pin(async move {
@@ -276,8 +304,7 @@ impl Executor for Probe {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 "leaf answer".into()
             };
-            events(json!({"kind":"turn_saved","output":output}));
-            Ok(())
+            Ok(answer(&output))
         })
     }
 }
