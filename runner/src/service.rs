@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse},
     routing::{get, post},
 };
-use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -97,7 +96,7 @@ impl LocalInstance {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let file = private_options().open(dir.join("daemon.lock"))?;
-        file.try_lock_exclusive()
+        file.try_lock()
             .context("a daemon is already using this data directory")?;
         Ok(Self {
             _lock: file,
