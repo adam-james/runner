@@ -76,6 +76,7 @@ enum Runs {
         id: String,
     },
 }
+
 #[derive(Subcommand)]
 enum Sessions {
     List,
