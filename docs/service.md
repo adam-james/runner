@@ -109,7 +109,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `POST /v1/sessions` | `{ "id": "optional-name" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
-| `GET /v1/runs` | List runs in submission order |
+| `GET /v1/runs` | List runs in submission order; optional `session_id` query parameter to list only that session's |
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |

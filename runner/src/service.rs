@@ -146,6 +146,12 @@ struct CreateSession {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RunFilter {
+    session_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cursor {
     after: Option<i64>,
 }
@@ -249,8 +255,15 @@ async fn create_session(
     ))
 }
 
-async fn list_runs(State(s): State<Service>) -> Result<Json<Vec<Run>>, ApiError> {
-    Ok(Json(s.db.blocking(|db| db.runs()).await.map_err(internal)?))
+async fn list_runs(
+    State(s): State<Service>,
+    Query(filter): Query<RunFilter>,
+) -> Result<Json<Vec<Run>>, ApiError> {
+    Ok(Json(
+        s.db.blocking(move |db| db.runs(filter.session_id.as_deref()))
+            .await
+            .map_err(internal)?,
+    ))
 }
 
 async fn submit(

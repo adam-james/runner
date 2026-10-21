@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use runner::{client::Client, service, ui};
+use runner::{
+    client::Client,
+    service,
+    ui::{self, Ui},
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
             deadline_secs,
         } => {
             let run = client.submit(session, agent, prompt, deadline_secs).await?;
-            eprintln!("session: {}", run.session_id);
+            ui::session(&run.session_id);
             if detach {
                 println!("{}", run.id);
             } else {
@@ -152,7 +156,7 @@ async fn main() -> Result<()> {
             }
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             loop {
-                ui::prompt();
+                ui::prompt(&session);
                 let line = tokio::select! { line = lines.next_line() => line?, _ = tokio::signal::ctrl_c() => break };
                 ui::end_input();
                 let Some(line) = line else {
@@ -179,7 +183,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Runs { command } => match command {
-            Runs::List => println!("{}", serde_json::to_string_pretty(&client.runs().await?)?),
+            Runs::List => println!(
+                "{}",
+                serde_json::to_string_pretty(&client.runs(None).await?)?
+            ),
             Runs::Inspect { id } => {
                 println!("{}", serde_json::to_string_pretty(&client.run(&id).await?)?)
             }
@@ -187,7 +194,10 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
-            Runs::Watch { id, after, json } => attach(&client, &id, after, json).await?,
+            Runs::Watch { id, after, json } => {
+                ui::session(&client.run(&id).await?.session_id);
+                attach(&client, &id, after, json).await?
+            }
         },
         Command::Agents {
             command: Agents::List,
@@ -206,22 +216,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Says where a picked-up session left off: its completed turns and last reply.
+/// Replays a picked-up session's conversation: each completed turn's prompt
+/// and output. Other turns weren't saved, so the model doesn't remember them.
 async fn resumed(client: &Client, session: &str) -> Result<()> {
     let turns: Vec<_> = client
-        .runs()
+        .runs(Some(session))
         .await?
         .into_iter()
-        .filter(|run| run.session_id == session && run.status == "completed")
+        .filter(|run| run.status == "completed")
         .collect();
-    let Some(last) = turns.last() else {
+    if turns.is_empty() {
         return Ok(());
-    };
-    let reply = client.reply(&last.id).await?;
-    ui::resumed(
-        turns.len(),
-        (!reply.trim().is_empty()).then_some(reply.as_str()),
-    );
+    }
+    ui::resumed(turns.len());
+    for turn in turns {
+        ui::past_prompt(session, &turn.prompt);
+        let mut ui = Ui::replay();
+        for event in client.events(&turn.id).await? {
+            ui.event(&event.data);
+        }
+        ui.finish();
+    }
     Ok(())
 }
 

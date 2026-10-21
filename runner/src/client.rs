@@ -94,8 +94,14 @@ impl Client {
         .await
     }
 
-    pub async fn runs(&self) -> Result<Vec<Run>> {
-        self.json(Method::GET, "/v1/runs", None).await
+    /// Runs in submission order, optionally only those of `session`.
+    pub async fn runs(&self, session: Option<&str>) -> Result<Vec<Run>> {
+        let path = match session {
+            // Session IDs are letters, digits, '.', '_' and '-', so need no escaping.
+            Some(session) => format!("/v1/runs?session_id={session}"),
+            None => "/v1/runs".to_string(),
+        };
+        self.json(Method::GET, &path, None).await
     }
 
     pub async fn run(&self, id: &str) -> Result<Run> {
@@ -108,23 +114,20 @@ impl Client {
             .await
     }
 
-    /// The model text of a finished run, read from its event replay.
-    pub async fn reply(&self, id: &str) -> Result<String> {
+    /// Every event of a finished run, read from its event replay. The replay
+    /// ends once a terminal run's events are all sent.
+    pub async fn events(&self, id: &str) -> Result<Vec<Event>> {
         let mut bytes = self
             .request(Method::GET, &format!("/v1/runs/{id}/events"), None)
             .await?
             .bytes_stream();
         let mut pending = Vec::new();
-        let mut text = String::new();
+        let mut events = Vec::new();
         while let Some(chunk) = bytes.next().await {
             pending.extend_from_slice(&chunk?);
-            for event in frames(&mut pending)? {
-                if event.data["kind"] == "text" {
-                    text.push_str(event.data["text"].as_str().unwrap_or_default());
-                }
-            }
+            events.extend(frames(&mut pending)?);
         }
-        Ok(text)
+        Ok(events)
     }
 
     pub async fn watch(&self, id: &str, mut after: i64, json_output: bool) -> Result<()> {

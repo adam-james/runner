@@ -295,7 +295,7 @@ async fn connect(data: &std::path::Path) -> Client {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Ok(client) = Client::connect(data)
-                && client.runs().await.is_ok()
+                && client.runs(None).await.is_ok()
             {
                 break client;
             }
@@ -359,6 +359,75 @@ async fn daemon_cli_and_crash_recovery_work_end_to_end() {
     );
     client.watch(&queued.id, 0, false).await.unwrap();
     assert_eq!(client.run(&id).await.unwrap().status, "completed");
+}
+
+/// `runner chat` with `input` piped in, so its output is plain text.
+fn chat(data: &std::path::Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(data)
+        .arg("chat")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn reconnecting_to_a_chat_replays_its_saved_turns() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    connect(&data).await;
+    let first = chat(
+        &data,
+        &["--session", "trip"],
+        "hello\ntool:probe\nfail\nagain\n",
+    );
+    // Piped input isn't echoed, so the live prompts are bare.
+    assert!(
+        first.contains("trip > ") && first.contains("turn 1: hello"),
+        "{first}"
+    );
+    let resumed = chat(&data, &["--session", "trip"], "");
+    let history = resumed
+        .split_once("resumed session · 3 earlier turns\n")
+        .unwrap_or_else(|| panic!("{resumed}"))
+        .1;
+    // Every saved turn in order, each prompt led by the session; no live timings.
+    let hello = history.find("trip > hello\nturn 1: hello").unwrap();
+    let probe = history.find("trip > tool:probe\n").unwrap();
+    let tool = history.find("⚙ fixture(probe) ✓").unwrap();
+    let again = history.find("trip > again\nturn 3: again").unwrap();
+    assert!(hello < probe && probe < tool && tool < again, "{history}");
+    // The failed turn was never saved, so the model doesn't remember it either.
+    assert!(!history.contains("fail"), "{history}");
+    assert!(!history.contains("Thought for"), "{history}");
+    // Generated session IDs are shortened at the prompt, but whole in the banner.
+    let fresh = chat(&data, &[], "hi\n");
+    let id = fresh
+        .split(" · session ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(id.len(), 36, "{fresh}");
+    let short = format!("\n{}…{} > ", &id[..4], &id[32..]);
+    assert!(fresh.contains(&short), "{fresh}");
 }
 
 #[tokio::test]

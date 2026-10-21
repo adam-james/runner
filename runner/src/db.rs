@@ -294,13 +294,15 @@ impl Database {
             .optional()?)
     }
 
-    pub fn runs(&self) -> Result<Vec<Run>> {
+    /// Runs in submission order, optionally only those of one session.
+    pub fn runs(&self, session_id: Option<&str>) -> Result<Vec<Run>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {RUN_COLUMNS} FROM runs ORDER BY created_at, rowid"
+            "SELECT {RUN_COLUMNS} FROM runs WHERE ?1 IS NULL OR session_id=?1
+            ORDER BY created_at, rowid"
         ))?;
         Ok(stmt
-            .query_map([], read_run)?
+            .query_map([session_id], read_run)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
