@@ -6,6 +6,7 @@
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
 - can the agent implementation just be native?
 - can we get rid of the session store since that's in sqlite now
+- add TUI
 - agent to agent communication
 - memory
 - component registry
@@ -22,6 +23,7 @@
   - cover tool execution, allowed and denied network/filesystem access, capability violations, and guest traps or resource-limit termination
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
+- add an agent that can audit security
 
 ## Service foundation
 
