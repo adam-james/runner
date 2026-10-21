@@ -111,6 +111,7 @@ impl Harness {
                     provider: "openai".into(),
                     model: "gpt-5".into(),
                     tools: vec!["web_search".into()],
+                    delegates: vec![],
                     max_tokens: host::DEFAULT_MAX_TOKENS,
                     max_model_calls: None,
                 })
@@ -226,7 +227,7 @@ async fn runs_execute_the_agent_definition_they_name() {
         agents,
         json!(
             ["default", "researcher"].map(|name| json!({"name":name, "provider":"openai",
-            "model":"gpt-5", "tools":["web_search"], "max_tokens":16384,
+            "model":"gpt-5", "tools":["web_search"], "max_tokens":16384,"delegates":[],
             "max_model_calls":null}))
         )
     );
@@ -491,8 +492,17 @@ fn a_version_1_database_gains_transcripts_and_keeps_its_runs() {
         .unwrap();
     // What a daemon from before transcripts moved into SQLite left behind.
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE transcripts; PRAGMA user_version=1;")
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE transcripts;
+        DROP TABLE run_results;
+        DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
+        ALTER TABLE runs DROP COLUMN parent_run_id;
+        ALTER TABLE runs DROP COLUMN root_run_id;
+        ALTER TABLE runs DROP COLUMN depth;
+        ALTER TABLE runs DROP COLUMN deadline_at;
+        PRAGMA user_version=1;",
+    )
+    .unwrap();
     drop(conn);
     let db = Database::open(&path).unwrap();
     assert_eq!(db.run(&run.id).unwrap().unwrap().prompt, "before upgrade");

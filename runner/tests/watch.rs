@@ -38,6 +38,10 @@ async fn watcher_reconnects_from_its_cursor_and_ignores_duplicate_events() {
                         deadline_secs: 30,
                         cancel_requested: false,
                         error: None,
+                        parent_run_id: None,
+                        root_run_id: "fixture".into(),
+                        depth: 0,
+                        deadline_at: None,
                     })
                 }
             }),

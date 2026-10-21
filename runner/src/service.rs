@@ -24,6 +24,8 @@ use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Database, Run};
+use crate::delegation::ExecutionContext;
+use tokio::sync::Semaphore;
 
 pub trait Executor: Send + Sync + 'static {
     /// Runs `run`'s turn on `transcript`, its session's conversation so far,
@@ -35,6 +37,29 @@ pub trait Executor: Send + Sync + 'static {
         events: host::EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<String>>;
+
+    fn execute_with_context(
+        &self,
+        run: Run,
+        transcript: Option<String>,
+        events: host::EventSink,
+        cancel: CancellationToken,
+        _context: Arc<ExecutionContext>,
+    ) -> BoxFuture<'static, Result<String>> {
+        self.execute(run, transcript, events, cancel)
+    }
+}
+
+struct ChildSession {
+    runtime: host::Runtime,
+    session: Option<String>,
+}
+impl Drop for ChildSession {
+    fn drop(&mut self) {
+        if let Some(session) = &self.session {
+            self.runtime.forget_session(session);
+        }
+    }
 }
 
 pub struct WasmExecutor(pub host::Runtime);
@@ -52,6 +77,27 @@ impl Executor for WasmExecutor {
             // Dropping the losing branch's future stops the guest at its next epoch yield.
             tokio::select! {
                 result = runtime.run_turn(&run.agent, &run.session_id, transcript.as_deref(), &run.prompt, events) => result.map_err(Into::into),
+                _ = cancel.cancelled() => bail!("run cancelled"),
+            }
+        })
+    }
+
+    fn execute_with_context(
+        &self,
+        run: Run,
+        transcript: Option<String>,
+        events: host::EventSink,
+        cancel: CancellationToken,
+        context: Arc<ExecutionContext>,
+    ) -> BoxFuture<'static, Result<String>> {
+        let runtime = self.0.clone();
+        Box::pin(async move {
+            let _session = ChildSession {
+                runtime: runtime.clone(),
+                session: run.parent_run_id.as_ref().map(|_| run.session_id.clone()),
+            };
+            tokio::select! {
+                result = runtime.run_turn_with_delegation(&run.agent, &run.session_id, transcript.as_deref(), &run.prompt, events, Some(context)) => result.map_err(Into::into),
                 _ = cancel.cancelled() => bail!("run cancelled"),
             }
         })
@@ -438,6 +484,7 @@ async fn execute(
     run: Run,
     executor: Arc<dyn Executor>,
     shutdown: CancellationToken,
+    context: Arc<ExecutionContext>,
 ) -> Result<()> {
     let transcript = db
         .blocking({
@@ -487,22 +534,31 @@ async fn execute(
     tracing::info!("run started");
     let cancel = CancellationToken::new();
     let requested = db.cancellation(&run.id);
+    let _execution_lease = context.clone();
     let execution_run = run.clone();
     let execution_cancel = cancel.clone();
     // Contain executor panics here so queued events drain before the terminal status.
     let mut future = Box::pin(
         std::panic::AssertUnwindSafe(async move {
             executor
-                .execute(execution_run, transcript, sink, execution_cancel)
+                .execute_with_context(execution_run, transcript, sink, execution_cancel, context)
                 .await
         })
         .catch_unwind(),
     );
-    let deadline = tokio::time::sleep(Duration::from_secs(run.deadline_secs));
+    let remaining_ms = run
+        .deadline_at
+        .unwrap_or_else(|| crate::db::now() + run.deadline_secs as i64 * 1000)
+        .saturating_sub(crate::db::now())
+        .max(0) as u64;
+    let deadline = tokio::time::sleep(Duration::from_millis(remaining_ms));
     tokio::pin!(deadline);
-    // The finished turn's transcript, saved only together with the run's completion.
     let mut transcript = None;
-    let (status, error): (&str, Option<String>) = {
+    let (status, error): (&str, Option<String>) = if remaining_ms == 0 {
+        ("failed", Some("run deadline exceeded".into()))
+    } else if requested.is_cancelled() {
+        ("cancelled", None)
+    } else {
         tokio::select! {
             biased;
             // A turn that has finished wins over cancel, deadline and shutdown.
@@ -560,6 +616,8 @@ pub async fn worker(
     if concurrency == 0 {
         bail!("concurrency must be positive");
     }
+    let capacity = Arc::new(Semaphore::new(concurrency));
+    let mut trees = HashMap::<String, String>::new();
     let mut jobs = JoinSet::new();
     let mut runs = HashMap::new();
     // Runs whose terminal status could not be written; each holds its session until it is.
@@ -574,8 +632,12 @@ pub async fn worker(
             }
             _ = tick.tick() => {
                 retry_unfinished(&db, &mut unfinished).await;
-                while jobs.len() < concurrency {
-                    let run = match db.blocking(|db| db.claim()).await {
+                trees.retain(|id, _| runs.values().any(|run| run == id) || unfinished.contains(id));
+                loop {
+                    let Ok(permit) = capacity.clone().try_acquire_owned() else { break; };
+                    let roots: std::collections::HashSet<_> = trees.values().collect();
+                    let allow_roots = roots.len() < concurrency;
+                    let run = match db.blocking(move |db| db.claim_for_worker(allow_roots)).await {
                         Ok(Some(run)) => run,
                         Ok(None) => break,
                         // Transient (e.g. SQLITE_BUSY); retry on the next tick.
@@ -585,8 +647,10 @@ pub async fn worker(
                         }
                     };
                     let id = run.id.clone();
+                    trees.insert(id.clone(), run.root_run_id.clone());
+                    let context = Arc::new(ExecutionContext::new(db.clone(), run.clone(), capacity.clone(), permit));
                     let span = tracing::info_span!("run", run = ?run.id, session = ?run.session_id, agent = ?run.agent);
-                    let job = jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone()).instrument(span));
+                    let job = jobs.spawn(execute(db.clone(), run, executor.clone(), shutdown.clone(), context).instrument(span));
                     runs.insert(job.id(), id);
                 }
             }

@@ -1,4 +1,5 @@
 mod activity;
+pub mod delegation;
 mod transcript;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -71,6 +72,8 @@ struct AgentConfig {
     /// Tools by their configured table keys. Omitted means none.
     #[serde(default)]
     tools: Vec<String>,
+    #[serde(default)]
+    delegates: Vec<String>,
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
@@ -88,6 +91,7 @@ struct AgentDefinition {
     provider_name: String,
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
+    delegates: Vec<String>,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_model_calls: Option<u32>,
@@ -110,6 +114,8 @@ pub struct AgentInfo {
     pub provider: String,
     pub model: String,
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub delegates: Vec<String>,
     pub max_tokens: u32,
     pub max_model_calls: Option<u32>,
 }
@@ -132,6 +138,9 @@ fn validate_table_key(kind: &str, name: &str) -> Result<()> {
 fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinition>> {
     for name in config.tools.keys() {
         validate_table_key("tool", name)?;
+        if matches!(name.as_str(), "delegate" | "wait") {
+            bail!("tool name '{name}' is reserved for host delegation");
+        }
     }
     for name in config.providers.keys() {
         validate_table_key("provider", name)?;
@@ -142,6 +151,11 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
     let mut agents = BTreeMap::new();
     for (name, agent) in &config.agents {
         validate_name("agent name", name)?;
+        for target in &agent.delegates {
+            if !config.agents.contains_key(target) {
+                bail!("agent '{name}': no delegation target named '{target}'");
+            }
+        }
         if agent.max_tokens == Some(0) || agent.max_model_calls == Some(0) {
             bail!("agent '{name}': `max_tokens` and `max_model_calls` must be at least 1");
         }
@@ -187,6 +201,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 provider_name: agent.provider.clone(),
                 provider,
                 tools,
+                delegates: agent.delegates.clone(),
                 system_prompt: agent.system_prompt.clone(),
                 max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 max_model_calls: agent.max_model_calls,
@@ -736,6 +751,8 @@ impl SessionComponents {
         mut history: Vec<Message>,
         prompt: String,
         events: &EventSink,
+        delegation: Option<&dyn delegation::Delegation>,
+        targets: &[String],
     ) -> Result<Vec<Message>, String> {
         let system = definition
             .system_prompt
@@ -759,7 +776,10 @@ impl SessionComponents {
                 max_tokens,
                 messages: history.clone(),
             };
-            let response = self.chat(request, events).await.map_err(|e| describe(&e))?;
+            let response = self
+                .chat(request, events, targets)
+                .await
+                .map_err(|e| describe(&e))?;
             events(serde_json::json!({"kind":"usage",
                 "reasoning_tokens":response.reasoning_tokens, "max_tokens":max_tokens,
                 "prompt_tokens":response.prompt_tokens,
@@ -780,7 +800,13 @@ impl SessionComponents {
             for block in &response.content {
                 if let ContentBlock::ToolUse(tool_use) = block {
                     let result = self
-                        .call_tool(&tool_use.name, &tool_use.input_json, events)
+                        .call_tool(
+                            &tool_use.name,
+                            &tool_use.input_json,
+                            events,
+                            delegation,
+                            targets,
+                        )
                         .await;
                     tool_results.push(ContentBlock::ToolResult(ToolResultBlock {
                         tool_use_id: tool_use.id.clone(),
@@ -808,14 +834,13 @@ impl SessionComponents {
         &mut self,
         request: ChatRequest,
         events: &EventSink,
+        targets: &[String],
     ) -> Result<ChatResponse, ChatError> {
         let (text_tx, mut text_rx) = mpsc::unbounded_channel();
-        let reply = run_provider(
-            &mut self.provider,
-            self.tool_definitions.clone(),
-            request,
-            text_tx,
-        );
+        let mut tools = self.tool_definitions.clone();
+        tools.extend(delegation::definitions(targets));
+        sort_tool_definitions(&mut tools);
+        let reply = run_provider(&mut self.provider, tools, request, text_tx);
         tokio::pin!(reply);
         let response = loop {
             tokio::select! {
@@ -836,6 +861,8 @@ impl SessionComponents {
         name: &str,
         input: &str,
         events: &EventSink,
+        delegation: Option<&dyn delegation::Delegation>,
+        targets: &[String],
     ) -> Result<String, String> {
         events(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
         let start = std::time::Instant::now();
@@ -844,6 +871,9 @@ impl SessionComponents {
             component = ?self.tools.get(name).map(|tool| &tool.config.path));
         let guard = activity::Activity::new(span.clone(), "tool");
         let result = async {
+            if matches!(name, "delegate" | "wait") {
+                return delegation::call(delegation, targets, name, input).await;
+            }
             match self.tools.get_mut(name) {
                 Some(tool) => tool.call(input).await,
                 None => Err(format!("no such tool: {name}")),
@@ -864,6 +894,26 @@ impl SessionComponents {
         );
         result
     }
+}
+
+/// Extracts a completed turn's final assistant text for supervised delegation.
+pub fn turn_output(transcript: &str) -> Result<String, serde_json::Error> {
+    let messages = transcript::decode(transcript)?;
+    Ok(cap_tool_output(
+        messages
+            .last()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_default(),
+    ))
 }
 
 /// A model error as the user sees it.
@@ -1074,13 +1124,21 @@ impl Runtime {
     pub fn agents(&self) -> Vec<AgentInfo> {
         self.agents
             .iter()
-            .map(|(name, definition)| AgentInfo {
-                name: name.clone(),
-                provider: definition.provider_name.clone(),
-                model: definition.model().to_string(),
-                tools: definition.tools.keys().cloned().collect(),
-                max_tokens: definition.max_tokens,
-                max_model_calls: definition.max_model_calls,
+            .map(|(name, definition)| {
+                let mut tools: Vec<_> = definition.tools.keys().cloned().collect();
+                if !definition.delegates.is_empty() {
+                    tools.extend(["delegate".into(), "wait".into()]);
+                    tools.sort();
+                }
+                AgentInfo {
+                    name: name.clone(),
+                    provider: definition.provider_name.clone(),
+                    model: definition.model().to_string(),
+                    tools,
+                    delegates: definition.delegates.clone(),
+                    max_tokens: definition.max_tokens,
+                    max_model_calls: definition.max_model_calls,
+                }
             })
             .collect()
     }
@@ -1099,6 +1157,11 @@ impl Runtime {
         store.set_epoch_deadline(1);
     }
 
+    /// Release retained component instances for an ephemeral delegated session.
+    pub fn forget_session(&self, session: &str) {
+        self.sessions.lock().unwrap().remove(session);
+    }
+
     /// Runs one turn of `session_id` with `agent`, continuing the
     /// conversation in `transcript` (from an earlier turn's return value;
     /// `None` for a new session). Returns the transcript with this turn
@@ -1112,6 +1175,20 @@ impl Runtime {
         transcript: Option<&str>,
         prompt: &str,
         events: EventSink,
+    ) -> Result<String> {
+        self.run_turn_with_delegation(agent, session_id, transcript, prompt, events, None)
+            .await
+    }
+
+    #[tracing::instrument(name = "turn", skip_all, fields(agent = ?agent, session = ?session_id))]
+    pub async fn run_turn_with_delegation(
+        &self,
+        agent: &str,
+        session_id: &str,
+        transcript: Option<&str>,
+        prompt: &str,
+        events: EventSink,
+        delegation: Option<Arc<dyn delegation::Delegation>>,
     ) -> Result<String> {
         validate_session_id(session_id)?;
         let definition = self
@@ -1145,7 +1222,14 @@ impl Runtime {
             _ => self.load_session(definition).await?,
         };
         let result = components
-            .turn(definition, history, prompt.to_string(), &events)
+            .turn(
+                definition,
+                history,
+                prompt.to_string(),
+                &events,
+                delegation.as_deref(),
+                &definition.delegates,
+            )
             .await;
         *cached = Some((agent.to_string(), components));
         result
@@ -1550,6 +1634,26 @@ mod tests {
     }
 
     #[test]
+    fn delegation_targets_and_reserved_tool_names_are_validated() {
+        let definitions = agents(
+            "[agents.default]\nprovider = \"main\"\ndelegates = [\"default\"]",
+            &["files", "docs"],
+        )
+        .unwrap();
+        assert_eq!(definitions["default"].delegates, ["default"]);
+        assert!(
+            agents(
+                "[agents.default]\nprovider = \"main\"\ndelegates = [\"missing\"]",
+                &["files", "docs"]
+            )
+            .is_err()
+        );
+        for name in ["delegate", "wait"] {
+            assert!(agents("[agents.default]\nprovider = \"main\"", &[name, "docs"]).is_err());
+        }
+    }
+
+    #[test]
     fn a_default_agent_must_be_declared() {
         let err = agents(
             "[agents.researcher]\nprovider = \"main\"",
@@ -1722,6 +1826,25 @@ mod tests {
         assert_eq!(agents["researcher"].max_model_calls, Some(20));
         assert_eq!(agents["default"].provider_name, "anthropic");
         assert_eq!(agents["default"].model(), "claude-sonnet-5");
+        assert!(agents["default"].delegates.is_empty());
+        assert_eq!(
+            agents["default"]
+                .tools
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["get_scores", "get_weather"]
+        );
+        assert!(agents["coordinator"].tools.is_empty());
+        assert_eq!(
+            agents["coordinator"].delegates,
+            ["weather_specialist", "sports_specialist"]
+        );
+        assert_eq!(
+            agents["research_coordinator"].delegates,
+            ["research_lead", "reader"]
+        );
+        assert_eq!(agents["research_lead"].delegates, ["researcher"]);
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]

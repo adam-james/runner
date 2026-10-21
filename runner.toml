@@ -104,3 +104,47 @@ max_model_calls = 20
 system_prompt = """
 You are a research assistant. Search the web before answering, prefer recent
 and primary sources, and end with the links you relied on."""
+
+# Delegation example 1: specialists with separate tools; the coordinator has
+# no direct tools. delegates grants host-provided delegate and wait.
+# Try: runner chat --agent coordinator
+# Prompt: "Get Boston's weather and the latest NFL scores, then summarize both."
+[agents.weather_specialist]
+provider = "openai"
+tools = ["get_weather"]
+system_prompt = "Use get_weather for weather questions. State location and forecast dates."
+
+[agents.sports_specialist]
+provider = "openai"
+tools = ["get_scores"]
+system_prompt = "Use get_scores for sports questions. State leagues and match dates."
+
+[agents.coordinator]
+provider = "anthropic"
+delegates = ["weather_specialist", "sports_specialist"]
+system_prompt = """
+Delegate weather and sports questions to their respective specialists. Pass all
+needed context in each task. Start independent tasks before waiting. Wait for
+every result you need, then combine the findings into one concise answer.
+Unfinished children are cancelled when you finish."""
+
+# Delegation example 2: nested research plus read-only local files.
+# Put notes in the configured read_file directory first; see docs/delegation.md.
+# Try: runner chat --agent research_coordinator
+# Prompt: "Read notes.txt and research its claims online. Cite the sources."
+[agents.research_lead]
+provider = "anthropic"
+delegates = ["researcher"]
+system_prompt = """
+Break the research task into focused questions for researcher. Pass needed
+context explicitly. Delegate independent questions before waiting for each
+result. Preserve source links and report disagreements or missing evidence."""
+
+[agents.research_coordinator]
+provider = "anthropic"
+delegates = ["research_lead", "reader"]
+system_prompt = """
+For tasks involving local files and external evidence, ask reader to extract the
+relevant file contents, then pass that context to research_lead. Wait for their
+results. Distinguish what the local notes say from externally verified facts,
+cite sources, and explain uncertainty. You have no direct file or network tools."""
