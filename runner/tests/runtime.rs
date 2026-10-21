@@ -393,3 +393,135 @@ async fn a_failed_session_save_does_not_report_a_saved_turn() {
     assert!(!events.iter().any(|event| event["kind"] == "turn_saved"));
     assert!(!fixture.dir.path().join("sessions/read-only.json").exists());
 }
+
+async fn turn_output(runtime: &host::Runtime, session: &str, prompt: &str) -> String {
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = events.clone();
+    let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+    runtime.run_turn(session, prompt, sink).await.unwrap();
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["text"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn component_state_survives_turns_and_runtime_clones_but_isolates_sessions() {
+    let fixture = Fixture::new();
+    let config = std::fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("fresh_per_call = true", "fresh_per_call = false");
+    std::fs::write(&fixture.config, config).unwrap();
+    let runtime = fixture.runtime();
+    assert_eq!(turn_output(&runtime, "tools", "tool:counter").await, "1");
+    assert_eq!(
+        turn_output(&runtime.clone(), "tools", "tool:counter").await,
+        "2"
+    );
+    assert_eq!(
+        turn_output(&runtime, "other-tools", "tool:counter").await,
+        "1"
+    );
+    assert_eq!(
+        turn_output(&runtime, "provider", "provider-counter").await,
+        "1"
+    );
+    assert_eq!(
+        turn_output(&runtime.clone(), "provider", "provider-counter").await,
+        "2"
+    );
+    assert_eq!(
+        turn_output(&runtime, "other-provider", "provider-counter").await,
+        "1"
+    );
+    // Application errors return normally from the component and preserve its state.
+    assert!(
+        runtime
+            .run_turn("tools", "api-error", Arc::new(|_| {}))
+            .await
+            .is_err()
+    );
+    assert_eq!(turn_output(&runtime, "tools", "tool:counter").await, "3");
+    assert!(
+        runtime
+            .run_turn("provider", "api-error", Arc::new(|_| {}))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        turn_output(&runtime, "provider", "provider-counter").await,
+        "4"
+    );
+    // The runtime itself serializes same-session callers, not just the queue worker.
+    let (a, b) = tokio::join!(
+        turn_output(&runtime, "tools", "tool:counter"),
+        turn_output(&runtime, "tools", "tool:counter"),
+    );
+    let mut outputs = [a, b];
+    outputs.sort();
+    assert_eq!(outputs, ["4", "5"]);
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn fresh_per_call_tools_still_reset_while_the_provider_is_reused() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime();
+    assert_eq!(turn_output(&runtime, "fresh", "tool:counter").await, "1");
+    assert_eq!(turn_output(&runtime, "fresh", "tool:counter").await, "1");
+    // Each tool turn makes two provider requests, all in the same provider instance.
+    assert_eq!(
+        turn_output(&runtime, "fresh", "provider-counter").await,
+        "5"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn interrupted_components_are_recreated_before_reuse() {
+    let fixture = Fixture::new();
+    let config = std::fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("fresh_per_call = true", "fresh_per_call = false");
+    std::fs::write(&fixture.config, config).unwrap();
+    let runtime = fixture.runtime();
+    assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "1");
+    assert!(
+        turn_output(&runtime, "recover", "tool:spin")
+            .await
+            .contains("timed out")
+    );
+    assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "1");
+    let trapped = turn_output(&runtime, "recover", "tool:trap").await;
+    assert!(trapped.starts_with("error:"), "{trapped}");
+    assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "1");
+    assert!(
+        runtime
+            .run_turn("recover", "provider-trap", Arc::new(|_| {}))
+            .await
+            .is_err()
+    );
+    // A provider trap resets that provider, preserving the unaffected tool.
+    assert_eq!(
+        turn_output(&runtime, "recover", "provider-counter").await,
+        "1"
+    );
+    assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "2");
+    // Dropping an in-flight turn discards its stores, including the busy provider.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.run_turn("recover", "wait", Arc::new(|_| {}))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        turn_output(&runtime, "recover", "provider-counter").await,
+        "1"
+    );
+    assert_eq!(turn_output(&runtime, "recover", "tool:counter").await, "1");
+}

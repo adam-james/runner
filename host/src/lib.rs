@@ -357,7 +357,7 @@ fn load_sandboxed(
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
 
-    Ok((component, linker, sandbox_store(runtime, config)?))
+    Ok((component, linker, sandbox_store(&runtime.engine, config)?))
 }
 
 /// The host directory `config` mounts as the component's `/`, if any, and
@@ -400,7 +400,7 @@ fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
 
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
-fn sandbox_store(runtime: &Runtime, config: &ComponentConfig) -> Result<Store<SandboxState>> {
+fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
     let mut wasi = WasiCtx::builder();
     if let Some((dir, perms)) = mounted_dir(config)? {
         wasi.preopened_dir(&dir, "/", perms)
@@ -419,15 +419,16 @@ fn sandbox_store(runtime: &Runtime, config: &ComponentConfig) -> Result<Store<Sa
         hooks: SandboxHooks::new(config)?,
         limits: limits.build(),
     };
-    let mut store = Store::new(&runtime.engine, state);
+    let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
     // Only a tool call with a `timeout_secs` sets a real deadline.
-    runtime.control_store(&mut store);
+    Runtime::control_store(&mut store);
     Ok(store)
 }
 
 struct ToolHandle {
-    runtime: Runtime,
+    engine: Engine,
+    healthy: bool,
     description: ToolDescription,
     config: ComponentConfig,
     // For making a new instance on every call, if `fresh_per_call` is set.
@@ -445,9 +446,8 @@ impl ToolHandle {
     }
 
     async fn call_uncapped(&mut self, input: &str) -> Result<String, String> {
-        if self.config.fresh_per_call {
-            let mut store =
-                sandbox_store(&self.runtime, &self.config).map_err(|e| e.to_string())?;
+        if self.config.fresh_per_call || !self.healthy {
+            let mut store = sandbox_store(&self.engine, &self.config).map_err(|e| e.to_string())?;
             self.instance = self
                 .pre
                 .instantiate_async(&mut store)
@@ -456,13 +456,15 @@ impl ToolHandle {
             self.store = store;
         }
 
+        self.healthy = false;
         let Some(timeout) = self.config.timeout_secs.map(Duration::from_secs) else {
-            return self
+            let result = self
                 .instance
                 .local_agent_tool_api()
                 .call_call(&mut self.store, input)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await;
+            self.healthy = result.is_ok();
+            return result.map_err(|e| e.to_string())?;
         };
         let timed_out = || format!("timed out after {}s", timeout.as_secs());
         // Every store yields at each epoch, even for CPU-bound guest code.
@@ -474,7 +476,10 @@ impl ToolHandle {
             .call_call(&mut self.store, input);
         match tokio::time::timeout(timeout, call).await {
             Err(_) => Err(timed_out()),
-            Ok(result) => result.map_err(|e| e.to_string())?,
+            Ok(result) => {
+                self.healthy = result.is_ok();
+                result.map_err(|e| e.to_string())?
+            }
         }
     }
 }
@@ -500,7 +505,8 @@ async fn load_tools(
         tools.insert(
             description.name.clone(),
             ToolHandle {
-                runtime: runtime.clone(),
+                engine: runtime.engine.clone(),
+                healthy: true,
                 description,
                 config: config.clone(),
                 pre,
@@ -514,6 +520,10 @@ async fn load_tools(
 }
 
 struct ProviderHandle {
+    engine: Engine,
+    config: ComponentConfig,
+    pre: provider_guest::ProviderGuestPre<SandboxState>,
+    healthy: bool,
     model: String,
     instance: provider_guest::ProviderGuest,
     store: Store<SandboxState>,
@@ -521,9 +531,13 @@ struct ProviderHandle {
 
 async fn load_provider(runtime: &Runtime, config: &ProviderConfig) -> Result<ProviderHandle> {
     let (component, linker, mut store) = load_sandboxed(runtime, &config.component)?;
-    let instance =
-        provider_guest::ProviderGuest::instantiate_async(&mut store, &component, &linker).await?;
+    let pre = provider_guest::ProviderGuestPre::new(linker.instantiate_pre(&component)?)?;
+    let instance = pre.instantiate_async(&mut store).await?;
     Ok(ProviderHandle {
+        engine: runtime.engine.clone(),
+        config: config.component.clone(),
+        pre,
+        healthy: true,
         model: config.model.clone(),
         instance,
         store,
@@ -531,6 +545,7 @@ async fn load_provider(runtime: &Runtime, config: &ProviderConfig) -> Result<Pro
 }
 
 struct SessionHandle {
+    healthy: bool,
     /// Which session this run loads and saves, picked by the host.
     id: String,
     instance: session_store_guest::SessionStoreGuest,
@@ -543,6 +558,7 @@ async fn load_session_store(runtime: &Runtime, config: &ComponentConfig) -> Resu
         session_store_guest::SessionStoreGuest::instantiate_async(&mut store, &component, &linker)
             .await?;
     Ok(SessionHandle {
+        healthy: true,
         id: String::new(),
         instance,
         store,
@@ -570,23 +586,29 @@ fn validate_session_id(id: &str) -> Result<()> {
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
-    // Shared with the task that runs each reply, which has to keep driving
-    // the provider's store while the agent's store reads what it produces.
+    components: SessionComponents,
+    events: EventSink,
+    provider_tasks: ProviderTasks,
+}
+
+struct SessionComponents {
+    // Shared with the task driving the provider while the agent reads its response.
     provider: Arc<Mutex<ProviderHandle>>,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
     session: SessionHandle,
-    events: EventSink,
-    provider_tasks: Vec<tokio::task::AbortHandle>,
 }
+
+#[derive(Default)]
+struct ProviderTasks(Vec<tokio::task::AbortHandle>);
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
     definitions.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 }
 
-impl Drop for HostState {
+impl Drop for ProviderTasks {
     fn drop(&mut self) {
-        for task in &self.provider_tasks {
+        for task in &self.0 {
             task.abort();
         }
     }
@@ -619,7 +641,7 @@ impl chat_api::Host for HostState {
     async fn call_tool(&mut self, name: String, input: String) -> Result<String, String> {
         (self.events)(serde_json::json!({"kind":"tool_started", "name":name, "input":input}));
         let start = std::time::Instant::now();
-        let result = match self.tools.get_mut(&name) {
+        let result = match self.components.tools.get_mut(&name) {
             Some(tool) => tool.call(&input).await,
             None => Err(format!("no such tool: {name}")),
         };
@@ -635,23 +657,27 @@ impl chat_api::Host for HostState {
 
 impl session::Host for HostState {
     async fn load(&mut self) -> Result<Option<Vec<Message>>, String> {
-        let handle = &mut self.session;
-        handle
+        let handle = &mut self.components.session;
+        handle.healthy = false;
+        let result = handle
             .instance
             .local_agent_session_store()
             .call_load(&mut handle.store, &handle.id)
-            .await
-            .map_err(|trap| format!("session store trapped: {trap}"))?
+            .await;
+        handle.healthy = result.is_ok();
+        result.map_err(|trap| format!("session store trapped: {trap}"))?
     }
 
     async fn save(&mut self, messages: Vec<Message>) -> Result<(), String> {
-        let handle = &mut self.session;
-        handle
+        let handle = &mut self.components.session;
+        handle.healthy = false;
+        let result = handle
             .instance
             .local_agent_session_store()
             .call_save(&mut handle.store, &handle.id, &messages)
-            .await
-            .map_err(|trap| format!("session store trapped: {trap}"))??;
+            .await;
+        handle.healthy = result.is_ok();
+        result.map_err(|trap| format!("session store trapped: {trap}"))??;
         // Report the agent's successful save before returning control to the guest.
         // Emitting from guest code after save would leave a cancellation window.
         (self.events)(serde_json::json!({"kind":"turn_saved"}));
@@ -668,7 +694,10 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
     async fn chat(accessor: &Accessor<U, Self>, request: ChatRequest) -> ChatStream {
         let (provider, tools) = accessor.with(|mut store| {
             let state = store.get();
-            (state.provider.clone(), state.tool_definitions.clone())
+            (
+                state.components.provider.clone(),
+                state.components.tool_definitions.clone(),
+            )
         });
 
         let (text_tx, text_rx) = mpsc::unbounded_channel();
@@ -678,7 +707,7 @@ impl<U> chat_api::HostWithStore<U> for HasSelf<HostState> {
             let _ = response_tx.send(response);
         });
 
-        accessor.with(|mut store| store.get().provider_tasks.push(task.abort_handle()));
+        accessor.with(|mut store| store.get().provider_tasks.0.push(task.abort_handle()));
         accessor.with(|mut store| ChatStream {
             text: StreamReader::new(&mut store, ChannelProducer(text_rx))
                 .expect("concurrency support is enabled"),
@@ -701,10 +730,24 @@ async fn run_provider(
     text_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ChatResponse, ChatError> {
     let mut provider = provider.lock().await;
+    if !provider.healthy {
+        let mut store = sandbox_store(&provider.engine, &provider.config)
+            .map_err(|e| ChatError::Internal(e.to_string()))?;
+        let instance = provider
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| ChatError::Internal(e.to_string()))?;
+        provider.store = store;
+        provider.instance = instance;
+    }
+    provider.healthy = false;
     let ProviderHandle {
         model,
         instance,
         store,
+        healthy,
+        ..
     } = &mut *provider;
     let (response_tx, response_rx) = oneshot::channel();
 
@@ -724,7 +767,10 @@ async fn run_provider(
         .await;
 
     match outcome {
-        Ok(Ok(Ok(response))) => response,
+        Ok(Ok(Ok(response))) => {
+            *healthy = true;
+            response
+        }
         Ok(Ok(Err(_))) => Err(ChatError::Internal(
             "provider dropped its response".to_string(),
         )),
@@ -812,14 +858,18 @@ impl<T: Lift + Send + Sync + 'static, D> FutureConsumer<D> for OneshotConsumer<T
     }
 }
 
-/// Native service runtime. Compiled code is shared; execution stores are not.
+/// Native service runtime. Compiled code is shared globally; component stores
+/// are retained per session and serialized across turns, including runtime clones.
 #[derive(Clone)]
 pub struct Runtime {
     engine: Engine,
     config: Arc<RunnerConfig>,
     components: Arc<HashMap<String, Component>>,
     _ticker: Arc<EpochTicker>,
+    sessions: Arc<std::sync::Mutex<HashMap<String, SessionSlot>>>,
 }
+
+type SessionSlot = Arc<Mutex<Option<SessionComponents>>>;
 
 struct EpochTicker(Arc<AtomicBool>);
 
@@ -878,6 +928,7 @@ impl Runtime {
             config: Arc::new(config),
             components: Arc::new(components),
             _ticker: Arc::new(EpochTicker(stopped)),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -890,13 +941,71 @@ impl Runtime {
 
     /// Yielding at each epoch lets Tokio poll timeouts and drop a cancelled
     /// run's future even while guest code is CPU-bound.
-    fn control_store<T: Send + 'static>(&self, store: &mut Store<T>) {
+    fn control_store<T: Send + 'static>(store: &mut Store<T>) {
         store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
         store.set_epoch_deadline(1);
     }
 
     pub async fn run_turn(&self, session_id: &str, prompt: &str, events: EventSink) -> Result<()> {
         validate_session_id(session_id)?;
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .entry(session_id.to_owned())
+            .or_default()
+            .clone();
+        let mut cached = session.lock().await;
+        // Taking the components out makes cancellation/panics discard interrupted
+        // stores automatically. A normally returned turn puts them back, even if
+        // the agent reports an application error (e.g. a rejected API request).
+        let components = match cached.take() {
+            Some(components) => components,
+            None => self.load_session(session_id).await?,
+        };
+        let config = &self.config;
+        let mut linker = Linker::<HostState>::new(&self.engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
+        let diagnostics = Diagnostics::new(events.clone());
+        // No inherited terminal, environment, filesystem or network for the agent.
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                wasi: WasiCtx::builder()
+                    .stdout(diagnostics.stdout.clone())
+                    .stderr(diagnostics.stderr.clone())
+                    .build(),
+                table: ResourceTable::new(),
+                components,
+                events,
+                provider_tasks: ProviderTasks::default(),
+            },
+        );
+        Self::control_store(&mut store);
+        let guest =
+            ChatGuest::instantiate_async(&mut store, &self.component(&config.agent)?, &linker)
+                .await?;
+        let prompt = prompt.to_string();
+        let result = store
+            .run_concurrent(async |accessor| {
+                guest
+                    .local_agent_agent_api()
+                    .call_run_turn(accessor, prompt)
+                    .await
+            })
+            .await??
+            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))));
+        let HostState { components, .. } = store.into_data();
+        if components.session.healthy {
+            *cached = Some(components);
+        }
+        result
+    }
+
+    async fn load_session(&self, session_id: &str) -> Result<SessionComponents> {
         let config = &self.config;
         let provider = load_provider(self, &config.provider).await?;
         let tools = load_tools(self, &config.tools).await?;
@@ -918,43 +1027,12 @@ impl Runtime {
         )
         .await?;
         session.id = session_id.to_string();
-        let mut linker = Linker::<HostState>::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        chat_api::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        session::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        run_events::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |s| s)?;
-        let diagnostics = Diagnostics::new(events.clone());
-        // No inherited terminal, environment, filesystem or network for the agent.
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                wasi: WasiCtx::builder()
-                    .stdout(diagnostics.stdout.clone())
-                    .stderr(diagnostics.stderr.clone())
-                    .build(),
-                table: ResourceTable::new(),
-                provider: Arc::new(Mutex::new(provider)),
-                tools,
-                tool_definitions: definitions,
-                session,
-                events,
-                provider_tasks: Vec::new(),
-            },
-        );
-        self.control_store(&mut store);
-        let guest =
-            ChatGuest::instantiate_async(&mut store, &self.component(&config.agent)?, &linker)
-                .await?;
-        let prompt = prompt.to_string();
-        store
-            .run_concurrent(async |accessor| {
-                guest
-                    .local_agent_agent_api()
-                    .call_run_turn(accessor, prompt)
-                    .await
-            })
-            .await??
-            .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
+        Ok(SessionComponents {
+            provider: Arc::new(Mutex::new(provider)),
+            tools,
+            tool_definitions: definitions,
+            session,
+        })
     }
 }
 

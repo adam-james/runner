@@ -351,11 +351,13 @@ fresh_per_call = true  # a new instance for every call
   model sees it. `app.py` cuts printed output shorter itself, but a script
   runs in the same interpreter and could undo that, so the host's cap is
   the one that holds.
-- `fresh_per_call` means one script can't leave anything behind for the
-  next one, and a call that was cut off can't break the tool, since an
-  instance that's been interrupted can't be used again. Starting an
-  instance is cheap: componentize-py snapshots the interpreter after
-  start-up.
+- With `fresh_per_call = false` (the default), Python variables and other tool
+  memory carry over between turns in the same session. Other sessions use
+  separate instances. This memory lasts until the daemon stops or that session's
+  execution is cancelled or traps; saved conversation history remains on disk.
+- `fresh_per_call = true` gives every script a new instance. Starting an instance
+  is cheap: componentize-py snapshots the interpreter after start-up. A tool that
+  times out or traps is recreated before its next call with either setting.
 
 Files, if you want them: give it a `dir`, and scripts can read what's in
 it (as `/`, so `open("data.csv")` works) but can't write, create, delete
