@@ -833,6 +833,8 @@ async fn session_responses_report_current_work_counts() {
             .await
             .unwrap();
         let session = sessions.iter().find(|s| s.id == "counts").unwrap();
+        assert_eq!(session.title.as_deref(), Some("wait"));
+        assert!(!session.delegated);
         (session.running_runs, session.queued_runs)
     };
     assert_eq!(counts().await, (1, 2));
@@ -844,6 +846,10 @@ async fn session_responses_report_current_work_counts() {
     h.db.cancel(&second.id).unwrap();
     h.wait_status(&second.id, "cancelled").await;
     assert_eq!(counts().await, (0, 0));
+    let sessions = h.db.sessions().unwrap();
+    let session = sessions.iter().find(|s| s.id == "counts").unwrap();
+    assert_eq!(session.last_status.as_deref(), Some("cancelled"));
+    assert!(session.updated_at >= third.created_at);
     let legacy: runner::db::Session =
         serde_json::from_value(json!({"id":"old", "created_at":0})).unwrap();
     assert_eq!((legacy.running_runs, legacy.queued_runs), (0, 0));

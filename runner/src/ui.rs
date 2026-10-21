@@ -338,16 +338,13 @@ pub fn goodbye(session: &str) {
 }
 
 /// Says how to get back to the session `tui` was showing, once it has quit.
-pub fn goodbye_tui(session: &str) {
+pub fn goodbye_tui(session: Option<&str>) {
     let tty = io::stdout().is_terminal();
-    println!(
-        "{}",
-        style(
-            tty,
-            DIM,
-            &format!("runs keep going · reopen with: runner tui --session {session}")
-        )
-    );
+    let line = match session {
+        Some(session) => format!("runs keep going · reopen with: runner tui --session {session}"),
+        None => "runs keep going · reopen with: runner tui".to_string(),
+    };
+    println!("{}", style(tty, DIM, &line));
 }
 
 /// The agent a `run` or `runs watch` is for and its session, then what the

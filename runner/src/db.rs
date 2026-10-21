@@ -17,7 +17,7 @@ struct Signals {
     cancellations: Mutex<HashMap<String, CancellationToken>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub created_at: i64,
@@ -25,6 +25,18 @@ pub struct Session {
     pub running_runs: u64,
     #[serde(default)]
     pub queued_runs: u64,
+    /// The first line of the session's first prompt.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// When the session, or its latest run, was created.
+    #[serde(default)]
+    pub updated_at: i64,
+    /// Its latest run's status.
+    #[serde(default)]
+    pub last_status: Option<String>,
+    /// Created for a delegated child run rather than by a client.
+    #[serde(default)]
+    pub delegated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +225,7 @@ impl Database {
                 run_id TEXT NOT NULL REFERENCES runs(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, id);
             CREATE INDEX IF NOT EXISTS queued_runs ON runs(status, created_at);
+            CREATE INDEX IF NOT EXISTS runs_by_session ON runs(session_id, created_at);
             -- Each session's conversation, as the host's turn loop encodes it. Not a
             -- foreign key: the runtime can be driven directly, without the queue.
             CREATE TABLE IF NOT EXISTS transcripts (session_id TEXT PRIMARY KEY,
@@ -247,11 +260,12 @@ impl Database {
     pub fn create_session(&self, id: Option<String>) -> Result<Session> {
         let id = id.unwrap_or_else(new_id);
         host::check_session_id(&id)?;
+        let created_at = now();
         let session = Session {
             id,
-            created_at: now(),
-            running_runs: 0,
-            queued_runs: 0,
+            created_at,
+            updated_at: created_at,
+            ..Session::default()
         };
         self.0.lock().unwrap().execute(
             "INSERT INTO sessions VALUES (?1, ?2)",
@@ -265,7 +279,13 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.created_at,
                 COUNT(CASE WHEN r.status='running' THEN 1 END),
-                COUNT(CASE WHEN r.status='queued' THEN 1 END)
+                COUNT(CASE WHEN r.status='queued' THEN 1 END),
+                (SELECT substr(prompt, 1, 200) FROM runs WHERE session_id=s.id
+                    ORDER BY created_at, rowid LIMIT 1),
+                max(s.created_at, COALESCE(MAX(r.created_at), 0)),
+                (SELECT status FROM runs WHERE session_id=s.id
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1),
+                EXISTS (SELECT 1 FROM runs WHERE session_id=s.id AND parent_run_id IS NOT NULL)
              FROM sessions s LEFT JOIN runs r ON r.session_id=s.id
              GROUP BY s.id ORDER BY s.created_at, s.rowid",
         )?;
@@ -276,6 +296,13 @@ impl Database {
                     created_at: row.get(1)?,
                     running_runs: row.get(2)?,
                     queued_runs: row.get(3)?,
+                    title: row.get::<_, Option<String>>(4)?.and_then(|prompt| {
+                        let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+                        Some(line.to_string())
+                    }),
+                    updated_at: row.get(5)?,
+                    last_status: row.get(6)?,
+                    delegated: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)

@@ -197,9 +197,14 @@ async fn main() -> Result<()> {
             let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
             let agents = client.agents().await?;
             known_agent(&agents, &agent)?;
-            let (session, _) = open_session(&client, session).await?;
+            // Without --session it starts on a new session, which its first
+            // prompt creates, so just looking leaves no empty sessions behind.
+            let session = match session {
+                Some(id) => Some(open_session(&client, Some(id)).await?.0),
+                None => None,
+            };
             let session = runner::tui::run(client, agents, agent, session, deadline_secs).await?;
-            ui::goodbye_tui(&session);
+            ui::goodbye_tui(session.as_deref());
         }
         Command::Runs { command } => match command {
             Runs::List => println!(
