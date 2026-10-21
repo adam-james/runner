@@ -96,17 +96,14 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
     runtime
-        .execution()
         .run_turn("conversation", "hello", sink.clone())
         .await
         .unwrap();
     runtime
-        .execution()
         .run_turn("conversation", "again", sink.clone())
         .await
         .unwrap();
     runtime
-        .execution()
         .run_turn("other", "separate", sink.clone())
         .await
         .unwrap();
@@ -119,11 +116,7 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
     assert_eq!(output, "turn 1: helloturn 2: againturn 1: separate");
     assert!(events.lock().unwrap().iter().any(|e| e["kind"] == "usage"));
     events.lock().unwrap().clear();
-    runtime
-        .execution()
-        .run_turn("probe", "tool:probe", sink)
-        .await
-        .unwrap();
+    runtime.run_turn("probe", "tool:probe", sink).await.unwrap();
     let events = events.lock().unwrap();
     let text: String = events.iter().filter_map(|e| e["text"].as_str()).collect();
     let probe: Value = serde_json::from_str(&text).unwrap();
