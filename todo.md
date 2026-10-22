@@ -4,6 +4,10 @@
 
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
 - agent to agent communication
+- a tool to write tools
+- dynamic tool config and permissioning
+- are there APIs for booking flights and other useful things like that?
+- should we build an encrypted store for API keys?
 - memory
 - component registry
 - OAuth/login
