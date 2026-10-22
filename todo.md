@@ -2,6 +2,7 @@
 
 ## Long term
 
+- move runner code to host
 - schedule tasks - see docs/service.md for one-off and recurring task semantics
 - agent to agent communication
 - a tool to write tools
