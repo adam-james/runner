@@ -1060,7 +1060,9 @@ impl SessionComponents {
             tool = ?activity::bounded_name(name),
             component = ?self.tools.get(name).map(|tool| &tool.config.path));
         let guard = activity::Activity::new(span.clone(), "tool");
-        let inspector = (name == wat::TOOL).then_some(self.inspector.clone()).flatten();
+        let inspector = (name == wat::TOOL)
+            .then_some(self.inspector.clone())
+            .flatten();
         let host_tool = matches!(name, "delegate" | "wait") || inspector.is_some();
         let component = match self.tools.get(name) {
             Some(tool) => tool.audit.id.clone(),
