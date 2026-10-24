@@ -31,6 +31,11 @@ fn default_data_dir() -> PathBuf {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect configured tools without starting the daemon.
+    Tools {
+        #[command(subcommand)]
+        command: Tools,
+    },
     /// Start the daemon in the foreground. Keep it running for detached jobs.
     Serve {
         #[arg(long, default_value = "runner.toml")]
@@ -83,6 +88,15 @@ enum Command {
     Agents {
         #[command(subcommand)]
         command: Agents,
+    },
+}
+
+#[derive(Subcommand)]
+enum Tools {
+    Inspect {
+        name: String,
+        #[arg(long, default_value = "runner.toml")]
+        config: String,
     },
 }
 
@@ -140,6 +154,16 @@ async fn main() -> Result<()> {
             .init();
         return service::serve(&config, &args.data_dir, concurrency).await;
     }
+    if let Command::Tools {
+        command: Tools::Inspect { name, config },
+    } = &args.command
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&host::inspect::tool(config, name)?)?
+        );
+        return Ok(());
+    }
     let client = Client::connect(&args.data_dir)?;
     // Register before printing headers. Retain this future so a signal arriving
     // during API requests or replay stays pending until the next exit point.
@@ -150,7 +174,7 @@ async fn main() -> Result<()> {
         _ = std::future::ready(()) => {},
     }
     match args.command {
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. } | Command::Tools { .. } => unreachable!(),
         Command::Run {
             prompt,
             session,

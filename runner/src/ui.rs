@@ -284,6 +284,9 @@ pub(crate) fn agent_details(agent: &host::AgentInfo) -> String {
     if let Some(calls) = agent.max_model_calls {
         details.push_str(&format!(" · max model calls {calls}"));
     }
+    for (component, capabilities) in &agent.capabilities {
+        details.push_str(&format!(" · {component} [{}]", capabilities.summary()));
+    }
     details
 }
 
@@ -621,6 +624,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5".into(),
             tools: vec!["get_scores".into(), "get_weather".into()],
+            capabilities: Default::default(),
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,

@@ -628,6 +628,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5".into(),
             tools: vec![],
+            capabilities: Default::default(),
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,

@@ -303,6 +303,36 @@ Two rules keep a header from going further than intended:
   header ... over plain http`), so a component can't send a credential in
   the clear.
 
+## Inspect capabilities before enabling tools
+
+API keys never enter the sandbox. The host resolves configured credentials
+and injects them into permitted outbound HTTPS requests. Guests receive no
+credential environment variables or configured header values.
+
+Inspect a configured tool without starting the daemon or supplying API keys:
+
+```bash
+runner tools inspect web_search --config runner.toml
+```
+
+The JSON report lists the component's WIT imports, configured allowed hosts,
+injected header names and their destination hosts, directory access, and resource
+limits. Header values are never included. Inspection compiles the component to
+read its interface but does not instantiate it or call guest code. Directory
+environment variables are expanded; header environment variables are not read.
+
+Imports show which interfaces a component requests; config shows the host grants.
+An HTTP import alone grants no network access, and socket imports do not grant
+socket permissions. Directory access is confined to the configured mount, with
+writes enabled only by `dir_writable`. An allowed host or directory can be
+configured even if the component does not import the corresponding interface.
+Inspection describes capabilities, not whether a tool's behavior is trustworthy.
+
+`runner agents list` includes these reports for each agent's provider and tools.
+Chat, run, and TUI banners summarize their network, filesystem, and injected
+header grants. Delegation targets are listed separately; inspect those agents'
+capabilities too when assessing what a delegating agent can do.
+
 ## Build and run
 
 From the repository root, build the CLI, all Rust components, and the Python

@@ -111,6 +111,7 @@ impl Harness {
                     provider: "openai".into(),
                     model: "gpt-5".into(),
                     tools: vec!["web_search".into()],
+                    capabilities: Default::default(),
                     delegates: vec![],
                     max_tokens: host::DEFAULT_MAX_TOKENS,
                     max_model_calls: None,
@@ -228,7 +229,7 @@ async fn runs_execute_the_agent_definition_they_name() {
         json!(
             ["default", "researcher"].map(|name| json!({"name":name, "provider":"openai",
             "model":"gpt-5", "tools":["web_search"], "max_tokens":16384,"delegates":[],
-            "max_model_calls":null}))
+            "capabilities":{}, "max_model_calls":null}))
         )
     );
     let run: Run = h

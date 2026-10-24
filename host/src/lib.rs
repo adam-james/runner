@@ -1,5 +1,6 @@
 mod activity;
 pub mod delegation;
+pub mod inspect;
 mod transcript;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -116,6 +117,8 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
     #[serde(default)]
     pub delegates: Vec<String>,
+    #[serde(default)]
+    pub capabilities: BTreeMap<String, inspect::Capabilities>,
     pub max_tokens: u32,
     pub max_model_calls: Option<u32>,
 }
@@ -1136,6 +1139,27 @@ impl Runtime {
                     model: definition.model().to_string(),
                     tools,
                     delegates: definition.delegates.clone(),
+                    capabilities: std::iter::once((
+                        format!("provider:{}", definition.provider_name),
+                        &definition.provider.component,
+                    ))
+                    .chain(
+                        definition
+                            .tools
+                            .iter()
+                            .map(|(name, config)| (format!("tool:{name}"), config)),
+                    )
+                    .map(|(name, config)| {
+                        (
+                            name,
+                            inspect::Capabilities::new(
+                                &self.engine,
+                                &self.components[&config.path],
+                                config,
+                            ),
+                        )
+                    })
+                    .collect(),
                     max_tokens: definition.max_tokens,
                     max_model_calls: definition.max_model_calls,
                 }
