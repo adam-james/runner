@@ -86,6 +86,7 @@ fn describe(component: &ComponentConfig, kind: Kind, name: &str, detail: Detail)
     let bytes = std::fs::read(&component.path)
         .map_err(|e| Error::msg(format!("reading component {}: {e}", component.path)))?;
     let mut out = capabilities(component, kind, name, bytes.len());
+    out.push_str(&enforcement(component, kind, &imports(&bytes)?));
     match detail {
         Detail::Full => out.push_str(
             &wasmprinter::print_bytes(&bytes)
@@ -128,17 +129,117 @@ fn capabilities(component: &ComponentConfig, kind: Kind, name: &str, size: usize
             Some(dir) => format!("{dir} (read-only)"),
         }
     );
+    out
+}
+
+/// What the host enforces whatever the component imports, so an import
+/// isn't mistaken for a grant. Lines about an interface appear only when the
+/// component imports it; each must stay true to `sandbox_store` and
+/// `SandboxHooks`.
+fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> String {
+    let imports_any = |prefixes: &[&str]| {
+        imports
+            .iter()
+            .any(|import| prefixes.iter().any(|prefix| import.starts_with(prefix)))
+    };
+    let mut out = String::from(";; host enforcement:\n");
+    let mut line = |text: &str| {
+        let _ = writeln!(out, ";;   {text}");
+    };
+    if imports_any(&["wasi:http/"]) {
+        line(if component.allowed_hosts.is_empty() {
+            "wasi:http: every request is refused (no allowed_hosts)"
+        } else {
+            "wasi:http: requests to hosts outside allowed_hosts are refused before reaching the network"
+        });
+    }
+    if imports_any(&["wasi:sockets/"]) {
+        line(
+            "wasi:sockets: always refused; TCP, UDP and name lookup are off and every address \
+             is denied. allowed_hosts governs wasi:http only",
+        );
+    }
+    if imports_any(&["wasi:filesystem/"]) {
+        line(&match &component.dir {
+            None => "wasi:filesystem: nothing is mounted, so there are no files to open".into(),
+            Some(dir) => format!(
+                "wasi:filesystem: only {dir}, mounted as / ({}); nothing else on the host",
+                if component.dir_writable {
+                    "read-write"
+                } else {
+                    "read-only"
+                }
+            ),
+        });
+    }
+    if imports_any(&["wasi:cli/environment"]) {
+        line("wasi:cli/environment: empty; the host passes no env vars or arguments");
+    }
+    if imports_any(&["wasi:cli/stdin"]) {
+        line("wasi:cli/stdin: closed; there is nothing to read");
+    }
+    if imports_any(&["wasi:cli/stdout", "wasi:cli/stderr"]) {
+        line("wasi:cli/stdout, stderr: discarded; output isn't shown or logged anywhere");
+    }
+    if imports_any(&["wasi:cli/exit"]) {
+        line(match kind {
+            Kind::Tool => {
+                "wasi:cli/exit: traps this instance only; the call fails and the host makes a \
+                 new instance before the next call. It can't stop the host"
+            }
+            Kind::Provider => {
+                "wasi:cli/exit: traps this instance only; the turn fails and the host makes a \
+                 new instance before the next request. It can't stop the host"
+            }
+        });
+    }
+    line(&format!(
+        "instances: {}; never shared across sessions",
+        if kind == Kind::Tool && component.fresh_per_call {
+            "a new one for every call"
+        } else {
+            "one per session, kept between turns"
+        }
+    ));
+    if !component.headers.is_empty() {
+        line(
+            "credentials: the host adds the headers above to outbound HTTPS requests to their \
+             hosts only, never plain HTTP; the component never sees their values",
+        );
+    }
     let limit = |value: Option<u64>, unit: &str| {
         value.map_or("none".to_string(), |value| format!("{value}{unit}"))
     };
-    let _ = writeln!(
-        out,
-        ";; timeout: {}, max_memory: {}, fresh_per_call: {}",
-        limit(component.timeout_secs, "s"),
+    line(&format!(
+        "limits: every call ends at its run's deadline (default 10 minutes); timeout_secs: {}; \
+         max_memory_mb: {}",
+        match kind {
+            Kind::Tool => limit(component.timeout_secs, "s"),
+            Kind::Provider => "n/a for providers".into(),
+        },
         limit(component.max_memory_mb, " MiB"),
-        component.fresh_per_call
-    );
+    ));
     out
+}
+
+/// The outer component's import names.
+fn imports(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut depth = 0usize;
+    let mut names = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| Error::msg(format!("parsing component: {e}")))? {
+            Payload::Version { .. } => depth += 1,
+            Payload::End(_) => depth -= 1,
+            Payload::ComponentImportSection(reader) if depth == 1 => {
+                for import in reader {
+                    let import = import.map_err(|e| Error::msg(e.to_string()))?;
+                    names.push(import.name.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(names)
 }
 
 /// The structural summary; `interface` stops at the outer component's own
@@ -352,9 +453,10 @@ pub(crate) fn definitions(config: &RunnerConfig) -> Vec<crate::ToolDefinition> {
     vec![crate::ToolDefinition {
         name: TOOL.into(),
         description: "Show a configured tool or provider component as WAT-style text: what its \
-            config grants (allowed hosts, which headers are injected and where, directory access, \
-            limits) and every import and export of it and its nested core modules. Imports are \
-            what it can ask the host for. Header values are never shown."
+            config grants (allowed hosts, which headers are injected and where, directory access), \
+            what the host enforces whatever it imports (refused sockets, empty environment, \
+            limits, ...), and every import and export of it and its nested core modules. Imports \
+            are what it can ask the host for, not what it gets. Header values are never shown."
             .into(),
         input_schema_json: json!({"type":"object","properties":{
             "component":{"type":"string","enum":names},
@@ -393,8 +495,68 @@ mod tests {
         assert!(text.contains("allowed_hosts: api.example.com"));
         assert!(text.contains("header authorization (value hidden) sent to: api.example.com"));
         assert!(text.contains("dir: /data (read-only)"));
-        assert!(text.contains("timeout: 5s, max_memory: none"));
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn enforcement_covers_only_imported_interfaces() {
+        let config = config(
+            r#"
+            [tools.search]
+            path = "search.wasm"
+            allowed_hosts = ["api.example.com"]
+            headers = { authorization = { value = "Bearer sk-secret-value", hosts = ["api.example.com"] } }
+            timeout_secs = 5
+            [providers.main]
+            path = "main.wasm"
+            "#,
+        );
+        let imports: Vec<String> = [
+            "wasi:sockets/tcp@0.2.0",
+            "wasi:cli/environment@0.2.0",
+            "wasi:cli/exit@0.2.0",
+            "wasi:filesystem/types@0.2.0",
+        ]
+        .map(String::from)
+        .to_vec();
+        let text = enforcement(&config.tools["search"], Kind::Tool, &imports);
+        assert!(text.contains("wasi:sockets: always refused"), "{text}");
+        assert!(text.contains("wasi:cli/environment: empty"), "{text}");
+        assert!(
+            text.contains("wasi:cli/exit: traps this instance only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("wasi:filesystem: nothing is mounted"),
+            "{text}"
+        );
+        assert!(text.contains("one per session"), "{text}");
+        assert!(text.contains("credentials: the host adds"), "{text}");
+        assert!(
+            text.contains("timeout_secs: 5s; max_memory_mb: none"),
+            "{text}"
+        );
+        assert!(!text.contains(";;   wasi:http:"), "{text}");
+        assert!(!text.contains("stdout"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+
+        let http = ["wasi:http/outgoing-handler@0.2.0".to_string()];
+        let text = enforcement(&config.providers["main"].component, Kind::Provider, &http);
+        assert!(
+            text.contains("every request is refused (no allowed_hosts)"),
+            "{text}"
+        );
+        assert!(text.contains("timeout_secs: n/a for providers"), "{text}");
+        assert!(!text.contains("credentials"), "{text}");
+        assert!(!text.contains("sockets"), "{text}");
+    }
+
+    #[test]
+    fn imports_are_the_outer_components_only() {
+        assert_eq!(
+            imports(&wat_component()).unwrap(),
+            ["wasi:cli/environment@0.2.0"]
+        );
     }
 
     #[test]

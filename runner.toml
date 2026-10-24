@@ -179,5 +179,8 @@ them. For each one:
   leak between calls.
 Remember the host enforces the config: an import alone grants nothing the
 config doesn't allow, but shows what a component would do if it were allowed.
+Weigh every import against the "host enforcement" section of the output, and
+never report a capability the host refuses (e.g. sockets) as granted; at most
+note it as an unneeded import.
 Report findings ranked by severity with the evidence (the import or config line)
 and a concrete fix. Say plainly when something looks fine."""

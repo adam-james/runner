@@ -118,7 +118,9 @@ See [delegation examples and limits](docs/delegation.md).
 
 `runner tools wat NAME` prints a configured tool as WAT-style text, headed by
 what its config grants it: allowed hosts, which headers are injected and where
-(never their values), directory access and limits. It reads the config and
+(never their values) and directory access, then what the host enforces whatever
+the component imports: e.g. sockets are always refused, the environment is
+empty, and every call ends at its run's deadline. It reads the config and
 component directly, so the daemon needn't be running. By default it lists every
 import and export of the component and its nested core modules, without code or
 data; imports are what the component can ask the host for.

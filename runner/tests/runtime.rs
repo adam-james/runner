@@ -239,6 +239,11 @@ async fn inspect_component_reads_configured_components_without_secrets() {
     let (finished, text) = run("auditor", r#"{"component":"fixture","kind":"tool"}"#).await;
     assert_eq!(finished["ok"], true, "{finished}");
     assert!(text.starts_with(";; tool fixture:"), "{text}");
+    assert!(text.contains(";; host enforcement:"), "{text}");
+    assert!(
+        text.contains("instances: a new one for every call"),
+        "{text}"
+    );
     assert!(
         text.contains("(export \"local:agent/tool-api@0.1.0\""),
         "{text}"
