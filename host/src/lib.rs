@@ -1,4 +1,5 @@
 mod activity;
+mod audit;
 pub mod delegation;
 mod transcript;
 pub mod wat;
@@ -19,8 +20,8 @@ use wasmtime::component::{
     Component, FutureConsumer, Lift, Linker, ResourceTable, Source, StreamConsumer, StreamResult,
 };
 use wasmtime::{
-    Cache, Config, Engine, Error, Result, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
-    bail,
+    Cache, Config, Engine, Error, ResourceLimiter, Result, Store, StoreContextMut, StoreLimits,
+    StoreLimitsBuilder, bail,
 };
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
@@ -348,6 +349,33 @@ struct SandboxHooks {
     component: String,
     allowed_hosts: HashSet<String>,
     headers: Vec<InjectedHeader>,
+    audit: SandboxAudit,
+}
+
+/// Which component a sandbox's audit records name, and the session's audit
+/// trail they go into.
+#[derive(Clone)]
+struct SandboxAudit {
+    id: Arc<audit::ComponentId>,
+    cell: audit::AuditCell,
+}
+
+impl SandboxAudit {
+    fn new(
+        kind: &'static str,
+        name: &str,
+        digest: Option<String>,
+        cell: &audit::AuditCell,
+    ) -> Self {
+        Self {
+            id: Arc::new(audit::ComponentId {
+                kind,
+                name: name.to_string(),
+                digest,
+            }),
+            cell: cell.clone(),
+        }
+    }
 }
 
 impl SandboxHooks {
@@ -382,14 +410,18 @@ impl SandboxHooks {
             component: config.path.clone(),
             allowed_hosts,
             headers,
+            // Outside a turn's trail until `sandbox_store` names it.
+            audit: SandboxAudit::new("component", &config.path, None, &Default::default()),
         })
     }
 
     /// Adds the configured headers that apply to `request`, which must
     /// already have passed the allow-list check. Overwrites any same-named
     /// header the guest set itself, so a component can't substitute its own
-    /// credentials for the host's.
-    fn add_headers<B>(&self, request: &mut http::Request<B>, host: &str) {
+    /// credentials for the host's. Returns how many were added and how many
+    /// were held back because the request isn't HTTPS.
+    fn add_headers<B>(&self, request: &mut http::Request<B>, host: &str) -> (usize, usize) {
+        let (mut added, mut withheld) = (0, 0);
         // Never put credentials on a plain-text request, even to an allowed
         // host -- the component doesn't get to downgrade the connection.
         let https = request.uri().scheme() == Some(&http::uri::Scheme::HTTPS);
@@ -399,12 +431,15 @@ impl SandboxHooks {
             }
             if !https {
                 tracing::warn!(component = ?self.component, host = ?host, "credential injection skipped for plain HTTP");
+                withheld += 1;
                 continue;
             }
             request
                 .headers_mut()
                 .insert(header.name.clone(), header.value.clone());
+            added += 1;
         }
+        (added, withheld)
     }
 }
 
@@ -433,25 +468,44 @@ impl WasiHttpHooks for SandboxHooks {
             .host()
             .map(str::to_lowercase)
             .unwrap_or_default();
-        let allowed = self.allowed_hosts.contains(&host);
+        let ticket = self.audit.cell.reserve(&self.audit.id, "http.request");
+        let allowed = ticket.is_some() && self.allowed_hosts.contains(&host);
         let span = tracing::info_span!("outbound_http", request_id = activity::next_id(),
             component = ?self.component, method = ?request.method(),
             scheme = ?request.uri().scheme_str().unwrap_or(""), host = ?host,
             port = request.uri().port_u16());
         let guard = activity::Activity::new(span.clone(), "http");
         tracing::info!(parent: &span, allowed, "network policy");
+        let mut ticket = ticket.map(|mut ticket| {
+            ticket.field("method", request.method().as_str());
+            ticket.field("scheme", request.uri().scheme_str().unwrap_or(""));
+            ticket.field("host", host.as_str());
+            ticket.field("port", request.uri().port_u16());
+            ticket
+        });
         if !allowed {
             drop(fut);
             return Box::new(
                 async move {
                     guard.finish("denied", 0, None);
+                    // No ticket means the turn is out of audit slots, and an
+                    // unrecorded request is refused like one off the list.
+                    if let Some(ticket) = ticket {
+                        ticket.finish(audit::Decision::Denied, "not_allowed_host");
+                    }
                     Err(wasmtime_wasi_http::Error::HttpRequestDenied)
                 }
                 .instrument(span)
                 .with_current_subscriber(),
             );
         }
-        self.add_headers(&mut request, &host);
+        let (added, withheld) = self.add_headers(&mut request, &host);
+        if let Some(ticket) = &mut ticket {
+            // Counts only: which headers and their values stay out of the record.
+            ticket.field("credentials_added", added);
+            ticket.field("credentials_withheld", withheld);
+        }
+        let ticket = ticket.expect("allowed requests have a ticket");
         let io_span = span.clone();
         Box::new(
             async move {
@@ -461,10 +515,14 @@ impl WasiHttpHooks for SandboxHooks {
                         Ok(response) => response,
                         Err(error) => {
                             guard.finish("transport_error", 0, None);
+                            ticket.finish(audit::Decision::Allowed, "transport_error");
                             return Err(error);
                         }
                     };
                 guard.finish("headers_received", 0, Some(res.status().as_u16()));
+                let mut ticket = ticket;
+                ticket.field("status", res.status().as_u16());
+                ticket.finish(audit::Decision::Allowed, "response");
                 let io: Box<
                     dyn std::future::Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send,
                 > = Box::new(io.instrument(io_span).with_current_subscriber());
@@ -481,7 +539,53 @@ struct SandboxState {
     http_ctx: WasiHttpCtx,
     table: ResourceTable,
     hooks: SandboxHooks,
+    limits: AuditedLimits,
+}
+
+/// A store's memory and table caps, recording each time one turns down a
+/// guest's request to grow.
+struct AuditedLimits {
     limits: StoreLimits,
+    audit: SandboxAudit,
+}
+
+impl AuditedLimits {
+    fn record(&self, action: &'static str, desired: usize, granted: bool) {
+        if !granted {
+            let fields = serde_json::Map::from_iter([("desired".into(), desired.into())]);
+            self.audit.cell.note(
+                &self.audit.id,
+                action,
+                audit::Decision::Denied,
+                "limit_exceeded",
+                fields,
+            );
+        }
+    }
+}
+
+impl ResourceLimiter for AuditedLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        let granted = self.limits.memory_growing(current, desired, maximum)?;
+        self.record("limit.memory", desired, granted);
+        Ok(granted)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        let granted = self.limits.table_growing(current, desired, maximum)?;
+        self.record("limit.table", desired, granted);
+        Ok(granted)
+    }
 }
 
 impl WasiView for SandboxState {
@@ -509,6 +613,7 @@ impl WasiHttpView for SandboxState {
 fn load_sandboxed(
     runtime: &Runtime,
     config: &ComponentConfig,
+    audit: &SandboxAudit,
 ) -> Result<(Component, Linker<SandboxState>, Store<SandboxState>)> {
     let component = runtime.component(&config.path)?;
 
@@ -518,7 +623,11 @@ fn load_sandboxed(
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
 
-    Ok((component, linker, sandbox_store(&runtime.engine, config)?))
+    Ok((
+        component,
+        linker,
+        sandbox_store(&runtime.engine, config, audit)?,
+    ))
 }
 
 /// The host directory `config` mounts as the component's `/`, if any, and
@@ -571,7 +680,14 @@ fn memory_cap_mb(config: &ComponentConfig) -> u64 {
 
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
-fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
+fn sandbox_store(
+    engine: &Engine,
+    config: &ComponentConfig,
+    audit: &SandboxAudit,
+) -> Result<Store<SandboxState>> {
+    // The mounted dir is the whole of a guest's filesystem access: WASI
+    // checks each file operation against it, so its mount is what's recorded.
+    let mut ticket = audit.cell.reserve(&audit.id, "sandbox.create");
     let mut wasi = WasiCtx::builder();
     // Components only get the network through `wasi:http` and its
     // allow-list. wasmtime already refuses every socket address by default;
@@ -582,7 +698,17 @@ fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<Sand
     if let Some((dir, perms)) = mounted_dir(config)? {
         wasi.preopened_dir(&dir, "/", perms)
             .map_err(|e| Error::msg(format!("dir for {}: opening {dir}: {e}", config.path)))?;
+        if let Some(ticket) = &mut ticket {
+            ticket.field("dir", dir);
+            ticket.field("dir_writable", config.dir_writable);
+        }
     }
+    let Some(mut ticket) = ticket else {
+        bail!("audit capacity exhausted for this turn");
+    };
+    ticket.field("allowed_hosts", config.allowed_hosts.len());
+    ticket.field("max_memory_mb", config.max_memory_mb);
+    ticket.field("timeout_secs", config.timeout_secs);
 
     let mb = memory_cap_mb(config);
     let limits = StoreLimitsBuilder::new().memory_size(mb as usize * 1024 * 1024);
@@ -591,13 +717,20 @@ fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<Sand
         wasi: wasi.build(),
         http_ctx: WasiHttpCtx::new(),
         table: ResourceTable::new(),
-        hooks: SandboxHooks::new(config)?,
-        limits: limits.build(),
+        hooks: SandboxHooks {
+            audit: audit.clone(),
+            ..SandboxHooks::new(config)?
+        },
+        limits: AuditedLimits {
+            limits: limits.build(),
+            audit: audit.clone(),
+        },
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
     // Only a tool call with a `timeout_secs` sets a real deadline.
     Runtime::control_store(&mut store);
+    ticket.finish(audit::Decision::Allowed, "ok");
     Ok(store)
 }
 
@@ -606,6 +739,7 @@ struct ToolHandle {
     healthy: bool,
     description: ToolDescription,
     config: ComponentConfig,
+    audit: SandboxAudit,
     // For making a new instance on every call, if `fresh_per_call` is set.
     pre: tool_guest::ToolGuestPre<SandboxState>,
     instance: tool_guest::ToolGuest,
@@ -613,26 +747,36 @@ struct ToolHandle {
 }
 
 impl ToolHandle {
-    async fn call(&mut self, input: &str) -> Result<String, String> {
-        self.call_uncapped(input)
-            .await
-            .map(cap_tool_output)
-            .map_err(cap_tool_output)
+    /// Calls the tool, and says how the call went for its audit record.
+    async fn call(&mut self, input: &str) -> (Result<String, String>, &'static str) {
+        let (result, outcome) = self.call_uncapped(input).await;
+        (
+            result.map(cap_tool_output).map_err(cap_tool_output),
+            outcome,
+        )
     }
 
     #[tracing::instrument(name = "component", skip_all, fields(component = ?self.config.path, kind = "tool"))]
-    async fn call_uncapped(&mut self, input: &str) -> Result<String, String> {
+    async fn call_uncapped(&mut self, input: &str) -> (Result<String, String>, &'static str) {
         if self.config.fresh_per_call || !self.healthy {
-            let mut store = sandbox_store(&self.engine, &self.config).map_err(|e| e.to_string())?;
-            self.instance = self
-                .pre
-                .instantiate_async(&mut store)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut store = match sandbox_store(&self.engine, &self.config, &self.audit) {
+                Ok(store) => store,
+                Err(e) => return (Err(e.to_string()), "sandbox_failed"),
+            };
+            match self.pre.instantiate_async(&mut store).await {
+                Ok(instance) => self.instance = instance,
+                Err(e) => return (Err(e.to_string()), "trap"),
+            }
             self.store = store;
         }
 
         self.healthy = false;
+        // A trap is the guest crashing, as opposed to a tool error it returns.
+        let finish = |result: Result<Result<String, String>>| match result {
+            Ok(Ok(output)) => (Ok(output), "ok"),
+            Ok(Err(error)) => (Err(error), "error"),
+            Err(trap) => (Err(trap.to_string()), "trap"),
+        };
         let Some(timeout) = self.config.timeout_secs.map(Duration::from_secs) else {
             let result = self
                 .instance
@@ -640,7 +784,7 @@ impl ToolHandle {
                 .call_call(&mut self.store, input)
                 .await;
             self.healthy = result.is_ok();
-            return result.map_err(|e| e.to_string())?;
+            return finish(result);
         };
         let timed_out = || format!("timed out after {}s", timeout.as_secs());
         // Every store yields at each epoch, even for CPU-bound guest code.
@@ -651,17 +795,23 @@ impl ToolHandle {
             .local_agent_tool_api()
             .call_call(&mut self.store, input);
         match tokio::time::timeout(timeout, call).await {
-            Err(_) => Err(timed_out()),
+            Err(_) => (Err(timed_out()), "timeout"),
             Ok(result) => {
                 self.healthy = result.is_ok();
-                result.map_err(|e| e.to_string())?
+                finish(result)
             }
         }
     }
 }
 
-async fn load_tool(runtime: &Runtime, config: &ComponentConfig) -> Result<ToolHandle> {
-    let (component, linker, mut store) = load_sandboxed(runtime, config)?;
+async fn load_tool(
+    runtime: &Runtime,
+    name: &str,
+    config: &ComponentConfig,
+    cell: &audit::AuditCell,
+) -> Result<ToolHandle> {
+    let audit = SandboxAudit::new("tool", name, runtime.digest(&config.path), cell);
+    let (component, linker, mut store) = load_sandboxed(runtime, config, &audit)?;
     let pre = tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
     let instance = pre.instantiate_async(&mut store).await?;
     let mut description = instance
@@ -677,6 +827,7 @@ async fn load_tool(runtime: &Runtime, config: &ComponentConfig) -> Result<ToolHa
         healthy: true,
         description,
         config: config.clone(),
+        audit,
         pre,
         instance,
         store,
@@ -686,10 +837,11 @@ async fn load_tool(runtime: &Runtime, config: &ComponentConfig) -> Result<ToolHa
 async fn load_tools(
     runtime: &Runtime,
     configs: &BTreeMap<String, ComponentConfig>,
+    cell: &audit::AuditCell,
 ) -> Result<HashMap<String, ToolHandle>> {
     let mut tools = HashMap::new();
     for (name, config) in configs {
-        let tool = load_tool(runtime, config).await?;
+        let tool = load_tool(runtime, name, config, cell).await?;
         tools.insert(name.clone(), tool);
     }
     Ok(tools)
@@ -698,6 +850,7 @@ async fn load_tools(
 struct ProviderHandle {
     engine: Engine,
     config: ComponentConfig,
+    audit: SandboxAudit,
     pre: provider_guest::ProviderGuestPre<SandboxState>,
     healthy: bool,
     model: String,
@@ -705,14 +858,25 @@ struct ProviderHandle {
     store: Store<SandboxState>,
 }
 
-async fn load_provider(runtime: &Runtime, definition: &AgentDefinition) -> Result<ProviderHandle> {
+async fn load_provider(
+    runtime: &Runtime,
+    definition: &AgentDefinition,
+    cell: &audit::AuditCell,
+) -> Result<ProviderHandle> {
     let config = &definition.provider;
-    let (component, linker, mut store) = load_sandboxed(runtime, &config.component)?;
+    let audit = SandboxAudit::new(
+        "provider",
+        &definition.provider_name,
+        runtime.digest(&config.component.path),
+        cell,
+    );
+    let (component, linker, mut store) = load_sandboxed(runtime, &config.component, &audit)?;
     let pre = provider_guest::ProviderGuestPre::new(linker.instantiate_pre(&component)?)?;
     let instance = pre.instantiate_async(&mut store).await?;
     Ok(ProviderHandle {
         engine: runtime.engine.clone(),
         config: config.component.clone(),
+        audit,
         pre,
         healthy: true,
         model: definition.model().to_string(),
@@ -749,6 +913,8 @@ struct SessionComponents {
     provider: ProviderHandle,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
+    /// Shared with every store above, which record into the running turn's trail.
+    audit: audit::AuditCell,
     /// Set for definitions with `inspect_components`.
     inspector: Option<Arc<RunnerConfig>>,
 }
@@ -864,7 +1030,7 @@ impl SessionComponents {
         let mut tools = self.tool_definitions.clone();
         tools.extend(delegation::definitions(targets));
         sort_tool_definitions(&mut tools);
-        let reply = run_provider(&mut self.provider, tools, request, text_tx);
+        let reply = run_provider(&mut self.provider, &self.audit, tools, request, text_tx);
         tokio::pin!(reply);
         let response = loop {
             tokio::select! {
@@ -894,17 +1060,48 @@ impl SessionComponents {
             tool = ?activity::bounded_name(name),
             component = ?self.tools.get(name).map(|tool| &tool.config.path));
         let guard = activity::Activity::new(span.clone(), "tool");
+        let inspector = (name == wat::TOOL)
+            .then_some(self.inspector.clone())
+            .flatten();
+        let host_tool = matches!(name, "delegate" | "wait") || inspector.is_some();
+        let component = match self.tools.get(name) {
+            Some(tool) => tool.audit.id.clone(),
+            None => Arc::new(audit::ComponentId {
+                kind: if host_tool { "host" } else { "unknown" },
+                name: name.to_string(),
+                digest: None,
+            }),
+        };
+        let ticket = self.audit.reserve(&component, "tool.call");
         let result = async {
-            if matches!(name, "delegate" | "wait") {
-                return delegation::call(delegation, targets, name, input).await;
-            }
-            if let (wat::TOOL, Some(config)) = (name, &self.inspector) {
-                return wat::call(config.clone(), input).await.map(cap_tool_output);
-            }
-            match self.tools.get_mut(name) {
-                Some(tool) => tool.call(input).await,
-                None => Err(format!("no such tool: {name}")),
-            }
+            let Some(mut ticket) = ticket else {
+                return Err("refused: this turn's audit log is full".to_string());
+            };
+            ticket.field("input_bytes", input.len());
+            let (result, decision, outcome) = if host_tool {
+                let result = match inspector {
+                    Some(config) => wat::call(config, input).await.map(cap_tool_output),
+                    None => delegation::call(delegation, targets, name, input).await,
+                };
+                let outcome = if result.is_ok() { "ok" } else { "error" };
+                (result, audit::Decision::Allowed, outcome)
+            } else {
+                match self.tools.get_mut(name) {
+                    Some(tool) => {
+                        let (result, outcome) = tool.call(input).await;
+                        (result, audit::Decision::Allowed, outcome)
+                    }
+                    None => (
+                        Err(format!("no such tool: {name}")),
+                        audit::Decision::Denied,
+                        "unknown_tool",
+                    ),
+                }
+            };
+            ticket.field("output_bytes", result.as_ref().map_or(0, String::len));
+            ticket.field("elapsed_ms", start.elapsed().as_millis() as u64);
+            ticket.finish(decision, outcome);
+            result
         }
         .instrument(span)
         .await;
@@ -969,13 +1166,21 @@ fn api_error_message(body: &str) -> Option<String> {
 #[tracing::instrument(name = "provider", skip_all, fields(component = tracing::field::Empty))]
 async fn run_provider(
     provider: &mut ProviderHandle,
+    audit: &audit::AuditCell,
     tools: Vec<ToolDefinition>,
     request: ChatRequest,
     text_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ChatResponse, ChatError> {
     tracing::Span::current().record("component", tracing::field::debug(&provider.config.path));
+    let Some(mut ticket) = audit.reserve(&provider.audit.id, "provider.chat") else {
+        return Err(ChatError::Internal(
+            "refused: this turn's audit log is full".to_string(),
+        ));
+    };
+    ticket.field("model", provider.model.as_str());
+    ticket.field("tools", tools.len());
     if !provider.healthy {
-        let mut store = sandbox_store(&provider.engine, &provider.config)
+        let mut store = sandbox_store(&provider.engine, &provider.config, &provider.audit)
             .map_err(|e| ChatError::Internal(e.to_string()))?;
         let instance = provider
             .pre
@@ -1011,19 +1216,25 @@ async fn run_provider(
         })
         .await;
 
-    let result = match outcome {
+    let (result, audited) = match outcome {
         Ok(Ok(Ok(response))) => {
             *healthy = true;
-            response
+            let audited = if response.is_ok() { "ok" } else { "error" };
+            (response, audited)
         }
-        Ok(Ok(Err(_))) => Err(ChatError::Internal(
-            "provider dropped its response".to_string(),
-        )),
-        Ok(Err(trap)) | Err(trap) => {
-            Err(ChatError::Internal(format!("provider trapped: {trap:?}")))
-        }
+        Ok(Ok(Err(_))) => (
+            Err(ChatError::Internal(
+                "provider dropped its response".to_string(),
+            )),
+            "dropped_response",
+        ),
+        Ok(Err(trap)) | Err(trap) => (
+            Err(ChatError::Internal(format!("provider trapped: {trap:?}"))),
+            "trap",
+        ),
     };
     guard.finish(if result.is_ok() { "ok" } else { "error" }, 0, None);
+    ticket.finish(audit::Decision::Allowed, audited);
     result
 }
 
@@ -1082,6 +1293,8 @@ pub struct Runtime {
     config: Arc<RunnerConfig>,
     agents: Arc<BTreeMap<String, AgentDefinition>>,
     components: Arc<HashMap<String, Component>>,
+    /// Each component file's SHA-256, as read when it was loaded, for audit records.
+    digests: Arc<HashMap<String, String>>,
     _ticker: Arc<EpochTicker>,
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionSlot>>>,
 }
@@ -1119,13 +1332,19 @@ impl Runtime {
         options.cache(Some(Cache::from_file(None)?));
         let engine = Engine::new(&options)?;
         let mut components = HashMap::new();
+        let mut digests = HashMap::new();
         for path in sandboxed_components(&config).map(|component| &component.path) {
             if components.contains_key(path) {
                 continue;
             }
-            let component = Component::from_file(&engine, path)
+            let context = |e: &dyn std::fmt::Display| format!("loading component {path}: {e}");
+            // Compiled from the same bytes that are hashed, so the digest
+            // names exactly the code that runs.
+            let bytes = std::fs::read(path).map_err(|e| Error::msg(context(&e)))?;
+            let component = Component::new(&engine, &bytes)
                 .map_err(|e| e.context(format!("loading component {path}")))?;
             components.insert(path.clone(), component);
+            digests.insert(path.clone(), audit::digest(&bytes));
         }
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
@@ -1141,6 +1360,7 @@ impl Runtime {
             config: Arc::new(config),
             agents: Arc::new(agents),
             components: Arc::new(components),
+            digests: Arc::new(digests),
             _ticker: Arc::new(EpochTicker(stopped)),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -1171,6 +1391,10 @@ impl Runtime {
                 }
             })
             .collect()
+    }
+
+    fn digest(&self, path: &str) -> Option<String> {
+        self.digests.get(path).cloned()
     }
 
     /// Refuses a config that mounts `protected` (the service's data
@@ -1254,9 +1478,26 @@ impl Runtime {
         // the agent reports an application error (e.g. a rejected API request).
         // A turn with a different definition starts over with that definition's
         // own instances; it never inherits another agent's provider or tool state.
-        let mut components = match cached.take() {
-            Some((cached_agent, components)) if cached_agent == agent => components,
-            _ => self.load_session(definition).await?,
+        let reused = match cached.take() {
+            Some((cached_agent, components)) if cached_agent == agent => Some(components),
+            _ => None,
+        };
+        let cell = reused
+            .as_ref()
+            .map_or_else(audit::AuditCell::default, |components| {
+                components.audit.clone()
+            });
+        // Started before loading, so a new session's sandboxes are recorded too.
+        let trail = cell.begin(agent, session_id, events.clone());
+        let mut components = match reused {
+            Some(components) => components,
+            None => match self.load_session(definition, cell).await {
+                Ok(components) => components,
+                Err(error) => {
+                    trail.finish("failed");
+                    return Err(error);
+                }
+            },
         };
         let result = components
             .turn(
@@ -1269,14 +1510,23 @@ impl Runtime {
             )
             .await;
         *cached = Some((agent.to_string(), components));
+        trail.finish(if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        });
         result
             .map(|history| transcript::encode(&history))
             .map_err(|message| Error::new(TurnFailed(redact(&self.config, &message))))
     }
 
-    async fn load_session(&self, definition: &AgentDefinition) -> Result<SessionComponents> {
-        let provider = load_provider(self, definition).await?;
-        let tools = load_tools(self, &definition.tools).await?;
+    async fn load_session(
+        &self,
+        definition: &AgentDefinition,
+        audit: audit::AuditCell,
+    ) -> Result<SessionComponents> {
+        let provider = load_provider(self, definition, &audit).await?;
+        let tools = load_tools(self, &definition.tools, &audit).await?;
         let mut definitions: Vec<_> = tools
             .iter()
             .map(|(name, tool)| ToolDefinition {
@@ -1294,6 +1544,7 @@ impl Runtime {
             provider,
             tools,
             tool_definitions: definitions,
+            audit,
             inspector,
         })
     }
@@ -1476,6 +1727,133 @@ mod tests {
         ] {
             assert!(!logs.contains(secret), "{logs}");
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_http_is_audited_without_payloads_and_refused_once_the_log_is_full() {
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let records = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink_records = records.clone();
+        let cell = audit::AuditCell::default();
+        let turn = cell.begin(
+            "default",
+            "s1",
+            Arc::new(move |value| sink_records.lock().unwrap().push(value)),
+        );
+        let mut hooks = SandboxHooks {
+            audit: SandboxAudit::new("tool", "fetch", Some("sha256:00".into()), &cell),
+            ..hooks(
+                r#"path = "test-component.wasm"
+                allowed_hosts = ["127.0.0.1"]
+                headers = { authorization = { value = "CONFIG_SECRET_VALUE", hosts = ["127.0.0.1"] } }"#,
+            )
+            .unwrap()
+        };
+        let call = |hooks: &mut SandboxHooks, url: String| {
+            let request = http::Request::get(url)
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap();
+            Box::into_pin(hooks.send_request(request, None, Box::new(async { Ok(()) })))
+        };
+        let (response, io) = call(&mut hooks, format!("http://127.0.0.1:{port}/PATH_SECRET"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        drop(io);
+        server.join().unwrap();
+        assert!(
+            call(&mut hooks, "http://denied.invalid/QUERY?SECRET".into())
+                .await
+                .is_err()
+        );
+        // The listener is gone, so this fails in transport.
+        assert!(
+            call(&mut hooks, format!("http://127.0.0.1:{port}/"))
+                .await
+                .is_err()
+        );
+        drop(call(
+            &mut hooks,
+            format!("http://127.0.0.1:{port}/DROP_SECRET"),
+        ));
+
+        let text = serde_json::to_string(&*records.lock().unwrap()).unwrap();
+        for secret in ["CONFIG_SECRET_VALUE", "PATH_SECRET", "QUERY", "DROP_SECRET"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        {
+            let records = records.lock().unwrap();
+            let http: Vec<_> = records
+                .iter()
+                .filter(|r| r["action"] == "http.request")
+                .collect();
+            let outcomes: Vec<_> = http
+                .iter()
+                .map(|r| {
+                    (
+                        r["decision"].as_str().unwrap(),
+                        r["outcome"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                outcomes,
+                [
+                    ("allowed", "response"),
+                    ("denied", "not_allowed_host"),
+                    ("allowed", "transport_error"),
+                    ("allowed", "interrupted"),
+                ]
+            );
+            assert_eq!(http[0]["status"], 204);
+            assert_eq!(http[0]["host"], "127.0.0.1");
+            assert_eq!(http[0]["component"]["name"], "fetch");
+            // Plain HTTP: the credential is held back, and only counted.
+            assert_eq!(http[0]["credentials_added"], 0);
+            assert_eq!(http[0]["credentials_withheld"], 1);
+            assert_eq!(http[1]["host"], "denied.invalid");
+        }
+
+        // Filling the log, even with denied requests, refuses everything
+        // after, allowed hosts included, rather than letting it go unrecorded.
+        for _ in 4..audit::MAX_EVENTS_PER_TURN {
+            assert!(
+                call(&mut hooks, "http://denied.invalid/".into())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            call(&mut hooks, format!("http://127.0.0.1:{port}/"))
+                .await
+                .is_err()
+        );
+        turn.finish("failed");
+        let records = records.lock().unwrap();
+        let last = records.last().unwrap();
+        assert_eq!(last["action"], "turn.finished");
+        assert_eq!(last["refused"], 1);
+        assert_eq!(last["records"].as_u64().unwrap() as usize, records.len());
+        assert!(
+            records
+                .iter()
+                .any(|r| r["action"] == "audit.capacity_exhausted")
+        );
     }
 
     /// The headers `hooks` would add to a GET of `url`.

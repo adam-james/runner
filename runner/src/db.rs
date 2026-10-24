@@ -209,7 +209,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 3 {
+        if version > 4 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -245,6 +245,19 @@ impl Database {
                  CREATE TABLE run_results (
                      run_id TEXT PRIMARY KEY REFERENCES runs(id), output TEXT NOT NULL);
                  PRAGMA user_version=3;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = conn.unchecked_transaction()?;
+            // Security audit records, which the host emits as `audit` events.
+            // Apart from the run's own event stream, so clients following a
+            // run never see them; kept for as long as the run is.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     run_id TEXT NOT NULL REFERENCES runs(id), data TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS audit_events_by_run ON audit_events(run_id, id);
+                 PRAGMA user_version=4;",
             )?;
             tx.commit()?;
         }
@@ -438,6 +451,73 @@ impl Database {
         tx.commit()?;
         self.notify(id);
         Ok(())
+    }
+
+    pub fn audit_event(&self, id: &str, data: Value) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO audit_events (run_id, data) VALUES (?1, ?2)",
+            params![id, data.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// A run's audit records, oldest first. A turn records a bounded number,
+    /// so this is never more than a few thousand.
+    pub fn audit(&self, id: &str) -> Result<Vec<Event>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, data FROM audit_events WHERE run_id=?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (seq, data) = row?;
+            Ok(Event {
+                id: seq,
+                run_id: id.to_string(),
+                data: serde_json::from_str(&data)?,
+            })
+        })
+        .collect()
+    }
+
+    /// The audit records of every run in a session, a run at a time in the
+    /// order they started, each oldest first. `None` if there's no such
+    /// session.
+    pub fn session_audit(&self, session_id: &str) -> Result<Option<Vec<Event>>> {
+        let conn = self.0.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        // Runs are ordered by their first record rather than `created_at`,
+        // which only has second resolution.
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.run_id, a.data FROM audit_events a JOIN runs r ON r.id=a.run_id
+             WHERE r.session_id=?1
+             ORDER BY (SELECT MIN(id) FROM audit_events WHERE run_id=a.run_id), a.id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (seq, run_id, data) = row?;
+            Ok(Event {
+                id: seq,
+                run_id,
+                data: serde_json::from_str(&data)?,
+            })
+        })
+        .collect::<Result<_>>()
+        .map(Some)
     }
 
     pub fn events(&self, id: &str, after: i64) -> Result<Vec<Event>> {

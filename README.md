@@ -164,6 +164,62 @@ be awake and the daemon running.
 See [service architecture and roadmap](docs/service.md) for the API and the
 next milestones: scheduling, explicit delegation, and desktop clients.
 
+### Audit log
+
+Every run keeps a security audit trail: what its provider and tools did, and
+what the host allowed or denied. Read it with:
+
+```bash
+runner runs audit RUN_ID          # a table, one line per record
+runner runs audit RUN_ID --json   # one JSON record per line
+runner sessions audit SESSION_ID  # every run in the session, a run at a time
+```
+
+```
+   1   +0.000s turn.started
+   2   +0.004s sandbox.create           provider anthropic     allowed  ok allowed_hosts=1
+   3   +0.009s sandbox.create           tool web_search        allowed  ok allowed_hosts=1
+   4   +0.011s http.request             provider anthropic     allowed  response method="POST" scheme="https" host="api.anthropic.com" credentials_added=1 credentials_withheld=0 status=200
+   5   +1.380s provider.chat            provider anthropic     allowed  ok model="claude-sonnet-5" tools=1
+   6   +1.381s http.request             tool web_search        denied   not_allowed_host method="GET" scheme="https" host="evil.example" ...
+   7   +1.383s tool.call                tool web_search        allowed  error input_bytes=31 output_bytes=0 elapsed_ms=2
+  ...
+```
+
+The guests are what it's guarding against, so the host makes every record
+itself, at the points it controls: creating a component's sandbox (and
+mounting its `dir`, the whole of its filesystem access), each tool and model
+call, each outbound request whether allowed or refused, and each memory or
+table growth a limit refuses. Tool calls end `ok`, `error`, `trap`, `timeout`
+or `unknown_tool`. Components are named as the config names them, with the
+SHA-256 of the `.wasm` that was loaded.
+
+Records are metadata only. They never include prompts, tool input or
+output, request paths or bodies, header values, or error text; credentials
+appear only as counts of headers added or held back.
+
+Each record carries a schema version (`v`), a sequence number that's
+contiguous within the turn, a timestamp, the agent and session, and the
+action's decision and outcome. The trail begins with `turn.started` and ends
+with `turn.finished`, which states how many records the turn wrote. `runs
+audit` warns on stderr when something's missing: a gap in the sequence, or
+no `turn.finished` because the daemon stopped mid-run.
+
+Limits and failures:
+
+- A turn records at most 4096 actions. Past that, the host refuses further
+  requests and tool and model calls rather than let them run unrecorded, so a
+  guest flooding the log only stops its own run.
+- Records are saved like run events, in the service's SQLite database, apart
+  from the event stream clients follow. A record that can't be saved fails
+  the run. Saving is asynchronous, so actions already under way when that
+  happens may finish unrecorded.
+- Records are kept as long as their run. They're readable with the same local
+  API token as the rest of the API (`GET /v1/runs/{id}/audit`, or
+  `GET /v1/sessions/{id}/audit` for every run in a session).
+- A delegated child is its own run, with its own trail; the parent's shows
+  the `delegate` and `wait` calls.
+
 ### Verify the service
 
 The standard tests use deterministic execution without API keys. The additional

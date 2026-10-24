@@ -12,7 +12,9 @@ the reason to pick runner.
   - `runner tools inspect NAME`, and in `agents list` / session banners
 - ~~wasm inspector - turn to s-expression and have llm read it~~ done: `runner tools wat` and the host `inspect_component` tool
   - next: include each tool's `describe()` text so the auditor sees its stated purpose, not just its name
-- security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID`
+- security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID` and `runner sessions audit SESSION_ID`
+  - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
+  - next: alerts on denials/refusals, retention beyond the run, a separate audit-read token, recording per-file access if the host ever mediates it
   - threat model: malicious guest components; trust the runner and host to enforce policy and record activity
   - add structured, versioned events with event IDs, sequence numbers, actor/run/session identity, component version, action, policy decision, and outcome
   - record activity at host-controlled boundaries so guests cannot forge, suppress, or bypass records; bound and escape guest-controlled metadata
@@ -21,6 +23,11 @@ the reason to pick runner.
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
 - ~~add an agent that can audit security~~ done: `security_auditor` in runner.toml
+- add an audit agent that reviews what runs actually did, from their audit trails (`security_auditor` reviews what components could do)
+  - e.g. "audit session X": flag denied requests, refusals, traps, timeouts and trail gaps, and tools reaching hosts or dirs their stated purpose doesn't need
+  - a host tool behind an opt-in flag like `inspect_components`, reading `runs audit` / `sessions audit` records; read-only, and never the run it's part of
+  - records are metadata-only, but guest-influenced fields (names, hosts) are untrusted input to the model: keep them bounded and quoted
+  - later: run it automatically after a run with denials, as a first step toward alerts
 - docs: say loudly that keys never enter the sandbox
 
 ## 2. Enforce capabilities at the moment they matter
