@@ -60,9 +60,11 @@ fresh_per_call = true
 
 # Lets the model read files and list directories, under `dir` only, which
 # it sees as `/`. Read-only; the directory must exist.
+# Use a dedicated directory, never "." or your home: everything under it can
+# be read and so sent to the model provider. Must exist: mkdir -p ~/notes
 [tools.read_file]
 path = "target/wasm32-wasip2/release/files.wasm"
-dir = "."
+dir = "${HOME}/notes"
 
 # Let the model write and edit files under `dir`, which it sees as `/`. They
 # can overwrite anything there, so use a directory you don't mind it
