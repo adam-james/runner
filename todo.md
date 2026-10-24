@@ -23,6 +23,11 @@ the reason to pick runner.
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
 - ~~add an agent that can audit security~~ done: `security_auditor` in runner.toml
+- add an audit agent that reviews what runs actually did, from their audit trails (`security_auditor` reviews what components could do)
+  - e.g. "audit session X": flag denied requests, refusals, traps, timeouts and trail gaps, and tools reaching hosts or dirs their stated purpose doesn't need
+  - a host tool behind an opt-in flag like `inspect_components`, reading `runs audit` / `sessions audit` records; read-only, and never the run it's part of
+  - records are metadata-only, but guest-influenced fields (names, hosts) are untrusted input to the model: keep them bounded and quoted
+  - later: run it automatically after a run with denials, as a first step toward alerts
 - docs: say loudly that keys never enter the sandbox
 
 ## 2. Enforce capabilities at the moment they matter
