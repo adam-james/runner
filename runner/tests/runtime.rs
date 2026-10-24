@@ -76,6 +76,9 @@ provider = "fixture"
 tools = ["fixture"]
 max_tokens = 99
 max_model_calls = 1
+[agents.auditor]
+provider = "fixture"
+inspect_components = true
 "#,
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
@@ -211,12 +214,71 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
+async fn inspect_component_reads_configured_components_without_secrets() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let run = async |agent: &str, input: &str| {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = events.clone();
+        let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+        let prompt = format!("named-tool:inspect_component:{input}");
+        runtime.run_turn(agent, agent, &prompt, sink).await.unwrap();
+        let events = events.lock().unwrap().clone();
+        let finished = events
+            .iter()
+            .find(|e| e["kind"] == "tool_finished")
+            .unwrap()
+            .clone();
+        let text: String = events
+            .iter()
+            .filter(|e| e["kind"] == "text")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        (finished, text)
+    };
+    let (finished, text) = run("auditor", r#"{"component":"fixture","kind":"tool"}"#).await;
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(text.starts_with(";; tool fixture:"), "{text}");
+    assert!(
+        text.contains("(export \"local:agent/tool-api@0.1.0\""),
+        "{text}"
+    );
+    assert!(text.contains("(core module"), "{text}");
+    let (_, text) = run(
+        "auditor",
+        r#"{"component":"fixture","kind":"provider","detail":"interface"}"#,
+    )
+    .await;
+    assert!(
+        text.contains("header x-api-key (value hidden) sent to: fixture.invalid"),
+        "{text}"
+    );
+    assert!(!text.contains("host-only-fixture-key"), "{text}");
+    assert!(!text.contains("(core module"), "{text}");
+    // Only configured names, and only for agents granted the tool.
+    let (finished, _) = run("auditor", r#"{"component":"../../etc/passwd"}"#).await;
+    assert_eq!(finished["ok"], false);
+    let (finished, _) = run("default", r#"{"component":"fixture"}"#).await;
+    assert_eq!(finished["error"], "no such tool: inspect_component");
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
     assert_eq!(
         runtime.agents(),
         [
+            host::AgentInfo {
+                name: "auditor".into(),
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                tools: vec!["inspect_component".into()],
+                delegates: vec![],
+                max_tokens: host::DEFAULT_MAX_TOKENS,
+                max_model_calls: None,
+            },
             host::AgentInfo {
                 name: "default".into(),
                 provider: "fixture".into(),
@@ -562,7 +624,7 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("unknown agent 'nope'; the daemon has: default, limited, notools"),
+        stderr.contains("unknown agent 'nope'; the daemon has: auditor, default, limited, notools"),
         "{stderr}"
     );
     // Rejected before the chat started, so no session was made for it.

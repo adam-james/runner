@@ -1,6 +1,7 @@
 mod activity;
 pub mod delegation;
 mod transcript;
+pub mod wat;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -74,6 +75,10 @@ struct AgentConfig {
     tools: Vec<String>,
     #[serde(default)]
     delegates: Vec<String>,
+    /// Grants the host's `inspect_component` tool, which reads every
+    /// configured component's imports, exports and config capabilities.
+    #[serde(default)]
+    inspect_components: bool,
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
@@ -92,6 +97,7 @@ struct AgentDefinition {
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
     delegates: Vec<String>,
+    inspect_components: bool,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_model_calls: Option<u32>,
@@ -138,8 +144,8 @@ fn validate_table_key(kind: &str, name: &str) -> Result<()> {
 fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinition>> {
     for name in config.tools.keys() {
         validate_table_key("tool", name)?;
-        if matches!(name.as_str(), "delegate" | "wait") {
-            bail!("tool name '{name}' is reserved for host delegation");
+        if matches!(name.as_str(), "delegate" | "wait" | wat::TOOL) {
+            bail!("tool name '{name}' is reserved for a host tool");
         }
     }
     for name in config.providers.keys() {
@@ -202,6 +208,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 provider,
                 tools,
                 delegates: agent.delegates.clone(),
+                inspect_components: agent.inspect_components,
                 system_prompt: agent.system_prompt.clone(),
                 max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 max_model_calls: agent.max_model_calls,
@@ -727,6 +734,8 @@ struct SessionComponents {
     provider: ProviderHandle,
     tool_definitions: Vec<ToolDefinition>,
     tools: HashMap<String, ToolHandle>,
+    /// Set for definitions with `inspect_components`.
+    inspector: Option<Arc<RunnerConfig>>,
 }
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
@@ -873,6 +882,9 @@ impl SessionComponents {
         let result = async {
             if matches!(name, "delegate" | "wait") {
                 return delegation::call(delegation, targets, name, input).await;
+            }
+            if let (wat::TOOL, Some(config)) = (name, &self.inspector) {
+                return wat::call(config.clone(), input).await.map(cap_tool_output);
             }
             match self.tools.get_mut(name) {
                 Some(tool) => tool.call(input).await,
@@ -1128,8 +1140,11 @@ impl Runtime {
                 let mut tools: Vec<_> = definition.tools.keys().cloned().collect();
                 if !definition.delegates.is_empty() {
                     tools.extend(["delegate".into(), "wait".into()]);
-                    tools.sort();
                 }
+                if definition.inspect_components {
+                    tools.push(wat::TOOL.into());
+                }
+                tools.sort();
                 AgentInfo {
                     name: name.clone(),
                     provider: definition.provider_name.clone(),
@@ -1248,11 +1263,16 @@ impl Runtime {
                 input_schema_json: tool.description.input_schema_json.clone(),
             })
             .collect();
+        let inspector = definition.inspect_components.then(|| self.config.clone());
+        if let Some(config) = &inspector {
+            definitions.extend(wat::definitions(config));
+        }
         sort_tool_definitions(&mut definitions);
         Ok(SessionComponents {
             provider,
             tools,
             tool_definitions: definitions,
+            inspector,
         })
     }
 }
@@ -1648,7 +1668,7 @@ mod tests {
             )
             .is_err()
         );
-        for name in ["delegate", "wait"] {
+        for name in ["delegate", "wait", "inspect_component"] {
             assert!(agents("[agents.default]\nprovider = \"main\"", &[name, "docs"]).is_err());
         }
     }
@@ -1845,6 +1865,9 @@ mod tests {
             ["research_lead", "reader"]
         );
         assert_eq!(agents["research_lead"].delegates, ["researcher"]);
+        assert!(agents["security_auditor"].inspect_components);
+        assert!(agents["security_auditor"].tools.is_empty());
+        assert!(!agents["default"].inspect_components);
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]
