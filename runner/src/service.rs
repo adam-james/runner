@@ -110,6 +110,8 @@ pub struct Service {
     token: Arc<String>,
     /// The agent definitions runs may name; fixed for the daemon's lifetime.
     agents: Arc<Vec<host::AgentInfo>>,
+    /// What each configured provider and tool can do; also fixed.
+    components: Arc<Vec<host::inspect::Capabilities>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -229,12 +231,20 @@ impl Service {
             db,
             token: Arc::new(token),
             agents: Arc::new(agents),
+            components: Arc::default(),
         }
+    }
+
+    /// Serve `components` from `/v1/components`.
+    pub fn with_components(mut self, components: Vec<host::inspect::Capabilities>) -> Self {
+        self.components = Arc::new(components);
+        self
     }
 
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/agents", get(list_agents))
+            .route("/v1/components", get(list_components))
             .route("/v1/sessions", get(list_sessions).post(create_session))
             .route("/v1/runs", get(list_runs).post(submit))
             .route("/v1/runs/{id}", get(inspect))
@@ -289,6 +299,10 @@ async fn authenticate(
 
 async fn list_agents(State(s): State<Service>) -> Json<Vec<host::AgentInfo>> {
     Json(s.agents.to_vec())
+}
+
+async fn list_components(State(s): State<Service>) -> Json<Vec<host::inspect::Capabilities>> {
+    Json(s.components.to_vec())
 }
 
 async fn list_sessions(
@@ -725,7 +739,8 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         token: token.clone(),
     };
     instance.publish(&info)?;
-    let service = Service::new(db.clone(), token, runtime.agents());
+    let service =
+        Service::new(db.clone(), token, runtime.agents()).with_components(runtime.capabilities());
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();

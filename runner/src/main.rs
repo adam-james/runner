@@ -84,6 +84,29 @@ enum Command {
         #[command(subcommand)]
         command: Agents,
     },
+    /// What configured tools can reach: network hosts, injected headers
+    /// (names only), files and limits.
+    Tools {
+        #[command(subcommand)]
+        command: Components,
+    },
+    /// What configured model providers can reach, like `tools`.
+    Providers {
+        #[command(subcommand)]
+        command: Components,
+    },
+}
+
+#[derive(Subcommand)]
+enum Components {
+    /// Each one's name and a one-line summary of its access.
+    List,
+    /// One in full: hosts, headers, files, limits and its component's imports.
+    Inspect {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +249,12 @@ async fn main() -> Result<()> {
         Command::Agents {
             command: Agents::List,
         } => println!("{}", serde_json::to_string_pretty(&client.agents().await?)?),
+        Command::Tools { command } => {
+            components(&client, host::inspect::ComponentKind::Tool, command).await?
+        }
+        Command::Providers { command } => {
+            components(&client, host::inspect::ComponentKind::Provider, command).await?
+        }
         Command::Sessions { command } => match command {
             Sessions::List => println!(
                 "{}",
@@ -253,6 +282,49 @@ fn known_agent<'a>(agents: &'a [host::AgentInfo], agent: &str) -> Result<&'a hos
             )
         }
     }
+}
+
+/// `tools` and `providers`: lists the daemon's components of `kind`, or
+/// describes one of them.
+async fn components(
+    client: &Client,
+    kind: host::inspect::ComponentKind,
+    command: Components,
+) -> Result<()> {
+    let mut components = client.components().await?;
+    components.retain(|component| component.kind == kind);
+    match command {
+        Components::List => {
+            let width = components.iter().map(|c| c.name.len()).max().unwrap_or(0);
+            for component in &components {
+                println!("{:<width$}  {}", component.name, component.summary());
+            }
+        }
+        Components::Inspect { name, json } => {
+            let Some(component) = components.iter().find(|c| c.name == name) else {
+                if kind == host::inspect::ComponentKind::Tool
+                    && matches!(name.as_str(), "delegate" | "wait")
+                {
+                    bail!("'{name}' is a host tool for delegation; it runs no component");
+                }
+                let names: Vec<_> = components.iter().map(|c| c.name.as_str()).collect();
+                bail!(
+                    "unknown {kind} '{name}'; the daemon has: {}",
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(component)?);
+            } else {
+                println!("{}", component.describe());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The named session, created if it isn't saved yet, or a new one; and

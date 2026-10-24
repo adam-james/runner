@@ -18,6 +18,40 @@ ever touches API keys or decides which provider/model/tools are in use.
 Swapping provider, model, or tools is a config change; none of the
 components need recompiling.
 
+### API keys never enter the sandbox
+
+No provider or tool ever holds a credential. Header values like
+`Bearer ${TAVILY_API_KEY}` are resolved by the host from the daemon's
+environment and added to a component's outbound request on its way out,
+and only when that request goes to a host the header's `hosts` list names.
+The component can't read them, can't send them anywhere else, and can't
+reach hosts outside its `allowed_hosts` at all. A component that's
+compromised, or tricked by a prompt injection, has no key to leak.
+
+To see what a component can do before relying on it:
+
+```bash
+runner tools list
+runner tools inspect web_search          # add --json for the same as JSON
+runner providers inspect anthropic
+```
+
+```
+tool web_search
+  component  target/wasm32-wasip2/release/search.wasm
+  summary    can reach api.tavily.com; gets an authorization header there; no filesystem access
+  network    api.tavily.com
+  headers    authorization → api.tavily.com (value kept by the host)
+  files      no filesystem access
+  imports    wasi:cli/environment@0.2.12, …, wasi:http/outgoing-handler@0.2.12, …
+```
+
+The summary combines the config with what the component imports: allowed
+hosts are no use to a component that doesn't import `wasi:http`, and
+`inspect` says so. Header names are shown, never their values. `chat`,
+`run` and `runs watch` print each tool's summary under the agent's details,
+and `agents list` includes them as `tool_access`.
+
 Replies stream: text is printed as the model generates it. That's built on
 WASI 0.3 (Component Model async): `chat` is an `async func` returning a
 `stream<string>` of text pieces plus a `future` of the complete response,
@@ -56,11 +90,12 @@ runner sessions list
 runner sessions create trip
 runner run --session trip "Plan a weekend in Seattle"
 runner agents list
+runner tools inspect web_search
 runner run --agent researcher "What changed in the latest Rust release?"
 ```
 
 `run` and `runs watch` print the run's agent and session ID on stderr, followed
-by the agent's provider, model, and tools; `run --detach` prints the run ID on
+by the agent's provider, model, and tools, and what each tool can reach; `run --detach` prints the run ID on
 stdout. Without `--detach`, `run` streams output until completion. Ctrl-C while
 watching detaches successfully and leaves the run working; use `runs cancel`
 to stop it. Failed, cancelled, and
