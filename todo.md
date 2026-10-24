@@ -12,6 +12,8 @@ the reason to pick runner.
   - `runner tools inspect NAME`, and in `agents list` / session banners
 - wasm inspector - turn to s-expression and have llm read it - inspect agents and tools
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID`
+  - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
+  - next: alerts on denials/refusals, retention beyond the run, a separate audit-read token, recording per-file access if the host ever mediates it
   - threat model: malicious guest components; trust the runner and host to enforce policy and record activity
   - add structured, versioned events with event IDs, sequence numbers, actor/run/session identity, component version, action, policy decision, and outcome
   - record activity at host-controlled boundaries so guests cannot forge, suppress, or bypass records; bound and escape guest-controlled metadata

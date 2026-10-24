@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::{Database, Run};
+use crate::db::{Database, Event, Run};
 use crate::delegation::ExecutionContext;
 use tokio::sync::Semaphore;
 
@@ -240,6 +240,7 @@ impl Service {
             .route("/v1/runs/{id}", get(inspect))
             .route("/v1/runs/{id}/cancel", post(cancel))
             .route("/v1/runs/{id}/events", get(events))
+            .route("/v1/runs/{id}/audit", get(audit))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
@@ -382,6 +383,30 @@ async fn cancel(
     ))
 }
 
+/// A run's security audit records. Readable with the same local API token as
+/// everything else; there's no separate audit role yet.
+async fn audit(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Vec<Event>>, ApiError> {
+    if s.db
+        .blocking({
+            let id = id.clone();
+            move |db| db.run(&id)
+        })
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    Ok(Json(
+        s.db.blocking(move |db| db.audit(&id))
+            .await
+            .map_err(internal)?,
+    ))
+}
+
 async fn events(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
@@ -464,6 +489,14 @@ impl BufferedEvents {
     }
 
     fn push(&mut self, value: Value) {
+        // Only the host makes events, and only its audit module makes these.
+        // A record that can't be saved fails the run like any other event.
+        if value["kind"] == "audit" {
+            if self.db.audit_event(&self.id, value).is_err() {
+                self.failed = true;
+            }
+            return;
+        }
         if value["kind"] == "text" {
             self.text
                 .push_str(value["text"].as_str().unwrap_or_default());

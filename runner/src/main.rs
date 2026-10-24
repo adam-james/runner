@@ -108,6 +108,13 @@ enum Runs {
     Cancel {
         id: String,
     },
+    /// What the run's components did, and what the host allowed or denied.
+    Audit {
+        id: String,
+        /// One JSON record per line, instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -218,6 +225,19 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
+            Runs::Audit { id, json } => {
+                let records = client.audit(&id).await?;
+                if json {
+                    for record in &records {
+                        println!("{}", serde_json::to_string(&record.data)?);
+                    }
+                } else {
+                    print!("{}", runner::audit::render(&records));
+                }
+                for problem in runner::audit::check(&records) {
+                    eprintln!("warning: {problem}");
+                }
+            }
             Runs::Watch { id, after, json } => {
                 header(&client, &client.run(&id).await?).await?;
                 let _ = attach(&client, &id, after, json, &mut interrupt).await?;
