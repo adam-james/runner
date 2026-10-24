@@ -84,6 +84,29 @@ enum Command {
         #[command(subcommand)]
         command: Agents,
     },
+    /// Look at the tool and provider components a config declares. Reads
+    /// the config and components directly; no daemon needed.
+    Tools {
+        #[command(subcommand)]
+        command: Tools,
+    },
+}
+
+#[derive(Subcommand)]
+enum Tools {
+    /// Print a tool (or, with --provider, a provider) as WAT-style text,
+    /// headed by what its config grants it.
+    Wat {
+        name: String,
+        #[arg(long, default_value = "runner.toml")]
+        config: String,
+        #[arg(long)]
+        provider: bool,
+        /// interface: the component's own imports and exports; structure:
+        /// nested modules' too; full: complete WAT, which can be huge.
+        #[arg(long, default_value = "structure")]
+        detail: host::wat::Detail,
+    },
 }
 
 #[derive(Subcommand)]
@@ -140,6 +163,21 @@ async fn main() -> Result<()> {
             .init();
         return service::serve(&config, &args.data_dir, concurrency).await;
     }
+    if let Command::Tools {
+        command:
+            Tools::Wat {
+                name,
+                config,
+                provider,
+                detail,
+            },
+    } = args.command
+    {
+        use host::wat::Kind;
+        let kind = if provider { Kind::Provider } else { Kind::Tool };
+        print!("{}", host::wat::print(&config, kind, &name, detail)?);
+        return Ok(());
+    }
     let client = Client::connect(&args.data_dir)?;
     // Register before printing headers. Retain this future so a signal arriving
     // during API requests or replay stays pending until the next exit point.
@@ -150,7 +188,7 @@ async fn main() -> Result<()> {
         _ = std::future::ready(()) => {},
     }
     match args.command {
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. } | Command::Tools { .. } => unreachable!(),
         Command::Run {
             prompt,
             session,

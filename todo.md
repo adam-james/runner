@@ -10,7 +10,8 @@ the reason to pick runner.
 - show what a tool or provider can do before it's enabled: component imports plus config `allowed_hosts`, `dir`/`dir_writable`, injected headers
   - e.g. "`web_search` can reach api.tavily.com, gets an Authorization header there, has no filesystem access"
   - `runner tools inspect NAME`, and in `agents list` / session banners
-- wasm inspector - turn to s-expression and have llm read it - inspect agents and tools
+- ~~wasm inspector - turn to s-expression and have llm read it~~ done: `runner tools wat` and the host `inspect_component` tool
+  - next: include each tool's `describe()` text so the auditor sees its stated purpose, not just its name
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID`
   - threat model: malicious guest components; trust the runner and host to enforce policy and record activity
   - add structured, versioned events with event IDs, sequence numbers, actor/run/session identity, component version, action, policy decision, and outcome
@@ -19,7 +20,7 @@ the reason to pick runner.
   - cover tool execution, allowed and denied network/filesystem access, capability violations, and guest traps or resource-limit termination
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
-- add an agent that can audit security
+- ~~add an agent that can audit security~~ done: `security_auditor` in runner.toml
 - docs: say loudly that keys never enter the sandbox
 
 ## 2. Enforce capabilities at the moment they matter
