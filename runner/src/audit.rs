@@ -1,5 +1,6 @@
-//! `runner runs audit`: a run's security audit records as a table, and
-//! checks that none of them went missing.
+//! `runner runs audit` and `runner sessions audit`: a run's or a session's
+//! security audit records as a table, and checks that none of them went
+//! missing.
 use serde_json::Value;
 
 use crate::db::Event;
@@ -18,14 +19,32 @@ const COMMON: &[&str] = &[
     "outcome",
 ];
 
-/// One line per record: its sequence number, time since the first record,
-/// action, component, decision and outcome, then its other fields.
+/// `records` split into each run's, in order. A session's trail holds
+/// several runs, and each numbers its records from 1.
+fn by_run(records: &[Event]) -> impl Iterator<Item = &[Event]> {
+    records.chunk_by(|a, b| a.run_id == b.run_id)
+}
+
+/// One line per record: its sequence number, time since its run's first
+/// record, action, component, decision and outcome, then its other fields.
+/// Records from more than one run get a heading line per run.
 pub fn render(records: &[Event]) -> String {
+    let mut out = String::new();
+    let several = by_run(records).nth(1).is_some();
+    for run in by_run(records) {
+        if several {
+            out.push_str(&format!("run {}\n", run[0].run_id));
+        }
+        render_run(run, &mut out);
+    }
+    out
+}
+
+fn render_run(records: &[Event], out: &mut String) {
     let start = records
         .first()
         .and_then(|record| record.data["ts_ms"].as_u64())
         .unwrap_or(0);
-    let mut out = String::new();
     for record in records {
         let data = &record.data;
         let elapsed = data["ts_ms"]
@@ -63,18 +82,32 @@ pub fn render(records: &[Event]) -> String {
         out.push_str(line.trim_end());
         out.push('\n');
     }
-    out
 }
 
 /// Why `records` might not be the whole story: a missing or unfinished
 /// turn, a gap in the sequence, or actions refused because the turn ran out
-/// of audit slots. Empty when the trail is complete.
+/// of audit slots. Empty when the trail is complete. With more than one
+/// run's records, each problem names its run.
 pub fn check(records: &[Event]) -> Vec<String> {
-    let mut problems = Vec::new();
     if records.is_empty() {
-        problems.push("no audit records (the run never started, or predates auditing)".into());
-        return problems;
+        return vec!["no audit records (nothing has run yet, or it predates auditing)".into()];
     }
+    let several = by_run(records).nth(1).is_some();
+    by_run(records)
+        .flat_map(|run| {
+            check_run(run).into_iter().map(move |problem| {
+                if several {
+                    format!("run {}: {problem}", run[0].run_id)
+                } else {
+                    problem
+                }
+            })
+        })
+        .collect()
+}
+
+fn check_run(records: &[Event]) -> Vec<String> {
+    let mut problems = Vec::new();
     let mut expected = 0;
     let mut in_turn = false;
     for record in records {
@@ -130,12 +163,16 @@ mod tests {
     use serde_json::json;
 
     fn trail(records: &[Value]) -> Vec<Event> {
+        run_trail("r", records)
+    }
+
+    fn run_trail(run_id: &str, records: &[Value]) -> Vec<Event> {
         records
             .iter()
             .enumerate()
             .map(|(i, data)| Event {
                 id: i as i64 + 1,
-                run_id: "r".into(),
+                run_id: run_id.into(),
                 data: data.clone(),
             })
             .collect()
@@ -185,5 +222,21 @@ mod tests {
         assert!(check(&trail(&refused))[0].contains("5 actions were refused"));
 
         assert!(!check(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_sessions_runs_are_checked_and_shown_one_at_a_time() {
+        let mut records = run_trail("first", &complete());
+        let mut second = complete();
+        second.remove(1);
+        records.extend(run_trail("second", &second));
+
+        let text = render(&records);
+        assert!(text.starts_with("run first\n"));
+        assert!(text.contains("\nrun second\n"));
+        assert!(!render(&trail(&complete())).contains("run r"));
+
+        // Each run's numbering starts again at 1, which isn't a gap.
+        assert_eq!(check(&records), ["run second: records #2..#2 are missing"]);
     }
 }

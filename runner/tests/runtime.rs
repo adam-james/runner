@@ -1642,21 +1642,23 @@ async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
         .unwrap();
         runs.push(run.id);
     }
-    let audit = |id: &str, json: bool| {
+    let audit_of = |of: &str, id: &str, json: bool| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_runner"));
-        command
-            .arg("--data-dir")
-            .arg(&data)
-            .args(["runs", "audit", id]);
+        command.arg("--data-dir").arg(&data).args([of, "audit", id]);
         if json {
             command.arg("--json");
         }
         let output = command.output().unwrap();
-        assert!(output.status.success());
         (
+            output.status.success(),
             String::from_utf8(output.stdout).unwrap(),
             String::from_utf8(output.stderr).unwrap(),
         )
+    };
+    let audit = |id: &str, json: bool| {
+        let (ok, records, warnings) = audit_of("runs", id, json);
+        assert!(ok);
+        (records, warnings)
     };
     let tool_call = |id: &str| -> Value {
         let (records, _) = audit(id, true);
@@ -1732,6 +1734,39 @@ async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
                 .all(|event| event.data["kind"] != "audit")
         );
     }
+
+    // A session's trail is each of its runs' trails, a run at a time.
+    let session = client
+        .create_session(Some("audited".into()))
+        .await
+        .unwrap()
+        .id;
+    let mut session_runs = Vec::new();
+    for prompt in ["tool:probe", "tool:trap"] {
+        let run = client
+            .submit(Some(session.clone()), None, prompt.into(), 30)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client.run(&run.id).await.unwrap().terminal() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session_runs.push(run.id);
+    }
+    let (ok, records, warnings) = audit_of("sessions", &session, true);
+    assert!(ok);
+    assert_eq!(warnings, "", "both runs' trails are complete");
+    let expected: String = session_runs.iter().map(|id| audit(id, true).0).collect();
+    assert_eq!(records, expected);
+    let (_, table, _) = audit_of("sessions", &session, false);
+    for id in &session_runs {
+        assert!(table.lines().any(|l| l == format!("run {id}")));
+    }
+    let (ok, _, _) = audit_of("sessions", "no-such-session", true);
+    assert!(!ok);
 }
 
 #[tokio::test]

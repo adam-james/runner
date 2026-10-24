@@ -236,6 +236,7 @@ impl Service {
         Router::new()
             .route("/v1/agents", get(list_agents))
             .route("/v1/sessions", get(list_sessions).post(create_session))
+            .route("/v1/sessions/{id}/audit", get(session_audit))
             .route("/v1/runs", get(list_runs).post(submit))
             .route("/v1/runs/{id}", get(inspect))
             .route("/v1/runs/{id}/cancel", post(cancel))
@@ -405,6 +406,19 @@ async fn audit(
             .await
             .map_err(internal)?,
     ))
+}
+
+/// The audit records of every run in a session, under the same token as
+/// a run's.
+async fn session_audit(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Vec<Event>>, ApiError> {
+    s.db.blocking(move |db| db.session_audit(&id))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "session not found".into()))
 }
 
 async fn events(

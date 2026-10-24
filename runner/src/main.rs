@@ -143,7 +143,16 @@ enum Runs {
 #[derive(Subcommand)]
 enum Sessions {
     List,
-    Create { id: Option<String> },
+    Create {
+        id: Option<String>,
+    },
+    /// The audit records of every run in the session, a run at a time.
+    Audit {
+        id: String,
+        /// One JSON record per line, instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -263,19 +272,7 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
-            Runs::Audit { id, json } => {
-                let records = client.audit(&id).await?;
-                if json {
-                    for record in &records {
-                        println!("{}", serde_json::to_string(&record.data)?);
-                    }
-                } else {
-                    print!("{}", runner::audit::render(&records));
-                }
-                for problem in runner::audit::check(&records) {
-                    eprintln!("warning: {problem}");
-                }
-            }
+            Runs::Audit { id, json } => print_audit(&client.audit(&id).await?, json)?,
             Runs::Watch { id, after, json } => {
                 header(&client, &client.run(&id).await?).await?;
                 let _ = attach(&client, &id, after, json, &mut interrupt).await?;
@@ -293,6 +290,7 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.create_session(id).await?)?
             ),
+            Sessions::Audit { id, json } => print_audit(&client.session_audit(&id).await?, json)?,
         },
     }
     Ok(())
@@ -300,6 +298,22 @@ async fn main() -> Result<()> {
 
 /// The daemon's definition of `agent`, checked up front so a typo doesn't
 /// wait for the first prompt to fail.
+/// Audit records as a table, or one JSON record per line, then a warning on
+/// stderr for each sign the trail is incomplete.
+fn print_audit(records: &[runner::db::Event], json: bool) -> Result<()> {
+    if json {
+        for record in records {
+            println!("{}", serde_json::to_string(&record.data)?);
+        }
+    } else {
+        print!("{}", runner::audit::render(records));
+    }
+    for problem in runner::audit::check(records) {
+        eprintln!("warning: {problem}");
+    }
+    Ok(())
+}
+
 fn known_agent<'a>(agents: &'a [host::AgentInfo], agent: &str) -> Result<&'a host::AgentInfo> {
     match agents.iter().find(|known| known.name == agent) {
         Some(details) => Ok(details),

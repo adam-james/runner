@@ -481,6 +481,45 @@ impl Database {
         .collect()
     }
 
+    /// The audit records of every run in a session, a run at a time in the
+    /// order they started, each oldest first. `None` if there's no such
+    /// session.
+    pub fn session_audit(&self, session_id: &str) -> Result<Option<Vec<Event>>> {
+        let conn = self.0.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        // Runs are ordered by their first record rather than `created_at`,
+        // which only has second resolution.
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.run_id, a.data FROM audit_events a JOIN runs r ON r.id=a.run_id
+             WHERE r.session_id=?1
+             ORDER BY (SELECT MIN(id) FROM audit_events WHERE run_id=a.run_id), a.id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (seq, run_id, data) = row?;
+            Ok(Event {
+                id: seq,
+                run_id,
+                data: serde_json::from_str(&data)?,
+            })
+        })
+        .collect::<Result<_>>()
+        .map(Some)
+    }
+
     pub fn events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(

@@ -135,6 +135,11 @@ impl Client {
             .await
     }
 
+    pub async fn session_audit(&self, id: &str) -> Result<Vec<Event>> {
+        self.json(Method::GET, &format!("/v1/sessions/{id}/audit"), None)
+            .await
+    }
+
     /// Every event of a finished run, read from its event replay. The replay
     /// ends once a terminal run's events are all sent.
     pub async fn events(&self, id: &str) -> Result<Vec<Event>> {

@@ -172,6 +172,7 @@ what the host allowed or denied. Read it with:
 ```bash
 runner runs audit RUN_ID          # a table, one line per record
 runner runs audit RUN_ID --json   # one JSON record per line
+runner sessions audit SESSION_ID  # every run in the session, a run at a time
 ```
 
 ```
@@ -214,7 +215,8 @@ Limits and failures:
   the run. Saving is asynchronous, so actions already under way when that
   happens may finish unrecorded.
 - Records are kept as long as their run. They're readable with the same local
-  API token as the rest of the API (`GET /v1/runs/{id}/audit`).
+  API token as the rest of the API (`GET /v1/runs/{id}/audit`, or
+  `GET /v1/sessions/{id}/audit` for every run in a session).
 - A delegated child is its own run, with its own trail; the parent's shows
   the `delegate` and `wait` calls.
 
