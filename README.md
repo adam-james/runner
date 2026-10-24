@@ -398,6 +398,8 @@ fresh_per_call = true  # a new instance for every call
   interrupted by Wasmtime's epoch deadline) and one stuck waiting
   (`time.sleep(1000)`, cut off by a timer). Either way the model just
   gets an error back, and the agent continues the turn.
+- `max_memory_mb` defaults to 512 for every provider and tool that doesn't
+  set it, so no component can grow to the 4 GiB a 32-bit memory allows.
 - Every tool's result (or error) is cut to 64 KB by the host before the
   model sees it. `app.py` cuts printed output shorter itself, but a script
   runs in the same interpreter and could undo that, so the host's cap is
@@ -564,4 +566,9 @@ wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/pyth
 
 The python tool imports no `wasi:http` at all. It does import
 `wasi:sockets`, as every componentize-py component does, but the host
-grants no socket permissions, so any connection attempt is denied.
+turns TCP, UDP and name lookups off for every component, so any socket is
+refused. `allowed_hosts` only governs `wasi:http`; no config grants sockets.
+
+The daemon also refuses to start if any component's `dir` contains its data
+directory (`~/.runner/service` by default, with the local API token and
+database) or sits inside it.

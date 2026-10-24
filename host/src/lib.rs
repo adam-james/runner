@@ -242,8 +242,9 @@ struct ComponentConfig {
     /// off and the model gets a "timed out" error. Without one, a call can
     /// run forever.
     timeout_secs: Option<u64>,
-    /// Cap on the component's memory, in MiB. Past it, growing memory fails
-    /// inside the component (e.g. Python's `MemoryError`).
+    /// Cap on the component's memory, in MiB; `DEFAULT_MAX_MEMORY_MB` if
+    /// omitted. Past it, growing memory fails inside the component (e.g.
+    /// Python's `MemoryError`).
     max_memory_mb: Option<u64>,
     /// Tools only: give every call a new instance, so nothing carries over
     /// between calls and a call that's cut off doesn't break the tool.
@@ -551,19 +552,27 @@ fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
     })
 }
 
+/// A component's memory cap when its config doesn't set one. Without any,
+/// each instance could grow to 4 GiB, the most a 32-bit memory can address.
+pub const DEFAULT_MAX_MEMORY_MB: u64 = 512;
+
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
 fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
     let mut wasi = WasiCtx::builder();
+    // Components only get the network through `wasi:http` and its
+    // allow-list. wasmtime already refuses every socket address by default;
+    // turning sockets off here keeps that true whatever its defaults become.
+    wasi.allow_tcp(false)
+        .allow_udp(false)
+        .allow_ip_name_lookup(false);
     if let Some((dir, perms)) = mounted_dir(config)? {
         wasi.preopened_dir(&dir, "/", perms)
             .map_err(|e| Error::msg(format!("dir for {}: opening {dir}: {e}", config.path)))?;
     }
 
-    let mut limits = StoreLimitsBuilder::new();
-    if let Some(mb) = config.max_memory_mb {
-        limits = limits.memory_size(mb as usize * 1024 * 1024);
-    }
+    let mb = config.max_memory_mb.unwrap_or(DEFAULT_MAX_MEMORY_MB);
+    let limits = StoreLimitsBuilder::new().memory_size(mb as usize * 1024 * 1024);
 
     let state = SandboxState {
         wasi: wasi.build(),
@@ -1143,6 +1152,13 @@ impl Runtime {
             .collect()
     }
 
+    /// Refuses a config that mounts `protected` (the service's data
+    /// directory, with its API token and database) into any component, or
+    /// mounts a directory inside it.
+    pub fn check_dirs_exclude(&self, protected: &std::path::Path) -> Result<()> {
+        dirs_exclude(&self.config, protected)
+    }
+
     fn component(&self, path: &str) -> Result<Component> {
         self.components
             .get(path)
@@ -1264,6 +1280,29 @@ fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &Componen
         .values()
         .map(|provider| &provider.component)
         .chain(config.tools.values())
+}
+
+fn dirs_exclude(config: &RunnerConfig, protected: &std::path::Path) -> Result<()> {
+    let Ok(protected) = protected.canonicalize() else {
+        return Ok(());
+    };
+    for component in sandboxed_components(config) {
+        let Some(dir) = &component.dir else { continue };
+        // A dir that doesn't exist yet can't contain anything.
+        let Ok(dir) = std::path::Path::new(dir).canonicalize() else {
+            continue;
+        };
+        if protected.starts_with(&dir) || dir.starts_with(&protected) {
+            bail!(
+                "dir for {}: {} would give it the runner's data directory {}; \
+                 use a dedicated directory",
+                component.path,
+                dir.display(),
+                protected.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Strips configured credentials out of a message headed for run storage
@@ -1982,6 +2021,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["files", "sports", "weather"]
         );
+    }
+
+    #[test]
+    fn dirs_must_not_expose_the_data_directory() {
+        let root = std::env::temp_dir().join(format!("runner-dirs-{}", std::process::id()));
+        let data = root.join("service");
+        let inside = data.join("sub");
+        let sibling = root.join("notes");
+        for dir in [&inside, &sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = |dir: &std::path::Path| -> RunnerConfig {
+            toml::from_str(&format!(
+                "[tools.read_file]\npath = \"files.wasm\"\ndir = {:?}\n",
+                dir.to_str().unwrap()
+            ))
+            .unwrap()
+        };
+        for exposing in [&root, &data, &inside] {
+            let error = dirs_exclude(&config(exposing), &data)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("data directory"), "{error}");
+        }
+        dirs_exclude(&config(&sibling), &data).unwrap();
+        dirs_exclude(&config(&root.join("missing")), &data).unwrap();
+        // The same directory reached through `..` is still caught.
+        dirs_exclude(&config(&sibling.join("..")), &data).unwrap_err();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

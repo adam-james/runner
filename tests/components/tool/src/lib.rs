@@ -19,6 +19,15 @@ impl Guest for Tool {
                 Ok((CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).to_string())
             }
             "trap" => panic!("fixture tool trap"),
+            // Touches every byte, so the memory is really grown.
+            alloc if alloc.starts_with("alloc:") => {
+                let mb: usize = alloc["alloc:".len()..].parse().map_err(|_| "bad size")?;
+                Ok(vec![1u8; mb << 20]
+                    .iter()
+                    .map(|&b| b as usize)
+                    .sum::<usize>()
+                    .to_string())
+            }
             "read-allowed" => std::fs::read_to_string("/allowed.txt").map_err(|e| e.to_string()),
             "spin" => loop {
                 std::hint::black_box(42);

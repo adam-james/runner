@@ -1550,3 +1550,35 @@ async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
     stop.cancel();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn components_without_a_memory_cap_get_the_default_one() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let finished = |session: &'static str, prompt: String| {
+        let runtime = runtime.clone();
+        async move {
+            let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = events.clone();
+            let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+            runtime
+                .run_turn("default", session, &prompt, sink)
+                .await
+                .unwrap();
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .find(|e| e["kind"] == "tool_finished")
+                .unwrap()
+                .clone()
+        }
+    };
+    // The fixture tool sets no `max_memory_mb`.
+    assert_eq!(finished("small", "tool:alloc:64".into()).await["ok"], true);
+    let over = host::DEFAULT_MAX_MEMORY_MB + 64;
+    assert_eq!(
+        finished("large", format!("tool:alloc:{over}")).await["ok"],
+        false
+    );
+}
