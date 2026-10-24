@@ -116,6 +116,31 @@ weather, or `runner chat --agent research_coordinator` for local notes plus web
 research. Children get fresh sessions and their own configured capabilities.
 See [delegation examples and limits](docs/delegation.md).
 
+`runner tools wat NAME` prints a configured tool as WAT-style text, headed by
+what its config grants it: allowed hosts, which headers are injected and where
+(never their values) and directory access, then what the host enforces whatever
+the component imports: e.g. sockets are always refused, the environment is
+empty, and every call ends at its run's deadline. It reads the config and
+component directly, so the daemon needn't be running. By default it lists every
+import and export of the component and its nested core modules, without code or
+data; imports are what the component can ask the host for.
+
+```bash
+runner tools wat get_weather                        # imports and exports, nested modules too
+runner tools wat anthropic --provider --detail interface  # only the outer component's
+runner tools wat run_python --detail full > python.wat    # complete WAT; can be huge
+```
+
+Agents with `inspect_components = true` get a host `inspect_component` tool
+that returns the same summary for any component the config names, and nothing
+else: it takes a configured name, never a path, and doesn't offer full WAT. The
+example `security_auditor` agent uses it to review components for capability
+overreach, unneeded imports and risky config:
+
+```bash
+runner run --agent security_auditor "Audit every configured tool and rank the risks."
+```
+
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;
 set `run --deadline-secs N` or `chat --deadline-secs N` (1–86400 seconds). The
@@ -452,6 +477,8 @@ fresh_per_call = true  # a new instance for every call
   interrupted by Wasmtime's epoch deadline) and one stuck waiting
   (`time.sleep(1000)`, cut off by a timer). Either way the model just
   gets an error back, and the agent continues the turn.
+- `max_memory_mb` defaults to 512 for every provider and tool that doesn't
+  set it, so no component can grow to the 4 GiB a 32-bit memory allows.
 - Every tool's result (or error) is cut to 64 KB by the host before the
   model sees it. `app.py` cuts printed output shorter itself, but a script
   runs in the same interpreter and could undo that, so the host's cap is
@@ -618,4 +645,9 @@ wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/pyth
 
 The python tool imports no `wasi:http` at all. It does import
 `wasi:sockets`, as every componentize-py component does, but the host
-grants no socket permissions, so any connection attempt is denied.
+turns TCP, UDP and name lookups off for every component, so any socket is
+refused. `allowed_hosts` only governs `wasi:http`; no config grants sockets.
+
+The daemon also refuses to start if any component's `dir` contains its data
+directory (`~/.runner/service` by default, with the local API token and
+database) or sits inside it.

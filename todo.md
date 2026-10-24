@@ -10,7 +10,8 @@ the reason to pick runner.
 - show what a tool or provider can do before it's enabled: component imports plus config `allowed_hosts`, `dir`/`dir_writable`, injected headers
   - e.g. "`web_search` can reach api.tavily.com, gets an Authorization header there, has no filesystem access"
   - `runner tools inspect NAME`, and in `agents list` / session banners
-- wasm inspector - turn to s-expression and have llm read it - inspect agents and tools
+- ~~wasm inspector - turn to s-expression and have llm read it~~ done: `runner tools wat` and the host `inspect_component` tool
+  - next: include each tool's `describe()` text so the auditor sees its stated purpose, not just its name
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID`
   - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
   - next: alerts on denials/refusals, retention beyond the run, a separate audit-read token, recording per-file access if the host ever mediates it
@@ -21,11 +22,19 @@ the reason to pick runner.
   - cover tool execution, allowed and denied network/filesystem access, capability violations, and guest traps or resource-limit termination
   - define retention, audit access controls, alerts, and detection of missing events or collector outages
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
-- add an agent that can audit security
+- ~~add an agent that can audit security~~ done: `security_auditor` in runner.toml
 - docs: say loudly that keys never enter the sandbox
 
 ## 2. Enforce capabilities at the moment they matter
 
+- lock each session to one agent for its whole life
+  - why: history (including tool results) carries across a session's runs, so switching agents combines capabilities no single agent has, e.g. `reader` reads a secret, then `researcher` can leak it via `web_search`; it can also hand history to a different provider
+  - runs are already locked to their agent (set at submit, never updated); the session is the gap
+  - record the agent on the session at creation or first run (schema change); reject runs naming a different agent
+  - switching agents means a new session: TUI Ctrl-A opens one; `chat`/`run --session X --agent Y` with a mismatch errors with a hint
+  - existing mixed-agent sessions lock to their most recent agent
+  - later, if missed: explicit handoff to a new session seeded with prompts and replies only (no tool results), behind a confirmation
+  - longer term: taint tracking of history from sensitive tools instead of a blanket lock
 - dynamic tool config and permissioning
   - per-run grants, e.g. "this run may write to `~/.runner/files` until it ends"; record every decision in the audit log
 - approval checkpoints: tools declare side-effecting actions (send email, book, `git push`); the run pauses durably until approved from CLI/TUI/remote

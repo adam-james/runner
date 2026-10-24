@@ -2,6 +2,7 @@ mod activity;
 mod audit;
 pub mod delegation;
 mod transcript;
+pub mod wat;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -75,6 +76,10 @@ struct AgentConfig {
     tools: Vec<String>,
     #[serde(default)]
     delegates: Vec<String>,
+    /// Grants the host's `inspect_component` tool, which reads every
+    /// configured component's imports, exports and config capabilities.
+    #[serde(default)]
+    inspect_components: bool,
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
@@ -93,6 +98,7 @@ struct AgentDefinition {
     provider: ProviderConfig,
     tools: BTreeMap<String, ComponentConfig>,
     delegates: Vec<String>,
+    inspect_components: bool,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_model_calls: Option<u32>,
@@ -139,8 +145,8 @@ fn validate_table_key(kind: &str, name: &str) -> Result<()> {
 fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinition>> {
     for name in config.tools.keys() {
         validate_table_key("tool", name)?;
-        if matches!(name.as_str(), "delegate" | "wait") {
-            bail!("tool name '{name}' is reserved for host delegation");
+        if matches!(name.as_str(), "delegate" | "wait" | wat::TOOL) {
+            bail!("tool name '{name}' is reserved for a host tool");
         }
     }
     for name in config.providers.keys() {
@@ -203,6 +209,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 provider,
                 tools,
                 delegates: agent.delegates.clone(),
+                inspect_components: agent.inspect_components,
                 system_prompt: agent.system_prompt.clone(),
                 max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 max_model_calls: agent.max_model_calls,
@@ -243,8 +250,9 @@ struct ComponentConfig {
     /// off and the model gets a "timed out" error. Without one, a call can
     /// run forever.
     timeout_secs: Option<u64>,
-    /// Cap on the component's memory, in MiB. Past it, growing memory fails
-    /// inside the component (e.g. Python's `MemoryError`).
+    /// Cap on the component's memory, in MiB; `DEFAULT_MAX_MEMORY_MB` if
+    /// omitted. Past it, growing memory fails inside the component (e.g.
+    /// Python's `MemoryError`).
     max_memory_mb: Option<u64>,
     /// Tools only: give every call a new instance, so nothing carries over
     /// between calls and a call that's cut off doesn't break the tool.
@@ -660,6 +668,16 @@ fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
     })
 }
 
+/// A component's memory cap when its config doesn't set one. Without any,
+/// each instance could grow to 4 GiB, the most a 32-bit memory can address.
+pub const DEFAULT_MAX_MEMORY_MB: u64 = 512;
+
+/// The memory cap a component's stores get. The inspector reports this same
+/// value, so what it says can't drift from what's enforced.
+fn memory_cap_mb(config: &ComponentConfig) -> u64 {
+    config.max_memory_mb.unwrap_or(DEFAULT_MAX_MEMORY_MB)
+}
+
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
 fn sandbox_store(
@@ -671,6 +689,12 @@ fn sandbox_store(
     // checks each file operation against it, so its mount is what's recorded.
     let mut ticket = audit.cell.reserve(&audit.id, "sandbox.create");
     let mut wasi = WasiCtx::builder();
+    // Components only get the network through `wasi:http` and its
+    // allow-list. wasmtime already refuses every socket address by default;
+    // turning sockets off here keeps that true whatever its defaults become.
+    wasi.allow_tcp(false)
+        .allow_udp(false)
+        .allow_ip_name_lookup(false);
     if let Some((dir, perms)) = mounted_dir(config)? {
         wasi.preopened_dir(&dir, "/", perms)
             .map_err(|e| Error::msg(format!("dir for {}: opening {dir}: {e}", config.path)))?;
@@ -686,10 +710,8 @@ fn sandbox_store(
     ticket.field("max_memory_mb", config.max_memory_mb);
     ticket.field("timeout_secs", config.timeout_secs);
 
-    let mut limits = StoreLimitsBuilder::new();
-    if let Some(mb) = config.max_memory_mb {
-        limits = limits.memory_size(mb as usize * 1024 * 1024);
-    }
+    let mb = memory_cap_mb(config);
+    let limits = StoreLimitsBuilder::new().memory_size(mb as usize * 1024 * 1024);
 
     let state = SandboxState {
         wasi: wasi.build(),
@@ -893,6 +915,8 @@ struct SessionComponents {
     tools: HashMap<String, ToolHandle>,
     /// Shared with every store above, which record into the running turn's trail.
     audit: audit::AuditCell,
+    /// Set for definitions with `inspect_components`.
+    inspector: Option<Arc<RunnerConfig>>,
 }
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
@@ -1036,7 +1060,8 @@ impl SessionComponents {
             tool = ?activity::bounded_name(name),
             component = ?self.tools.get(name).map(|tool| &tool.config.path));
         let guard = activity::Activity::new(span.clone(), "tool");
-        let host_tool = matches!(name, "delegate" | "wait");
+        let inspector = (name == wat::TOOL).then_some(self.inspector.clone()).flatten();
+        let host_tool = matches!(name, "delegate" | "wait") || inspector.is_some();
         let component = match self.tools.get(name) {
             Some(tool) => tool.audit.id.clone(),
             None => Arc::new(audit::ComponentId {
@@ -1052,7 +1077,10 @@ impl SessionComponents {
             };
             ticket.field("input_bytes", input.len());
             let (result, decision, outcome) = if host_tool {
-                let result = delegation::call(delegation, targets, name, input).await;
+                let result = match inspector {
+                    Some(config) => wat::call(config, input).await.map(cap_tool_output),
+                    None => delegation::call(delegation, targets, name, input).await,
+                };
                 let outcome = if result.is_ok() { "ok" } else { "error" };
                 (result, audit::Decision::Allowed, outcome)
             } else {
@@ -1345,8 +1373,11 @@ impl Runtime {
                 let mut tools: Vec<_> = definition.tools.keys().cloned().collect();
                 if !definition.delegates.is_empty() {
                     tools.extend(["delegate".into(), "wait".into()]);
-                    tools.sort();
                 }
+                if definition.inspect_components {
+                    tools.push(wat::TOOL.into());
+                }
+                tools.sort();
                 AgentInfo {
                     name: name.clone(),
                     provider: definition.provider_name.clone(),
@@ -1362,6 +1393,13 @@ impl Runtime {
 
     fn digest(&self, path: &str) -> Option<String> {
         self.digests.get(path).cloned()
+    }
+
+    /// Refuses a config that mounts `protected` (the service's data
+    /// directory, with its API token and database) into any component, or
+    /// mounts a directory inside it.
+    pub fn check_dirs_exclude(&self, protected: &std::path::Path) -> Result<()> {
+        dirs_exclude(&self.config, protected)
     }
 
     fn component(&self, path: &str) -> Result<Component> {
@@ -1495,12 +1533,17 @@ impl Runtime {
                 input_schema_json: tool.description.input_schema_json.clone(),
             })
             .collect();
+        let inspector = definition.inspect_components.then(|| self.config.clone());
+        if let Some(config) = &inspector {
+            definitions.extend(wat::definitions(config));
+        }
         sort_tool_definitions(&mut definitions);
         Ok(SessionComponents {
             provider,
             tools,
             tool_definitions: definitions,
             audit,
+            inspector,
         })
     }
 }
@@ -1512,6 +1555,29 @@ fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &Componen
         .values()
         .map(|provider| &provider.component)
         .chain(config.tools.values())
+}
+
+fn dirs_exclude(config: &RunnerConfig, protected: &std::path::Path) -> Result<()> {
+    let Ok(protected) = protected.canonicalize() else {
+        return Ok(());
+    };
+    for component in sandboxed_components(config) {
+        let Some(dir) = &component.dir else { continue };
+        // A dir that doesn't exist yet can't contain anything.
+        let Ok(dir) = std::path::Path::new(dir).canonicalize() else {
+            continue;
+        };
+        if protected.starts_with(&dir) || dir.starts_with(&protected) {
+            bail!(
+                "dir for {}: {} would give it the runner's data directory {}; \
+                 use a dedicated directory",
+                component.path,
+                dir.display(),
+                protected.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Strips configured credentials out of a message headed for run storage
@@ -2023,7 +2089,7 @@ mod tests {
             )
             .is_err()
         );
-        for name in ["delegate", "wait"] {
+        for name in ["delegate", "wait", "inspect_component"] {
             assert!(agents("[agents.default]\nprovider = \"main\"", &[name, "docs"]).is_err());
         }
     }
@@ -2220,6 +2286,9 @@ mod tests {
             ["research_lead", "reader"]
         );
         assert_eq!(agents["research_lead"].delegates, ["researcher"]);
+        assert!(agents["security_auditor"].inspect_components);
+        assert!(agents["security_auditor"].tools.is_empty());
+        assert!(!agents["default"].inspect_components);
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]
@@ -2357,6 +2426,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["files", "sports", "weather"]
         );
+    }
+
+    #[test]
+    fn dirs_must_not_expose_the_data_directory() {
+        let root = std::env::temp_dir().join(format!("runner-dirs-{}", std::process::id()));
+        let data = root.join("service");
+        let inside = data.join("sub");
+        let sibling = root.join("notes");
+        for dir in [&inside, &sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = |dir: &std::path::Path| -> RunnerConfig {
+            toml::from_str(&format!(
+                "[tools.read_file]\npath = \"files.wasm\"\ndir = {:?}\n",
+                dir.to_str().unwrap()
+            ))
+            .unwrap()
+        };
+        for exposing in [&root, &data, &inside] {
+            let error = dirs_exclude(&config(exposing), &data)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("data directory"), "{error}");
+        }
+        dirs_exclude(&config(&sibling), &data).unwrap();
+        dirs_exclude(&config(&root.join("missing")), &data).unwrap();
+        // The same directory reached through `..` is still caught.
+        dirs_exclude(&config(&sibling.join("..")), &data).unwrap_err();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

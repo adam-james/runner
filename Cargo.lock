@@ -1726,9 +1726,12 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "wasmparser 0.258.3",
+ "wasmprinter 0.258.3",
  "wasmtime 49.0.3",
  "wasmtime-wasi 49.0.3",
  "wasmtime-wasi-http",
+ "wat",
 ]
 
 [[package]]
