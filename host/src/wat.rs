@@ -217,7 +217,10 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
             Kind::Tool => limit(component.timeout_secs, "s"),
             Kind::Provider => "n/a for providers".into(),
         },
-        limit(component.max_memory_mb, " MiB"),
+        match component.max_memory_mb {
+            Some(_) => format!("{} MiB", crate::memory_cap_mb(component)),
+            None => format!("{} MiB (default)", crate::memory_cap_mb(component)),
+        },
     ));
     out
 }
@@ -533,8 +536,15 @@ mod tests {
         assert!(text.contains("one per session"), "{text}");
         assert!(text.contains("credentials: the host adds"), "{text}");
         assert!(
-            text.contains("timeout_secs: 5s; max_memory_mb: none"),
+            text.contains(&format!(
+                "timeout_secs: 5s; max_memory_mb: {} MiB (default)",
+                crate::DEFAULT_MAX_MEMORY_MB
+            )),
             "{text}"
+        );
+        assert!(
+            !text.contains("none"),
+            "every component has a memory cap: {text}"
         );
         assert!(!text.contains(";;   wasi:http:"), "{text}");
         assert!(!text.contains("stdout"), "{text}");

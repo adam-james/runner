@@ -563,6 +563,12 @@ fn dir_note(config: &ComponentConfig) -> Option<&'static str> {
 /// each instance could grow to 4 GiB, the most a 32-bit memory can address.
 pub const DEFAULT_MAX_MEMORY_MB: u64 = 512;
 
+/// The memory cap a component's stores get. The inspector reports this same
+/// value, so what it says can't drift from what's enforced.
+fn memory_cap_mb(config: &ComponentConfig) -> u64 {
+    config.max_memory_mb.unwrap_or(DEFAULT_MAX_MEMORY_MB)
+}
+
 /// A new store for a provider or tool from `config`: its own WASI context,
 /// `wasi:http` allow-list and memory cap.
 fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<SandboxState>> {
@@ -578,7 +584,7 @@ fn sandbox_store(engine: &Engine, config: &ComponentConfig) -> Result<Store<Sand
             .map_err(|e| Error::msg(format!("dir for {}: opening {dir}: {e}", config.path)))?;
     }
 
-    let mb = config.max_memory_mb.unwrap_or(DEFAULT_MAX_MEMORY_MB);
+    let mb = memory_cap_mb(config);
     let limits = StoreLimitsBuilder::new().memory_size(mb as usize * 1024 * 1024);
 
     let state = SandboxState {
