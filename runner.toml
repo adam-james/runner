@@ -18,17 +18,22 @@ headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = [
     "api.anthropic.com",
 ] } }
 
+# A hung API shouldn't hold a run until its deadline; a timed-out tool gets a
+# new instance before its next call.
 [tools.get_weather]
 path = "target/wasm32-wasip2/release/weather.wasm"
 allowed_hosts = ["api.open-meteo.com", "geocoding-api.open-meteo.com"]
+timeout_secs = 30
 
 [tools.get_scores]
 path = "target/wasm32-wasip2/release/sports.wasm"
 allowed_hosts = ["site.api.espn.com"]
+timeout_secs = 30
 
 [tools.web_search]
 path = "target/wasm32-wasip2/release/search.wasm"
 allowed_hosts = ["api.tavily.com"]
+timeout_secs = 30
 headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = [
     "api.tavily.com",
 ] } }
@@ -36,6 +41,7 @@ headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = [
 [tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
 allowed_hosts = ["docs.rs", "doc.rust-lang.org"]
+timeout_secs = 30
 
 # Runs Python the model writes, so it's boxed in more tightly than the rest.
 # Built by `cargo run -p build-python --release`.
