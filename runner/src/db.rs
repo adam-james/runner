@@ -481,6 +481,16 @@ impl Database {
         .collect()
     }
 
+    /// Whether any run in `session_id` belongs to the delegation tree rooted
+    /// at `root_run_id`.
+    pub fn session_in_tree(&self, session_id: &str, root_run_id: &str) -> Result<bool> {
+        Ok(self.0.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND root_run_id=?2)",
+            params![session_id, root_run_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The audit records of every run in a session, a run at a time in the
     /// order they started, each oldest first. `None` if there's no such
     /// session.

@@ -6,6 +6,12 @@ pub type Reply<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send 
 pub trait Delegation: Send + Sync {
     fn delegate(&self, agent: String, prompt: String, deadline_secs: Option<u64>) -> Reply<'_>;
     fn wait(&self, run_id: String) -> Reply<'_>;
+    /// `trail`'s audit records as text for a reviewing agent, or why the
+    /// caller may not read them.
+    fn audit_trail(&self, trail: crate::trails::Trail) -> Reply<'_> {
+        let _ = trail;
+        Box::pin(async { Err("audit trails aren't available here".into()) })
+    }
 }
 
 #[derive(serde::Deserialize)]
