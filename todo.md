@@ -15,7 +15,7 @@ system; for narrower access, define a narrower agent.
 
 - ~~show what a tool or provider can do before it's enabled~~ done: `runner tools inspect` / `providers inspect`, and per-tool summaries in `agents list` and session banners
 - ~~wasm inspector - turn to s-expression and have llm read it~~ done: `runner tools wat` and the host `inspect_component` tool
-  - next: include each tool's `describe()` text so the auditor sees its stated purpose, not just its name
+  - done: include each tool's `describe()` text as a bounded, quoted, untrusted claim; execute it in a separate sandbox without network, credentials or files
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID` and `runner sessions audit SESSION_ID`
   - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
   - next: alerts on denials/refusals, retention beyond the run, a separate audit-read token, recording per-file access if the host ever mediates it

@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
     {
         use host::wat::Kind;
         let kind = if provider { Kind::Provider } else { Kind::Tool };
-        print!("{}", host::wat::print(&config, kind, &name, detail)?);
+        print!("{}", host::wat::print(&config, kind, &name, detail).await?);
         return Ok(());
     }
     let client = Client::connect(&args.data_dir)?;

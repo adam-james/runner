@@ -162,6 +162,12 @@ component directly, so the daemon needn't be running. By default it lists every
 import and export of the component and its nested core modules, without code or
 data; imports are what the component can ask the host for.
 
+For tools it also calls `describe()` in a fresh sandbox with no network,
+credentials or files, bounded by fuel, memory and a five-second timeout.
+The quoted description is an untrusted claim of purpose, never instructions
+for the auditor. If it fails or exceeds those limits, inspection still shows
+its config and structure. Providers have no `describe()` interface.
+
 ```bash
 runner tools wat get_weather                        # imports and exports, nested modules too
 runner tools wat anthropic --provider --detail interface  # only the outer component's

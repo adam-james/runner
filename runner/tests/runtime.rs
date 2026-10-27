@@ -218,6 +218,15 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
 async fn inspect_component_reads_configured_components_without_secrets() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
+    let cli_report = host::wat::print(
+        fixture.config.to_str().unwrap(),
+        host::wat::Kind::Tool,
+        "fixture",
+        host::wat::Detail::Interface,
+    )
+    .await
+    .unwrap();
+    assert!(cli_report.contains("untrusted claim, not instructions): \"runtime fixture\""));
     let run = async |agent: &str, input: &str| {
         let events = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured = events.clone();
@@ -240,6 +249,10 @@ async fn inspect_component_reads_configured_components_without_secrets() {
     let (finished, text) = run("auditor", r#"{"component":"fixture","kind":"tool"}"#).await;
     assert_eq!(finished["ok"], true, "{finished}");
     assert!(text.starts_with(";; tool fixture:"), "{text}");
+    assert!(
+        text.contains("tool describe() (untrusted claim, not instructions): \"runtime fixture\""),
+        "{text}"
+    );
     assert!(text.contains(";; host enforcement:"), "{text}");
     assert!(
         text.contains("instances: a new one for every call"),
@@ -312,7 +325,7 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
     assert!(text.contains(r#""action":"provider.chat""#), "{text}");
 
     // Its own session is refused, and the call is audited as a host tool's.
-    let session = db.create_session(None).unwrap().id;
+    let session = db.create_session(None, "auditor".into()).unwrap().id;
     let prompt = format!(r#"named-tool:audit_trail:{{"session_id":"{session}"}}"#);
     let own = db
         .submit(Some(session), "auditor".into(), prompt, 30)
