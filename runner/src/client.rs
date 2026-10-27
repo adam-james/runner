@@ -92,6 +92,12 @@ impl Client {
         self.json(Method::GET, "/v1/agents", None).await
     }
 
+    /// What runs of an agent version were allowed.
+    pub async fn agent_version(&self, id: &str) -> Result<crate::db::AgentVersion> {
+        self.json(Method::GET, &format!("/v1/agent-versions/{id}"), None)
+            .await
+    }
+
     /// What each configured provider and tool can do.
     pub async fn components(&self) -> Result<Vec<host::inspect::Capabilities>> {
         self.json(Method::GET, "/v1/components", None).await

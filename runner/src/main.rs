@@ -131,8 +131,12 @@ enum Tools {
 
 #[derive(Subcommand)]
 enum Agents {
-    /// The agent definitions the daemon's config declares.
+    /// The agent definitions the daemon's config declares, with each one's
+    /// current version.
     List,
+    /// What runs of an agent version were allowed: the definition it
+    /// snapshots, as JSON. Runs' audit trails name their version.
+    Version { id: String },
 }
 
 #[derive(Subcommand)]
@@ -304,9 +308,13 @@ async fn main() -> Result<()> {
                 let _ = attach(&client, &id, after, json, &mut interrupt).await?;
             }
         },
-        Command::Agents {
-            command: Agents::List,
-        } => println!("{}", serde_json::to_string_pretty(&client.agents().await?)?),
+        Command::Agents { command } => match command {
+            Agents::List => println!("{}", serde_json::to_string_pretty(&client.agents().await?)?),
+            Agents::Version { id } => println!(
+                "{}",
+                serde_json::to_string_pretty(&client.agent_version(&id).await?)?
+            ),
+        },
         Command::Tools {
             command: Tools::Components(command),
         } => components(&client, host::inspect::ComponentKind::Tool, command).await?,

@@ -35,14 +35,11 @@ system; for narrower access, define a narrower agent.
 
 In order; each step ships something usable on its own.
 
-1. agent versions - an audit trail must show what a run was allowed, not just what it did, even after runner.toml changes
-   - today records keep only the agent's name, component names and digests, and a count of allowed hosts: which hosts, which headers went where, and the agent's tools, provider, model, delegates and flags are lost when the config changes
-   - at the start of each run, snapshot the resolved agent definition: provider and model, each tool's capabilities (allowed hosts, header names and their hosts but never values, dir, limits, component digest; `inspect::Capabilities` has the shape), delegates, flags, and a hash of the system prompt
-   - its hash is the version: store each distinct snapshot once in an `agent_versions` table, and record the version on the run and in `turn.started`
-   - `runs audit` and `run_auditor` compare what a run did with what its version allowed
-   - sessions stay locked to the agent name; each run records its version, so a config change mid-session shows in the trail
+1. ~~agent versions~~ done: each run's resolved agent definition is snapshotted (never header values; system prompt as a hash), stored once per version in `agent_versions`, linked from the run and named in `turn.started`; `runner agents version ID`, and `run_auditor` reviews runs against their versions
+   - next: `runs audit` could show where a run went beyond its version (it can't today, since the host enforces the version, but it would catch a host bug)
 2. schedules pinned to an agent version - one-off and cron schedules (see docs/service.md); each occurrence is an ordinary run in a fresh session
    - a schedule names an agent and pins the version it was created with; if the version changes (config edit or swapped binary), the schedule pauses until re-approved, so an edit made for chat can't quietly widen what an unattended agent can do
+   - delegates are in a version by name only; a schedule's pin must cover the versions of the agents it can delegate to as well
    - read-only background agents (e.g. a morning brief) are safe and useful at this step
 3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
    - host-made summary of every background run from its audit records, no model involved: hosts reached, denials, errors, trail gaps, pending approvals

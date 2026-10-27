@@ -274,9 +274,11 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
     let fixture = Fixture::new();
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
+    let runtime = fixture.runtime().await.host;
+    let version = runtime.agent_version("default").unwrap().id;
     let task = tokio::spawn(worker(
         db.clone(),
-        Arc::new(WasmExecutor(fixture.runtime().await.host)),
+        Arc::new(WasmExecutor(runtime)),
         1,
         stop.clone(),
     ));
@@ -310,9 +312,16 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
     );
     assert!(text.contains("\nTrail problems:\nnone\n"), "{text}");
     assert!(text.contains(r#""action":"provider.chat""#), "{text}");
+    // What the run was allowed, from the version its trail names.
+    assert!(
+        text.contains(&format!(
+            r#"{{"id":"{version}","agent":"default","definition":"#
+        )),
+        "{text}"
+    );
 
     // Its own session is refused, and the call is audited as a host tool's.
-    let session = db.create_session(None).unwrap().id;
+    let session = db.create_session(None, "auditor".into()).unwrap().id;
     let prompt = format!(r#"named-tool:audit_trail:{{"session_id":"{session}"}}"#);
     let own = db
         .submit(Some(session), "auditor".into(), prompt, 30)
@@ -341,6 +350,101 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
+async fn agent_versions_record_what_each_run_was_allowed() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await.host;
+    let version = runtime.agent_version("default").unwrap();
+    // The same config and components always give the same version.
+    assert_eq!(
+        fixture.runtime().await.host.agent_version("default"),
+        Some(version.clone())
+    );
+    assert!(version.id.starts_with("sha256:"));
+    let definition = &version.definition;
+    assert_eq!(definition["model"], "fixture");
+    assert_eq!(definition["tools"][0]["name"], "fixture");
+    assert!(
+        definition["tools"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(definition["tools"][0]["timeout_secs"], 1);
+    assert_eq!(
+        definition["provider"]["headers"],
+        serde_json::json!([{"name":"x-api-key", "hosts":["fixture.invalid"]}])
+    );
+    let notools = runtime.agent_version("notools").unwrap();
+    for text in [definition.to_string(), notools.definition.to_string()] {
+        assert!(!text.contains("host-only-fixture-key"), "{text}");
+        // Its system prompt only as a hash.
+        assert!(!text.contains("Answer without tools"), "{text}");
+    }
+    assert_ne!(notools.id, version.id);
+
+    let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
+    let run_once = async |runtime: host::Runtime| {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(worker(
+            db.clone(),
+            Arc::new(WasmExecutor(runtime)),
+            1,
+            stop.clone(),
+        ));
+        let run = db
+            .submit(None, "default".into(), "hello".into(), 30)
+            .unwrap();
+        wait(&db, &run.id, "completed").await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        run.id
+    };
+    let first = run_once(runtime).await;
+    assert_eq!(
+        db.run_agent_version(&first).unwrap(),
+        Some(version.id.clone())
+    );
+    let started = &db.audit(&first).unwrap()[0].data;
+    assert_eq!(started["action"], "turn.started");
+    assert_eq!(started["agent_version"], version.id.as_str());
+    let stored = db.agent_version(&version.id).unwrap().unwrap();
+    assert_eq!(stored.agent, "default");
+    assert_eq!(&stored.definition, definition);
+    // Versions aren't part of the run's event stream.
+    assert!(
+        !db.events(&first, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.data["kind"] == "agent_version")
+    );
+
+    // A config change makes a new version; the earlier run keeps its own.
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    let changed = config.replacen(
+        "[agents.default]\nprovider = \"fixture\"\n",
+        "[agents.default]\nprovider = \"fixture\"\nmax_model_calls = 7\n",
+        1,
+    );
+    assert_ne!(changed, config);
+    std::fs::write(&fixture.config, changed).unwrap();
+    let runtime = fixture.runtime().await.host;
+    let newer = runtime.agent_version("default").unwrap();
+    assert_ne!(newer.id, version.id);
+    assert_eq!(newer.definition["max_model_calls"], 7);
+    let second = run_once(runtime).await;
+    assert_eq!(db.run_agent_version(&second).unwrap(), Some(newer.id));
+    assert_eq!(
+        db.run_agent_version(&first).unwrap(),
+        Some(version.id.clone())
+    );
+    assert_eq!(
+        &db.agent_version(&version.id).unwrap().unwrap().definition,
+        definition
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
@@ -352,6 +456,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
         ),
     )]
     .into();
+    let version = |agent: &str| runtime.host.agent_version(agent).unwrap().id;
     assert_eq!(
         runtime.agents(),
         [
@@ -363,6 +468,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                version: version("auditor"),
                 tool_access: Default::default(),
             },
             host::AgentInfo {
@@ -373,6 +479,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                version: version("default"),
                 tool_access: access.clone(),
             },
             host::AgentInfo {
@@ -383,6 +490,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: 99,
                 max_model_calls: Some(1),
+                version: version("limited"),
                 tool_access: access.clone(),
             },
             host::AgentInfo {
@@ -393,6 +501,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                version: version("notools"),
                 tool_access: Default::default(),
             },
         ]

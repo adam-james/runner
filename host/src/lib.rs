@@ -4,6 +4,7 @@ pub mod delegation;
 pub mod inspect;
 pub mod trails;
 mod transcript;
+pub mod version;
 pub mod wat;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -116,6 +117,22 @@ impl AgentDefinition {
     fn model(&self) -> &str {
         self.provider.model.as_deref().unwrap_or_default()
     }
+
+    /// The tools the host provides it itself, sorted.
+    fn host_tools(&self) -> Vec<&'static str> {
+        let mut tools = Vec::new();
+        if !self.delegates.is_empty() {
+            tools.extend(["delegate", "wait"]);
+        }
+        if self.inspect_components {
+            tools.push(wat::TOOL);
+        }
+        if self.read_audit_trails {
+            tools.push(trails::TOOL);
+        }
+        tools.sort();
+        tools
+    }
 }
 
 /// The name of the definition used when a run doesn't pick one.
@@ -132,6 +149,9 @@ pub struct AgentInfo {
     pub delegates: Vec<String>,
     pub max_tokens: u32,
     pub max_model_calls: Option<u32>,
+    /// Its current `version::AgentVersion` id.
+    #[serde(default)]
+    pub version: String,
     /// A one-line summary of what each of `tools` can reach, by tool name;
     /// see `inspect::Capabilities::summary`. Host tools aren't listed.
     #[serde(default)]
@@ -1318,6 +1338,8 @@ pub struct Runtime {
     capabilities: Arc<Vec<inspect::Capabilities>>,
     /// Each component file's SHA-256, as read when it was loaded, for audit records.
     digests: Arc<HashMap<String, String>>,
+    /// Each agent definition's version, by agent name.
+    versions: Arc<BTreeMap<String, version::AgentVersion>>,
     _ticker: Arc<EpochTicker>,
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionSlot>>>,
 }
@@ -1369,7 +1391,7 @@ impl Runtime {
             components.insert(path.clone(), component);
             digests.insert(path.clone(), audit::digest(&bytes));
         }
-        let capabilities = config
+        let capabilities: Vec<_> = config
             .providers
             .iter()
             .map(|(name, provider)| (inspect::ComponentKind::Provider, name, &provider.component))
@@ -1389,6 +1411,7 @@ impl Runtime {
                 )
             })
             .collect();
+        let versions = agent_versions(&agents, &capabilities, &digests);
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
         let ticker = engine.clone();
@@ -1405,6 +1428,7 @@ impl Runtime {
             components: Arc::new(components),
             capabilities: Arc::new(capabilities),
             digests: Arc::new(digests),
+            versions: Arc::new(versions),
             _ticker: Arc::new(EpochTicker(stopped)),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -1417,15 +1441,7 @@ impl Runtime {
             .iter()
             .map(|(name, definition)| {
                 let mut tools: Vec<_> = definition.tools.keys().cloned().collect();
-                if !definition.delegates.is_empty() {
-                    tools.extend(["delegate".into(), "wait".into()]);
-                }
-                if definition.inspect_components {
-                    tools.push(wat::TOOL.into());
-                }
-                if definition.read_audit_trails {
-                    tools.push(trails::TOOL.into());
-                }
+                tools.extend(definition.host_tools().into_iter().map(String::from));
                 tools.sort();
                 AgentInfo {
                     name: name.clone(),
@@ -1435,6 +1451,7 @@ impl Runtime {
                     delegates: definition.delegates.clone(),
                     max_tokens: definition.max_tokens,
                     max_model_calls: definition.max_model_calls,
+                    version: self.versions[name].id.clone(),
                     tool_access: self
                         .capabilities
                         .iter()
@@ -1452,6 +1469,11 @@ impl Runtime {
     /// What every configured provider and tool can do, providers first.
     pub fn capabilities(&self) -> Vec<inspect::Capabilities> {
         self.capabilities.to_vec()
+    }
+
+    /// The version of the definition runs of `agent` get.
+    pub fn agent_version(&self, agent: &str) -> Option<version::AgentVersion> {
+        self.versions.get(agent).cloned()
     }
 
     fn digest(&self, path: &str) -> Option<String> {
@@ -1548,8 +1570,13 @@ impl Runtime {
             .map_or_else(audit::AuditCell::default, |components| {
                 components.audit.clone()
             });
+        // What this run is allowed, ahead of its trail, which names it. The
+        // service stores each version once and links the run to it.
+        let version = &self.versions[agent];
+        events(serde_json::json!({"kind":"agent_version", "id":version.id,
+            "agent":agent, "definition":version.definition}));
         // Started before loading, so a new session's sandboxes are recorded too.
-        let trail = cell.begin(agent, session_id, events.clone());
+        let trail = cell.begin(agent, session_id, &version.id, events.clone());
         let mut components = match reused {
             Some(components) => components,
             None => match self.load_session(definition, cell).await {
@@ -1613,6 +1640,51 @@ impl Runtime {
             audit_trails: definition.read_audit_trails,
         })
     }
+}
+
+/// Each agent definition's version, from the capabilities and digests of
+/// the components it uses.
+fn agent_versions(
+    agents: &BTreeMap<String, AgentDefinition>,
+    capabilities: &[inspect::Capabilities],
+    digests: &HashMap<String, String>,
+) -> BTreeMap<String, version::AgentVersion> {
+    let component = |kind, name: &str| {
+        let capabilities = capabilities
+            .iter()
+            .find(|caps| caps.kind == kind && caps.name == name)
+            .expect("every configured component has capabilities");
+        version::ComponentSnapshot {
+            digest: digests.get(&capabilities.path).map(String::as_str),
+            capabilities,
+        }
+    };
+    agents
+        .iter()
+        .map(|(name, definition)| {
+            let prompt = definition
+                .system_prompt
+                .as_deref()
+                .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+            let snapshot = version::Snapshot {
+                schema: version::SCHEMA_VERSION,
+                agent: name,
+                model: definition.model(),
+                provider: component(inspect::ComponentKind::Provider, &definition.provider_name),
+                tools: definition
+                    .tools
+                    .keys()
+                    .map(|tool| component(inspect::ComponentKind::Tool, tool))
+                    .collect(),
+                host_tools: definition.host_tools(),
+                delegates: &definition.delegates,
+                max_tokens: definition.max_tokens,
+                max_model_calls: definition.max_model_calls,
+                system_prompt_sha256: audit::digest(prompt.as_bytes()),
+            };
+            (name.clone(), snapshot.version())
+        })
+        .collect()
 }
 
 /// Every sandboxed component `config` declares: providers and tools.
@@ -1814,6 +1886,7 @@ mod tests {
         let turn = cell.begin(
             "default",
             "s1",
+            "sha256:00",
             Arc::new(move |value| sink_records.lock().unwrap().push(value)),
         );
         let mut hooks = SandboxHooks {

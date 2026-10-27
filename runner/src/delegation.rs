@@ -93,6 +93,17 @@ impl ExecutionContext {
     }
 }
 
+/// The stored agent versions `records` refer to.
+fn versions_of(
+    db: &Database,
+    records: &[crate::db::Event],
+) -> anyhow::Result<Vec<crate::db::AgentVersion>> {
+    audit::versions(records)
+        .iter()
+        .filter_map(|id| db.agent_version(id).transpose())
+        .collect()
+}
+
 impl Delegation for ExecutionContext {
     fn delegate(&self, agent: String, prompt: String, deadline_secs: Option<u64>) -> Reply<'_> {
         Box::pin(async move {
@@ -133,7 +144,11 @@ impl Delegation for ExecutionContext {
                                  review it"
                                     .to_string())
                             }
-                            Some(_) => Ok(audit::review(&format!("run {id}"), &db.audit(&id)?)),
+                            Some(_) => {
+                                let records = db.audit(&id)?;
+                                let versions = versions_of(&db, &records)?;
+                                Ok(audit::review(&format!("run {id}"), &records, &versions))
+                            }
                         },
                         Trail::Session(id) => {
                             if id == own_session || db.session_in_tree(&id, &root)? {
@@ -144,7 +159,12 @@ impl Delegation for ExecutionContext {
                                 match db.session_audit(&id)? {
                                     None => Err("no session with that id".to_string()),
                                     Some(records) => {
-                                        Ok(audit::review(&format!("session {id}"), &records))
+                                        let versions = versions_of(&db, &records)?;
+                                        Ok(audit::review(
+                                            &format!("session {id}"),
+                                            &records,
+                                            &versions,
+                                        ))
                                     }
                                 }
                             }
