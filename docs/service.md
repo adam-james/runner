@@ -160,21 +160,50 @@ directory.
 
 ## Roadmap
 
-1. **Scheduling:** add durable one-off and cron schedules with explicit time
-   zones and API/CLI management. Each occurrence creates an ordinary run in a
-   fresh session. Unique occurrence IDs prevent duplicate enqueueing. Skip
-   missed recurring occurrences and enqueue overdue one-off tasks once when
-   the daemon returns. No wake-from-sleep or remote execution initially.
-2. **Dynamic agents:** temporary specialists and constrained overrides of static
-   definitions. Host-approved models, tools, and targets bound their authority;
-   define lifetime, quotas, and persistence before implementation. Static
-   delegation is implemented; see [delegation](delegation.md).
-3. **Desktop:** use the same API for sessions, live output, run trees,
-   cancellation, and scheduling. Desktop and CLI share a daemon. Choose the UI
-   framework when implementation starts; it does not determine the runtime.
+The focus is background agents that are secure and auditable: nobody watches
+a background run, so what it may do is approved before it starts, anything
+beyond that waits for an approval that defaults to deny, and the audit log is
+how you find out what happened. Each milestone ships something usable on its
+own; [todo.md](../todo.md) tracks the details.
+
+1. **Schedules with pinned grants:** add durable one-off and cron schedules
+   with explicit time zones and API/CLI management. Each occurrence creates an
+   ordinary run in a fresh session. Unique occurrence IDs prevent duplicate
+   enqueueing. Skip missed recurring occurrences and enqueue overdue one-off
+   tasks once when the daemon returns. No wake-from-sleep or remote execution
+   initially. The schedule is the unit of approval: its agent and that agent's
+   hosts, headers, and directories are reviewed when it's created, and each
+   occurrence runs with an immutable snapshot of them, recorded in its audit
+   trail. The snapshot pins the config and component digests; if either
+   changes, the schedule pauses until it's approved again.
+2. **Run summaries and alerts:** the host summarizes every background run
+   from its audit records, without a model: hosts reached, denials, errors,
+   trail gaps, and pending approvals. Denials, gaps, and hosts a schedule has
+   never reached before raise alerts, and only flagged runs go to the
+   `run_auditor` agent. Audit records are kept longer than their runs, since
+   background runs are reviewed later.
+3. **Asynchronous approvals:** tools declare side-effecting actions in their
+   WIT interface. Such an action pauses its run durably, surviving restarts,
+   until it's approved or denied from the CLI, TUI, or a remote client.
+   Approvals expire, and an expired approval is a denial. Schedules may hold
+   standing approvals for routine, narrow actions. Every approval, denial, and
+   expiry is audited.
+4. **Desktop:** use the same API for sessions, live output, run trees,
+   cancellation, schedules, summaries, and approvals. Desktop and CLI share a
+   daemon. Choose the UI framework when implementation starts; it does not
+   determine the runtime.
+
+Deferred: dynamic agents (temporary specialists and overrides of static
+definitions created at runtime), since a background agent that defines new
+agents is hard to audit; static delegation with reviewed grants fits the
+focus (see [delegation](delegation.md)). If revisited, host-approved models,
+tools, and targets bound their authority, and lifetime, quotas, and
+persistence are defined before implementation. Memory across a schedule's
+runs waits for the milestones above, since it's how a prompt injection would
+persist.
 
 Remote serving, multi-user authorization, automatic retries, durable stack
-checkpoints, and distributed workers are outside this milestone.
+checkpoints, and distributed workers are outside these milestones.
 
 ## Host activity logs
 
