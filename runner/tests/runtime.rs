@@ -730,7 +730,10 @@ async fn capabilities_come_from_imports_and_config_without_secrets() {
     );
     let tool = String::from_utf8(cli(&["tools", "inspect", "fixture"]).stdout).unwrap();
     assert!(
-        tool.contains("limits     timeout 1s · fresh instance per call"),
+        tool.contains(&format!(
+            "limits     timeout 1s · memory {} MiB (default) · fresh instance per call",
+            host::DEFAULT_MAX_MEMORY_MB
+        )),
         "{tool}"
     );
     let unknown = cli(&["tools", "inspect", "nope"]);

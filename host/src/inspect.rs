@@ -48,7 +48,10 @@ pub struct Capabilities {
     pub dir: Option<String>,
     pub dir_writable: bool,
     pub timeout_secs: Option<u64>,
-    pub max_memory_mb: Option<u64>,
+    /// The memory cap its stores get: its config's, or the default.
+    pub max_memory_mb: u64,
+    /// Whether `max_memory_mb` is the default because its config sets none.
+    pub memory_default: bool,
     pub fresh_per_call: bool,
 }
 
@@ -83,7 +86,8 @@ impl Capabilities {
             dir: config.dir.clone(),
             dir_writable: config.dir_writable,
             timeout_secs: config.timeout_secs,
-            max_memory_mb: config.max_memory_mb,
+            max_memory_mb: crate::memory_cap_mb(config),
+            memory_default: config.max_memory_mb.is_none(),
             fresh_per_call: config.fresh_per_call,
         }
     }
@@ -154,19 +158,25 @@ impl Capabilities {
         }
     }
 
-    /// Its limits, if any are set, e.g. `timeout 10s · memory 256 MiB`.
-    pub fn limits(&self) -> Option<String> {
+    /// Its limits, e.g. `timeout 10s · memory 256 MiB`.
+    pub fn limits(&self) -> String {
         let mut limits = Vec::new();
         if let Some(secs) = self.timeout_secs {
             limits.push(format!("timeout {secs}s"));
         }
-        if let Some(mb) = self.max_memory_mb {
-            limits.push(format!("memory {mb} MiB"));
-        }
+        limits.push(format!(
+            "memory {} MiB{}",
+            self.max_memory_mb,
+            if self.memory_default {
+                " (default)"
+            } else {
+                ""
+            }
+        ));
         if self.fresh_per_call {
             limits.push("fresh instance per call".into());
         }
-        (!limits.is_empty()).then(|| limits.join(" · "))
+        limits.join(" · ")
     }
 
     /// One line: `can reach api.tavily.com; gets an authorization header
@@ -207,9 +217,7 @@ impl Capabilities {
             ));
         }
         lines.push(format!("  {:<10} {}", "files", self.files()));
-        if let Some(limits) = self.limits() {
-            lines.push(format!("  {:<10} {limits}", "limits"));
-        }
+        lines.push(format!("  {:<10} {}", "limits", self.limits()));
         if self.imports_interface("wasi:sockets") {
             lines.push(format!(
                 "  {:<10} imports wasi:sockets, but the host allows no socket connections",
@@ -251,7 +259,8 @@ mod tests {
             dir: None,
             dir_writable: false,
             timeout_secs: None,
-            max_memory_mb: None,
+            max_memory_mb: crate::DEFAULT_MAX_MEMORY_MB,
+            memory_default: true,
             fresh_per_call: false,
         }
     }
@@ -292,12 +301,25 @@ mod tests {
     }
 
     #[test]
+    fn unset_memory_cap_reports_the_default() {
+        assert!(
+            search().describe().contains(&format!(
+                "memory {} MiB (default)",
+                crate::DEFAULT_MAX_MEMORY_MB
+            )),
+            "{}",
+            search().describe()
+        );
+    }
+
+    #[test]
     fn describe_lists_limits_and_never_header_values() {
         let mut caps = search();
         caps.dir = Some("/scratch".into());
         caps.dir_writable = true;
         caps.timeout_secs = Some(10);
-        caps.max_memory_mb = Some(256);
+        caps.max_memory_mb = 256;
+        caps.memory_default = false;
         caps.fresh_per_call = true;
         let text = caps.describe();
         assert!(text.starts_with("tool web_search\n"), "{text}");

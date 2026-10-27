@@ -43,6 +43,7 @@ tool web_search
   network    api.tavily.com
   headers    authorization → api.tavily.com (value kept by the host)
   files      no filesystem access
+  limits     memory 512 MiB (default)
   imports    wasi:cli/environment@0.2.12, …, wasi:http/outgoing-handler@0.2.12, …
 ```
 
@@ -151,7 +152,8 @@ weather, or `runner chat --agent research_coordinator` for local notes plus web
 research. Children get fresh sessions and their own configured capabilities.
 See [delegation examples and limits](docs/delegation.md).
 
-`runner tools wat NAME` prints a configured tool as WAT-style text, headed by
+For more than `runner tools inspect` shows, `runner tools wat NAME` prints a
+configured tool as WAT-style text, headed by
 what its config grants it: allowed hosts, which headers are injected and where
 (never their values) and directory access, then what the host enforces whatever
 the component imports: e.g. sockets are always refused, the environment is
