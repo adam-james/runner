@@ -272,6 +272,14 @@ async fn inspect_component_reads_configured_components_without_secrets() {
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
+    let access: std::collections::BTreeMap<_, _> = [(
+        "fixture".to_string(),
+        format!(
+            "no network access; reads {}",
+            fixture.dir.path().join("tools").display()
+        ),
+    )]
+    .into();
     assert_eq!(
         runtime.agents(),
         [
@@ -283,6 +291,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                tool_access: Default::default(),
             },
             host::AgentInfo {
                 name: "default".into(),
@@ -292,6 +301,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                tool_access: access.clone(),
             },
             host::AgentInfo {
                 name: "limited".into(),
@@ -301,6 +311,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: 99,
                 max_model_calls: Some(1),
+                tool_access: access.clone(),
             },
             host::AgentInfo {
                 name: "notools".into(),
@@ -310,6 +321,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,
+                tool_access: Default::default(),
             },
         ]
     );
@@ -616,6 +628,17 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
         default.lines().nth(1),
         Some("provider fixture · model fixture · tools fixture")
     );
+    // Then what each tool can reach.
+    assert_eq!(
+        default.lines().nth(2),
+        Some(
+            format!(
+                "  fixture: no network access; reads {}",
+                fixture.dir.path().join("tools").display()
+            )
+            .as_str()
+        )
+    );
     let run = client.runs(Some("a")).await.unwrap();
     assert_eq!(run[0].agent, "notools");
 
@@ -635,6 +658,91 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     // Rejected before the chat started, so no session was made for it.
     let sessions = client.sessions().await.unwrap();
     assert!(!sessions.iter().any(|session| session.id == "c"));
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn capabilities_come_from_imports_and_config_without_secrets() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let capabilities = runtime.host.capabilities();
+    let names: Vec<_> = capabilities
+        .iter()
+        .map(|caps| (caps.kind, caps.name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (host::inspect::ComponentKind::Provider, "fixture"),
+            (host::inspect::ComponentKind::Tool, "fixture"),
+        ]
+    );
+    // The fixture provider answers without HTTP, so its allowed host and
+    // header give it nothing; imports, not just config, decide that.
+    let provider = &capabilities[0];
+    assert!(
+        provider
+            .imports
+            .contains(&"local:agent/messages@0.1.0".to_string()),
+        "{:?}",
+        provider.imports
+    );
+    assert!(!provider.has_network());
+    assert_eq!(
+        provider.summary(),
+        "no network access (hosts are allowed, but it doesn't import wasi:http); \
+         no filesystem access"
+    );
+    let tool = &capabilities[1];
+    assert!(!tool.imports.is_empty());
+    assert_eq!(tool.timeout_secs, Some(1));
+    assert!(tool.fresh_per_call);
+
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    connect(&data).await;
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_runner"))
+            .arg("--data-dir")
+            .arg(&data)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = cli(&["providers", "inspect", "fixture"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.starts_with("provider fixture\n"), "{text}");
+    assert!(
+        text.contains("x-api-key → fixture.invalid (value kept by the host)"),
+        "{text}"
+    );
+    let json = cli(&["providers", "inspect", "fixture", "--json"]);
+    assert!(json.status.success());
+    let json = String::from_utf8(json.stdout).unwrap();
+    for output in [&text, &json] {
+        assert!(!output.contains("host-only-fixture-key"), "{output}");
+    }
+    let list = String::from_utf8(cli(&["tools", "list"]).stdout).unwrap();
+    assert!(
+        list.starts_with("fixture  no network access; reads "),
+        "{list}"
+    );
+    let tool = String::from_utf8(cli(&["tools", "inspect", "fixture"]).stdout).unwrap();
+    assert!(
+        tool.contains(&format!(
+            "limits     timeout 1s · memory {} MiB (default) · fresh instance per call",
+            host::DEFAULT_MAX_MEMORY_MB
+        )),
+        "{tool}"
+    );
+    let unknown = cli(&["tools", "inspect", "nope"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8(unknown.stderr)
+            .unwrap()
+            .contains("unknown tool 'nope'; the daemon has: fixture")
+    );
 }
 
 #[cfg(unix)]

@@ -472,6 +472,7 @@ mod tests {
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,
+            tool_access: Default::default(),
         };
         let mut app = App::new(vec![agent], "default".into(), Some("trip".into()));
         app.update(Msg::Sessions(vec![

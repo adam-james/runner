@@ -261,6 +261,19 @@ pub fn banner(agent: &host::AgentInfo, session: &str) {
         )
     );
     println!("{}", style(tty, DIM, &agent_details(agent)));
+    for line in tool_access(agent) {
+        println!("{}", style(tty, DIM, &line));
+    }
+}
+
+/// `  web_search: can reach api.tavily.com; ...`, one line per tool with
+/// a component, saying what it can reach.
+pub(crate) fn tool_access(agent: &host::AgentInfo) -> Vec<String> {
+    agent
+        .tool_access
+        .iter()
+        .map(|(tool, summary)| format!("  {tool}: {summary}"))
+        .collect()
 }
 
 /// `provider openai · model gpt-5 · tools get_scores, get_weather`, then
@@ -358,6 +371,9 @@ pub fn run_header(agent: &str, details: Option<&host::AgentInfo>, session: &str)
     );
     if let Some(details) = details {
         eprintln!("{}", style(tty, DIM, &agent_details(details)));
+        for line in tool_access(details) {
+            eprintln!("{}", style(tty, DIM, &line));
+        }
     }
 }
 
@@ -624,7 +640,16 @@ mod tests {
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,
+            tool_access: [(
+                "get_weather".to_string(),
+                "can reach api.open-meteo.com; no filesystem access".to_string(),
+            )]
+            .into(),
         };
+        assert_eq!(
+            tool_access(&agent),
+            ["  get_weather: can reach api.open-meteo.com; no filesystem access"]
+        );
         assert_eq!(
             agent_details(&agent),
             "provider openai · model gpt-5 · tools get_scores, get_weather"

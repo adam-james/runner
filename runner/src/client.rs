@@ -88,6 +88,11 @@ impl Client {
         self.json(Method::GET, "/v1/agents", None).await
     }
 
+    /// What each configured provider and tool can do.
+    pub async fn components(&self) -> Result<Vec<host::inspect::Capabilities>> {
+        self.json(Method::GET, "/v1/components", None).await
+    }
+
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         self.json(Method::GET, "/v1/sessions", None).await
     }

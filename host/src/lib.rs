@@ -1,6 +1,7 @@
 mod activity;
 mod audit;
 pub mod delegation;
+pub mod inspect;
 mod transcript;
 pub mod wat;
 
@@ -125,6 +126,10 @@ pub struct AgentInfo {
     pub delegates: Vec<String>,
     pub max_tokens: u32,
     pub max_model_calls: Option<u32>,
+    /// A one-line summary of what each of `tools` can reach, by tool name;
+    /// see `inspect::Capabilities::summary`. Host tools aren't listed.
+    #[serde(default)]
+    pub tool_access: BTreeMap<String, String>,
 }
 
 /// Tool and provider table keys: what agent definitions refer to them by.
@@ -1293,6 +1298,8 @@ pub struct Runtime {
     config: Arc<RunnerConfig>,
     agents: Arc<BTreeMap<String, AgentDefinition>>,
     components: Arc<HashMap<String, Component>>,
+    /// Every configured provider, then every tool, each sorted by name.
+    capabilities: Arc<Vec<inspect::Capabilities>>,
     /// Each component file's SHA-256, as read when it was loaded, for audit records.
     digests: Arc<HashMap<String, String>>,
     _ticker: Arc<EpochTicker>,
@@ -1346,6 +1353,26 @@ impl Runtime {
             components.insert(path.clone(), component);
             digests.insert(path.clone(), audit::digest(&bytes));
         }
+        let capabilities = config
+            .providers
+            .iter()
+            .map(|(name, provider)| (inspect::ComponentKind::Provider, name, &provider.component))
+            .chain(
+                config
+                    .tools
+                    .iter()
+                    .map(|(name, tool)| (inspect::ComponentKind::Tool, name, tool)),
+            )
+            .map(|(kind, name, component)| {
+                inspect::Capabilities::new(
+                    &engine,
+                    &components[&component.path],
+                    kind,
+                    name,
+                    component,
+                )
+            })
+            .collect();
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
         let ticker = engine.clone();
@@ -1360,6 +1387,7 @@ impl Runtime {
             config: Arc::new(config),
             agents: Arc::new(agents),
             components: Arc::new(components),
+            capabilities: Arc::new(capabilities),
             digests: Arc::new(digests),
             _ticker: Arc::new(EpochTicker(stopped)),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1388,9 +1416,23 @@ impl Runtime {
                     delegates: definition.delegates.clone(),
                     max_tokens: definition.max_tokens,
                     max_model_calls: definition.max_model_calls,
+                    tool_access: self
+                        .capabilities
+                        .iter()
+                        .filter(|caps| {
+                            caps.kind == inspect::ComponentKind::Tool
+                                && definition.tools.contains_key(&caps.name)
+                        })
+                        .map(|caps| (caps.name.clone(), caps.summary()))
+                        .collect(),
                 }
             })
             .collect()
+    }
+
+    /// What every configured provider and tool can do, providers first.
+    pub fn capabilities(&self) -> Vec<inspect::Capabilities> {
+        self.capabilities.to_vec()
     }
 
     fn digest(&self, path: &str) -> Option<String> {
