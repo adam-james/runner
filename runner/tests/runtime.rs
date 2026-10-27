@@ -76,6 +76,9 @@ provider = "fixture"
 tools = ["fixture"]
 max_tokens = 99
 max_model_calls = 1
+[agents.auditor]
+provider = "fixture"
+inspect_components = true
 "#,
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
@@ -211,6 +214,61 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
+async fn inspect_component_reads_configured_components_without_secrets() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let run = async |agent: &str, input: &str| {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = events.clone();
+        let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+        let prompt = format!("named-tool:inspect_component:{input}");
+        runtime.run_turn(agent, agent, &prompt, sink).await.unwrap();
+        let events = events.lock().unwrap().clone();
+        let finished = events
+            .iter()
+            .find(|e| e["kind"] == "tool_finished")
+            .unwrap()
+            .clone();
+        let text: String = events
+            .iter()
+            .filter(|e| e["kind"] == "text")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        (finished, text)
+    };
+    let (finished, text) = run("auditor", r#"{"component":"fixture","kind":"tool"}"#).await;
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(text.starts_with(";; tool fixture:"), "{text}");
+    assert!(text.contains(";; host enforcement:"), "{text}");
+    assert!(
+        text.contains("instances: a new one for every call"),
+        "{text}"
+    );
+    assert!(
+        text.contains("(export \"local:agent/tool-api@0.1.0\""),
+        "{text}"
+    );
+    assert!(text.contains("(core module"), "{text}");
+    let (_, text) = run(
+        "auditor",
+        r#"{"component":"fixture","kind":"provider","detail":"interface"}"#,
+    )
+    .await;
+    assert!(
+        text.contains("header x-api-key (value hidden) sent to: fixture.invalid"),
+        "{text}"
+    );
+    assert!(!text.contains("host-only-fixture-key"), "{text}");
+    assert!(!text.contains("(core module"), "{text}");
+    // Only configured names, and only for agents granted the tool.
+    let (finished, _) = run("auditor", r#"{"component":"../../etc/passwd"}"#).await;
+    assert_eq!(finished["ok"], false);
+    let (finished, _) = run("default", r#"{"component":"fixture"}"#).await;
+    assert_eq!(finished["error"], "no such tool: inspect_component");
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
@@ -225,6 +283,16 @@ async fn agent_definitions_only_get_the_tools_they_name() {
     assert_eq!(
         runtime.agents(),
         [
+            host::AgentInfo {
+                name: "auditor".into(),
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                tools: vec!["inspect_component".into()],
+                delegates: vec![],
+                max_tokens: host::DEFAULT_MAX_TOKENS,
+                max_model_calls: None,
+                tool_access: Default::default(),
+            },
             host::AgentInfo {
                 name: "default".into(),
                 provider: "fixture".into(),
@@ -584,7 +652,7 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("unknown agent 'nope'; the daemon has: default, limited, notools"),
+        stderr.contains("unknown agent 'nope'; the daemon has: auditor, default, limited, notools"),
         "{stderr}"
     );
     // Rejected before the chat started, so no session was made for it.
@@ -1653,4 +1721,187 @@ async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
     wait(&db, &next.id, "completed").await;
     stop.cancel();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("service");
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let mut runs = Vec::new();
+    for prompt in [
+        "tool:probe",
+        "tool:trap",
+        "tool:spin",
+        "named-tool:missing:{}",
+    ] {
+        let run = client.submit(None, None, prompt.into(), 30).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client.run(&run.id).await.unwrap().terminal() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        runs.push(run.id);
+    }
+    let audit_of = |of: &str, id: &str, json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_runner"));
+        command.arg("--data-dir").arg(&data).args([of, "audit", id]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let audit = |id: &str, json: bool| {
+        let (ok, records, warnings) = audit_of("runs", id, json);
+        assert!(ok);
+        (records, warnings)
+    };
+    let tool_call = |id: &str| -> Value {
+        let (records, _) = audit(id, true);
+        records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["action"] == "tool.call")
+            .unwrap()
+    };
+
+    let (records, warnings) = audit(&runs[0], true);
+    assert_eq!(warnings, "", "a finished run's trail is complete");
+    let records: Vec<Value> = records
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let actions: Vec<_> = records
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions.first(), Some(&"turn.started"));
+    assert_eq!(actions.last(), Some(&"turn.finished"));
+    assert!(actions.contains(&"provider.chat"));
+    let sandbox = records
+        .iter()
+        .find(|r| r["action"] == "sandbox.create" && r["component"]["kind"] == "tool")
+        .unwrap();
+    assert_eq!(sandbox["dir_writable"], false);
+    assert!(
+        sandbox["component"]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let call = records.iter().find(|r| r["action"] == "tool.call").unwrap();
+    assert_eq!(call["component"]["name"], "fixture");
+    assert_eq!(
+        (call["decision"].as_str(), call["outcome"].as_str()),
+        (Some("allowed"), Some("ok"))
+    );
+    assert!(
+        records
+            .iter()
+            .all(|r| r["agent"] == "default" && r["v"] == 1)
+    );
+
+    assert_eq!(tool_call(&runs[1])["outcome"], "trap");
+    assert_eq!(tool_call(&runs[2])["outcome"], "timeout");
+    let missing = tool_call(&runs[3]);
+    assert_eq!(missing["decision"], "denied");
+    assert_eq!(missing["outcome"], "unknown_tool");
+    assert_eq!(missing["component"]["kind"], "unknown");
+
+    // The table names actions and components, and never payloads or secrets.
+    let (table, _) = audit(&runs[0], false);
+    assert!(
+        table
+            .lines()
+            .any(|l| l.contains("tool.call") && l.contains("tool fixture"))
+    );
+    for id in &runs {
+        let (records, _) = audit(id, true);
+        assert!(!records.contains("host-only-fixture-key"));
+        assert!(!records.contains("tool:probe"));
+        assert!(!records.contains("inside_read"), "tool output stays out");
+        // Nor do audit records leak into the run's own event stream.
+        assert!(
+            client
+                .events(id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|event| event.data["kind"] != "audit")
+        );
+    }
+
+    // A session's trail is each of its runs' trails, a run at a time.
+    let session = client
+        .create_session(Some("audited".into()))
+        .await
+        .unwrap()
+        .id;
+    let mut session_runs = Vec::new();
+    for prompt in ["tool:probe", "tool:trap"] {
+        let run = client
+            .submit(Some(session.clone()), None, prompt.into(), 30)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client.run(&run.id).await.unwrap().terminal() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session_runs.push(run.id);
+    }
+    let (ok, records, warnings) = audit_of("sessions", &session, true);
+    assert!(ok);
+    assert_eq!(warnings, "", "both runs' trails are complete");
+    let expected: String = session_runs.iter().map(|id| audit(id, true).0).collect();
+    assert_eq!(records, expected);
+    let (_, table, _) = audit_of("sessions", &session, false);
+    for id in &session_runs {
+        assert!(table.lines().any(|l| l == format!("run {id}")));
+    }
+    let (ok, _, _) = audit_of("sessions", "no-such-session", true);
+    assert!(!ok);
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn components_without_a_memory_cap_get_the_default_one() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime().await;
+    let finished = |session: &'static str, prompt: String| {
+        let runtime = runtime.clone();
+        async move {
+            let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = events.clone();
+            let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+            runtime
+                .run_turn("default", session, &prompt, sink)
+                .await
+                .unwrap();
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .find(|e| e["kind"] == "tool_finished")
+                .unwrap()
+                .clone()
+        }
+    };
+    // The fixture tool sets no `max_memory_mb`.
+    assert_eq!(finished("small", "tool:alloc:64".into()).await["ok"], true);
+    let over = host::DEFAULT_MAX_MEMORY_MB + 64;
+    assert_eq!(
+        finished("large", format!("tool:alloc:{over}")).await["ok"],
+        false
+    );
 }

@@ -88,7 +88,7 @@ enum Command {
     /// (names only), files and limits.
     Tools {
         #[command(subcommand)]
-        command: Components,
+        command: Tools,
     },
     /// What configured model providers can reach, like `tools`.
     Providers {
@@ -106,6 +106,26 @@ enum Components {
         name: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum Tools {
+    #[command(flatten)]
+    Components(Components),
+    /// Print a tool (or, with --provider, a provider) as WAT-style text,
+    /// headed by what its config grants it. Reads the config and components
+    /// directly; no daemon needed.
+    Wat {
+        name: String,
+        #[arg(long, default_value = "runner.toml")]
+        config: String,
+        #[arg(long)]
+        provider: bool,
+        /// interface: the component's own imports and exports; structure:
+        /// nested modules' too; full: complete WAT, which can be huge.
+        #[arg(long, default_value = "structure")]
+        detail: host::wat::Detail,
     },
 }
 
@@ -131,12 +151,28 @@ enum Runs {
     Cancel {
         id: String,
     },
+    /// What the run's components did, and what the host allowed or denied.
+    Audit {
+        id: String,
+        /// One JSON record per line, instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum Sessions {
     List,
-    Create { id: Option<String> },
+    Create {
+        id: Option<String>,
+    },
+    /// The audit records of every run in the session, a run at a time.
+    Audit {
+        id: String,
+        /// One JSON record per line, instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -163,6 +199,21 @@ async fn main() -> Result<()> {
             .init();
         return service::serve(&config, &args.data_dir, concurrency).await;
     }
+    if let Command::Tools {
+        command:
+            Tools::Wat {
+                name,
+                config,
+                provider,
+                detail,
+            },
+    } = args.command
+    {
+        use host::wat::Kind;
+        let kind = if provider { Kind::Provider } else { Kind::Tool };
+        print!("{}", host::wat::print(&config, kind, &name, detail)?);
+        return Ok(());
+    }
     let client = Client::connect(&args.data_dir)?;
     // Register before printing headers. Retain this future so a signal arriving
     // during API requests or replay stays pending until the next exit point.
@@ -173,7 +224,10 @@ async fn main() -> Result<()> {
         _ = std::future::ready(()) => {},
     }
     match args.command {
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. }
+        | Command::Tools {
+            command: Tools::Wat { .. },
+        } => unreachable!(),
         Command::Run {
             prompt,
             session,
@@ -241,6 +295,7 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
+            Runs::Audit { id, json } => print_audit(&client.audit(&id).await?, json)?,
             Runs::Watch { id, after, json } => {
                 header(&client, &client.run(&id).await?).await?;
                 let _ = attach(&client, &id, after, json, &mut interrupt).await?;
@@ -249,9 +304,9 @@ async fn main() -> Result<()> {
         Command::Agents {
             command: Agents::List,
         } => println!("{}", serde_json::to_string_pretty(&client.agents().await?)?),
-        Command::Tools { command } => {
-            components(&client, host::inspect::ComponentKind::Tool, command).await?
-        }
+        Command::Tools {
+            command: Tools::Components(command),
+        } => components(&client, host::inspect::ComponentKind::Tool, command).await?,
         Command::Providers { command } => {
             components(&client, host::inspect::ComponentKind::Provider, command).await?
         }
@@ -264,6 +319,7 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.create_session(id).await?)?
             ),
+            Sessions::Audit { id, json } => print_audit(&client.session_audit(&id).await?, json)?,
         },
     }
     Ok(())
@@ -271,6 +327,22 @@ async fn main() -> Result<()> {
 
 /// The daemon's definition of `agent`, checked up front so a typo doesn't
 /// wait for the first prompt to fail.
+/// Audit records as a table, or one JSON record per line, then a warning on
+/// stderr for each sign the trail is incomplete.
+fn print_audit(records: &[runner::db::Event], json: bool) -> Result<()> {
+    if json {
+        for record in records {
+            println!("{}", serde_json::to_string(&record.data)?);
+        }
+    } else {
+        print!("{}", runner::audit::render(records));
+    }
+    for problem in runner::audit::check(records) {
+        eprintln!("warning: {problem}");
+    }
+    Ok(())
+}
+
 fn known_agent<'a>(agents: &'a [host::AgentInfo], agent: &str) -> Result<&'a host::AgentInfo> {
     match agents.iter().find(|known| known.name == agent) {
         Some(details) => Ok(details),
@@ -302,10 +374,17 @@ async fn components(
         }
         Components::Inspect { name, json } => {
             let Some(component) = components.iter().find(|c| c.name == name) else {
-                if kind == host::inspect::ComponentKind::Tool
-                    && matches!(name.as_str(), "delegate" | "wait")
-                {
-                    bail!("'{name}' is a host tool for delegation; it runs no component");
+                if kind == host::inspect::ComponentKind::Tool {
+                    match name.as_str() {
+                        "delegate" | "wait" => {
+                            bail!("'{name}' is a host tool for delegation; it runs no component")
+                        }
+                        "inspect_component" => bail!(
+                            "'{name}' is a host tool that reads configured components; \
+                             it runs no component"
+                        ),
+                        _ => {}
+                    }
                 }
                 let names: Vec<_> = components.iter().map(|c| c.name.as_str()).collect();
                 bail!(

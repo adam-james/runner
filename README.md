@@ -151,6 +151,31 @@ weather, or `runner chat --agent research_coordinator` for local notes plus web
 research. Children get fresh sessions and their own configured capabilities.
 See [delegation examples and limits](docs/delegation.md).
 
+`runner tools wat NAME` prints a configured tool as WAT-style text, headed by
+what its config grants it: allowed hosts, which headers are injected and where
+(never their values) and directory access, then what the host enforces whatever
+the component imports: e.g. sockets are always refused, the environment is
+empty, and every call ends at its run's deadline. It reads the config and
+component directly, so the daemon needn't be running. By default it lists every
+import and export of the component and its nested core modules, without code or
+data; imports are what the component can ask the host for.
+
+```bash
+runner tools wat get_weather                        # imports and exports, nested modules too
+runner tools wat anthropic --provider --detail interface  # only the outer component's
+runner tools wat run_python --detail full > python.wat    # complete WAT; can be huge
+```
+
+Agents with `inspect_components = true` get a host `inspect_component` tool
+that returns the same summary for any component the config names, and nothing
+else: it takes a configured name, never a path, and doesn't offer full WAT. The
+example `security_auditor` agent uses it to review components for capability
+overreach, unneeded imports and risky config:
+
+```bash
+runner run --agent security_auditor "Audit every configured tool and rank the risks."
+```
+
 The daemon runs up to four tasks concurrently (`serve --concurrency N`), while
 serializing turns within a session. Runs have a ten-minute deadline by default;
 set `run --deadline-secs N` or `chat --deadline-secs N` (1–86400 seconds). The
@@ -173,6 +198,62 @@ be awake and the daemon running.
 
 See [service architecture and roadmap](docs/service.md) for the API and the
 next milestones: scheduling, explicit delegation, and desktop clients.
+
+### Audit log
+
+Every run keeps a security audit trail: what its provider and tools did, and
+what the host allowed or denied. Read it with:
+
+```bash
+runner runs audit RUN_ID          # a table, one line per record
+runner runs audit RUN_ID --json   # one JSON record per line
+runner sessions audit SESSION_ID  # every run in the session, a run at a time
+```
+
+```
+   1   +0.000s turn.started
+   2   +0.004s sandbox.create           provider anthropic     allowed  ok allowed_hosts=1
+   3   +0.009s sandbox.create           tool web_search        allowed  ok allowed_hosts=1
+   4   +0.011s http.request             provider anthropic     allowed  response method="POST" scheme="https" host="api.anthropic.com" credentials_added=1 credentials_withheld=0 status=200
+   5   +1.380s provider.chat            provider anthropic     allowed  ok model="claude-sonnet-5" tools=1
+   6   +1.381s http.request             tool web_search        denied   not_allowed_host method="GET" scheme="https" host="evil.example" ...
+   7   +1.383s tool.call                tool web_search        allowed  error input_bytes=31 output_bytes=0 elapsed_ms=2
+  ...
+```
+
+The guests are what it's guarding against, so the host makes every record
+itself, at the points it controls: creating a component's sandbox (and
+mounting its `dir`, the whole of its filesystem access), each tool and model
+call, each outbound request whether allowed or refused, and each memory or
+table growth a limit refuses. Tool calls end `ok`, `error`, `trap`, `timeout`
+or `unknown_tool`. Components are named as the config names them, with the
+SHA-256 of the `.wasm` that was loaded.
+
+Records are metadata only. They never include prompts, tool input or
+output, request paths or bodies, header values, or error text; credentials
+appear only as counts of headers added or held back.
+
+Each record carries a schema version (`v`), a sequence number that's
+contiguous within the turn, a timestamp, the agent and session, and the
+action's decision and outcome. The trail begins with `turn.started` and ends
+with `turn.finished`, which states how many records the turn wrote. `runs
+audit` warns on stderr when something's missing: a gap in the sequence, or
+no `turn.finished` because the daemon stopped mid-run.
+
+Limits and failures:
+
+- A turn records at most 4096 actions. Past that, the host refuses further
+  requests and tool and model calls rather than let them run unrecorded, so a
+  guest flooding the log only stops its own run.
+- Records are saved like run events, in the service's SQLite database, apart
+  from the event stream clients follow. A record that can't be saved fails
+  the run. Saving is asynchronous, so actions already under way when that
+  happens may finish unrecorded.
+- Records are kept as long as their run. They're readable with the same local
+  API token as the rest of the API (`GET /v1/runs/{id}/audit`, or
+  `GET /v1/sessions/{id}/audit` for every run in a session).
+- A delegated child is its own run, with its own trail; the parent's shows
+  the `delegate` and `wait` calls.
 
 ### Verify the service
 
@@ -433,6 +514,8 @@ fresh_per_call = true  # a new instance for every call
   interrupted by Wasmtime's epoch deadline) and one stuck waiting
   (`time.sleep(1000)`, cut off by a timer). Either way the model just
   gets an error back, and the agent continues the turn.
+- `max_memory_mb` defaults to 512 for every provider and tool that doesn't
+  set it, so no component can grow to the 4 GiB a 32-bit memory allows.
 - Every tool's result (or error) is cut to 64 KB by the host before the
   model sees it. `app.py` cuts printed output shorter itself, but a script
   runs in the same interpreter and could undo that, so the host's cap is
@@ -599,4 +682,9 @@ wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/pyth
 
 The python tool imports no `wasi:http` at all. It does import
 `wasi:sockets`, as every componentize-py component does, but the host
-grants no socket permissions, so any connection attempt is denied.
+turns TCP, UDP and name lookups off for every component, so any socket is
+refused. `allowed_hosts` only governs `wasi:http`; no config grants sockets.
+
+The daemon also refuses to start if any component's `dir` contains its data
+directory (`~/.runner/service` by default, with the local API token and
+database) or sits inside it.
