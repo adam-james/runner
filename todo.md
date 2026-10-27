@@ -44,11 +44,17 @@ In order; each step ships something usable on its own.
 2. schedules pinned to an agent version - one-off and cron schedules (see docs/service.md); each occurrence is an ordinary run in a fresh session
    - a schedule names an agent and pins the version it was created with; if the version changes (config edit or swapped binary), the schedule pauses until re-approved, so an edit made for chat can't quietly widen what an unattended agent can do
    - read-only background agents (e.g. a morning brief) are safe and useful at this step
-3. after-run summaries and alerts - the audit log becomes the primary interface
+3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
    - host-made summary of every background run from its audit records, no model involved: hosts reached, denials, errors, trail gaps, pending approvals
    - alerts on denials, trail gaps, and a host the schedule has never reached before
    - `run_auditor` only when the summary flags something
    - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later
+   - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert
+     - the daemon keeps durable notification records, so nothing's lost while no client is connected or the machine sleeps; unread ones wait until seen
+     - delivered as desktop notifications (macOS Notification Center, freedesktop on Linux) and listed in the TUI; opening one shows the run
+     - host-written text only (task, outcome, duration, the summary's flags), never the model's reply: a prompt injection could otherwise put a convincing fake message or link in a trusted-looking system notification
+     - per schedule: notify on every finish, only on failures and alerts, or never
+     - approval requests (step 4) use the same channel
 4. asynchronous approval checkpoints - what lets a background agent act
    - tools declare side-effecting actions (send email, book, `git push`) in their WIT interface
    - the run pauses durably (survives restarts) and the action waits in a queue, approved or denied from CLI/TUI/remote

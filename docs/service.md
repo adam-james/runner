@@ -184,12 +184,19 @@ separate grant system. Each milestone ships something usable on its own;
    execution initially. A schedule names an agent and pins the version it was
    created with; if the version changes, the schedule pauses until it's
    approved again.
-3. **Run summaries and alerts:** the host summarizes every background run
+3. **Run summaries, alerts, and notifications:** the host summarizes every background run
    from its audit records, without a model: hosts reached, denials, errors,
    trail gaps, and pending approvals. Denials, gaps, and hosts a schedule has
    never reached before raise alerts, and only flagged runs go to the
    `run_auditor` agent. Audit records, and the agent versions they reference,
    are kept longer than their runs, since background runs are reviewed later.
+   The user is notified in the foreground when a background run finishes,
+   fails, or raises an alert, as a desktop notification and in the TUI; each
+   schedule chooses every finish, only failures and alerts, or never.
+   Notifications are durable records, so none are lost while no client is
+   connected, and their text is written by the host (task, outcome, duration,
+   flags), never taken from the model's reply, which a prompt injection could
+   steer. Approval requests use the same channel.
 4. **Asynchronous approvals:** tools declare side-effecting actions in their
    WIT interface. Such an action pauses its run durably, surviving restarts,
    until it's approved or denied from the CLI, TUI, or a remote client.
@@ -197,9 +204,9 @@ separate grant system. Each milestone ships something usable on its own;
    standing approvals for routine, narrow actions, as part of their version.
    Every approval, denial, and expiry is audited.
 5. **Desktop:** use the same API for sessions, live output, run trees,
-   cancellation, schedules, summaries, and approvals. Desktop and CLI share a
-   daemon. Choose the UI framework when implementation starts; it does not
-   determine the runtime.
+   cancellation, schedules, summaries, notifications, and approvals. Desktop
+   and CLI share a daemon. Choose the UI framework when implementation starts;
+   it does not determine the runtime.
 
 Deferred: dynamic agents (temporary specialists and overrides of static
 definitions created at runtime), since a background agent that defines new
