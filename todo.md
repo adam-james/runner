@@ -32,7 +32,7 @@ the reason to pick runner.
 
 ## 2. Enforce capabilities at the moment they matter
 
-- ~~lock each session to one agent for its whole life~~ done: durable first-run binding, mismatch errors, migration, and TUI switches start new sessions
+- ~~lock each session to one agent for its whole life~~ done: required agent at creation, mismatch errors, migration, and TUI switches start new sessions
   - later: explicit handoff to a new session seeded with prompts and replies only (no tool results), behind a confirmation
   - longer term: taint tracking of history from sensitive tools instead of a blanket lock
 - dynamic tool config and permissioning

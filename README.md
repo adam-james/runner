@@ -492,8 +492,9 @@ runner sessions list                 # list saved sessions
 runner chat --session trip           # create or resume a named session
 ```
 
-Sessions lock to the agent named by their first submitted run, including failed or
-cancelled runs. Later turns cannot change agents: an explicit mismatch returns
+Sessions lock to an agent at creation, before any runs are submitted.
+`runner sessions create NAME --agent AGENT` chooses that agent (default: `default`).
+The session creation API requires an `agent` field. Later turns cannot change agents: an explicit mismatch returns
 an error with a hint to create a new session. Omitting `--agent` resumes the
 session's agent. TUI Ctrl-A starts a fresh session with the selected agent.
 This prevents one agent from inheriting another agent's tool results or sending
@@ -502,7 +503,7 @@ changes to that definition still take effect after a daemon restart.
 
 On upgrade, existing sessions lock to their most recent run's agent (submission
 order breaks timestamp ties). Older queued turns naming another agent fail
-without executing. Empty sessions bind on their first run. Existing history
+without executing. Existing empty sessions migrate to `default`. Existing history
 is retained; upgrading does not remove data already shared between agents.
 
 New sessions receive UUIDs. `chat --session ID` creates a named session if it

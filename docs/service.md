@@ -119,7 +119,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | Method and route | Input / behavior |
 | --- | --- |
 | `GET /v1/agents` | List agent definitions, sorted by name, as `[{"name": "default", "provider": "openai", "model": "gpt-5", "tools": ["get_scores"]}, ...]` |
-| `POST /v1/sessions` | `{ "id": "optional-name" }`; omitted/null ID generates one; returns session, HTTP 201 |
+| `POST /v1/sessions` | `{ "id": "optional-name", "agent": "default" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
 | `GET /v1/runs` | List runs in submission order; optional `session_id` query parameter to list only that session's |
@@ -136,7 +136,7 @@ unknown definition is rejected. Unknown submission fields are rejected.
 
 Run records contain `id`, `session_id`, `agent`, `prompt`, `status`,
 `created_at` (Unix milliseconds), `deadline_secs`, `cancel_requested`, and
-nullable `error`. Session records contain `id`, `created_at`, and nullable `agent` (bound atomically on the first submission). Runs with a different agent are rejected; an omitted agent resumes the owner or uses `default` for an unbound session.
+nullable `error`. Session records contain `id`, `created_at`, and `agent` (required and fixed at creation). Runs with a different agent are rejected; an omitted agent resumes the owner or uses `default` for a new session.
 
 Each SSE frame has event name `run`, a durable integer `id`, and JSON data:
 

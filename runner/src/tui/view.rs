@@ -478,6 +478,7 @@ mod tests {
         app.update(Msg::Sessions(vec![
             Session {
                 id: "trip".into(),
+                agent: "default".into(),
                 running_runs: 1,
                 title: Some("Weather in Seattle?".into()),
                 updated_at: 2,
@@ -485,6 +486,7 @@ mod tests {
             },
             Session {
                 id: "older".into(),
+                agent: "default".into(),
                 title: Some("Plan a weekend".into()),
                 last_status: Some("failed".into()),
                 updated_at: 1,

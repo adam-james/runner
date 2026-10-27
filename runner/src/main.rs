@@ -165,6 +165,9 @@ enum Sessions {
     List,
     Create {
         id: Option<String>,
+        /// Agent this session will use for its lifetime.
+        #[arg(long, default_value = host::DEFAULT_AGENT)]
+        agent: String,
     },
     /// The audit records of every run in the session, a run at a time.
     Audit {
@@ -251,7 +254,7 @@ async fn main() -> Result<()> {
             let agent = session_agent(&client, session.as_deref(), agent).await?;
             let agents = client.agents().await?;
             let details = known_agent(&agents, &agent)?;
-            let (session, existing) = open_session(&client, session).await?;
+            let (session, existing) = open_session(&client, session, &agent).await?;
             ui::banner(details, &session);
             let result = chat(
                 &client,
@@ -277,7 +280,7 @@ async fn main() -> Result<()> {
             // Without --session it starts on a new session, which its first
             // prompt creates, so just looking leaves no empty sessions behind.
             let session = match session {
-                Some(id) => Some(open_session(&client, Some(id)).await?.0),
+                Some(id) => Some(open_session(&client, Some(id), &agent).await?.0),
                 None => None,
             };
             let session = runner::tui::run(client, agents, agent, session, deadline_secs).await?;
@@ -315,9 +318,9 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.sessions().await?)?
             ),
-            Sessions::Create { id } => println!(
+            Sessions::Create { id, agent } => println!(
                 "{}",
-                serde_json::to_string_pretty(&client.create_session(id).await?)?
+                serde_json::to_string_pretty(&client.create_session(id, agent).await?)?
             ),
             Sessions::Audit { id, json } => print_audit(&client.session_audit(&id).await?, json)?,
         },
@@ -336,7 +339,7 @@ async fn session_agent(
         .await?
         .into_iter()
         .find(|s| Some(s.id.as_str()) == session)
-        .and_then(|s| s.agent);
+        .map(|s| s.agent);
     if let (Some(owner), Some(requested)) = (&owner, &agent)
         && owner != requested
     {
@@ -432,7 +435,11 @@ async fn components(
 
 /// The named session, created if it isn't saved yet, or a new one; and
 /// whether it already existed.
-async fn open_session(client: &Client, session: Option<String>) -> Result<(String, bool)> {
+async fn open_session(
+    client: &Client,
+    session: Option<String>,
+    agent: &str,
+) -> Result<(String, bool)> {
     Ok(match session {
         Some(id) => {
             let existing = client
@@ -441,11 +448,16 @@ async fn open_session(client: &Client, session: Option<String>) -> Result<(Strin
                 .iter()
                 .any(|session| session.id == id);
             if !existing {
-                client.create_session(Some(id.clone())).await?;
+                client
+                    .create_session(Some(id.clone()), agent.to_string())
+                    .await?;
             }
             (id, existing)
         }
-        None => (client.create_session(None).await?.id, false),
+        None => (
+            client.create_session(None, agent.to_string()).await?.id,
+            false,
+        ),
     })
 }
 

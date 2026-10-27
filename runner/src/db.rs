@@ -19,9 +19,8 @@ struct Signals {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Session {
-    /// Bound on the first submitted run; never changes.
-    #[serde(default)]
-    pub agent: Option<String>,
+    /// Set at session creation; never changes.
+    pub agent: String,
     pub id: String,
     pub created_at: i64,
     #[serde(default)]
@@ -267,9 +266,9 @@ impl Database {
         if version < 5 {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
-                "ALTER TABLE sessions ADD COLUMN agent TEXT;
-                 UPDATE sessions SET agent=(SELECT agent FROM runs
-                     WHERE session_id=sessions.id ORDER BY created_at DESC, rowid DESC LIMIT 1);
+                "ALTER TABLE sessions ADD COLUMN agent TEXT NOT NULL DEFAULT 'default';
+                 UPDATE sessions SET agent=COALESCE((SELECT agent FROM runs
+                     WHERE session_id=sessions.id ORDER BY created_at DESC, rowid DESC LIMIT 1), 'default');
                  PRAGMA user_version=5;",
             )?;
             // Old queued turns must not execute under another agent's history.
@@ -305,19 +304,20 @@ impl Database {
         ))
     }
 
-    pub fn create_session(&self, id: Option<String>) -> Result<Session> {
+    pub fn create_session(&self, id: Option<String>, agent: String) -> Result<Session> {
         let id = id.unwrap_or_else(new_id);
         host::check_session_id(&id)?;
         let created_at = now();
         let session = Session {
+            agent,
             id,
             created_at,
             updated_at: created_at,
             ..Session::default()
         };
         self.0.lock().unwrap().execute(
-            "INSERT INTO sessions (id, created_at) VALUES (?1, ?2)",
-            params![session.id, session.created_at],
+            "INSERT INTO sessions (id, created_at, agent) VALUES (?1, ?2, ?3)",
+            params![session.id, session.created_at, session.agent],
         )?;
         Ok(session)
     }
@@ -390,28 +390,21 @@ impl Database {
             None => {
                 let id = new_id();
                 tx.execute(
-                    "INSERT INTO sessions (id, created_at) VALUES (?1, ?2)",
-                    params![id, now()],
+                    "INSERT INTO sessions (id, created_at, agent) VALUES (?1, ?2, ?3)",
+                    params![id, now(), agent],
                 )?;
                 id
             }
         };
-        let owner: Option<String> = tx.query_row(
+        let owner: String = tx.query_row(
             "SELECT agent FROM sessions WHERE id=?1",
             [&session_id],
             |r| r.get(0),
         )?;
-        if let Some(owner) = owner {
-            if owner != agent {
-                bail!(
-                    "session '{session_id}' is locked to agent '{owner}'; create a new session to use agent '{agent}'"
-                );
-            }
-        } else {
-            tx.execute(
-                "UPDATE sessions SET agent=?2 WHERE id=?1",
-                params![session_id, agent],
-            )?;
+        if owner != agent {
+            bail!(
+                "session '{session_id}' is locked to agent '{owner}'; create a new session to use agent '{agent}'"
+            );
         }
         let id = new_id();
         let run = Run {

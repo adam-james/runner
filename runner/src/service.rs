@@ -192,6 +192,7 @@ pub fn default_deadline() -> u64 {
 #[serde(deny_unknown_fields)]
 struct CreateSession {
     id: Option<String>,
+    agent: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -319,10 +320,16 @@ async fn create_session(
     State(s): State<Service>,
     Json(input): Json<CreateSession>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if !s.agents.iter().any(|known| known.name == input.agent) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent '{}'", input.agent),
+        ));
+    }
     Ok((
         StatusCode::CREATED,
         Json(
-            s.db.blocking(move |db| db.create_session(input.id))
+            s.db.blocking(move |db| db.create_session(input.id, input.agent))
                 .await
                 .map_err(bad)?,
         ),
@@ -351,7 +358,7 @@ async fn submit(
                 .sessions()?
                 .into_iter()
                 .find(|session| Some(&session.id) == session_id.as_ref())
-                .and_then(|session| session.agent))
+                .map(|session| session.agent))
         })
         .await
         .map_err(internal)?;

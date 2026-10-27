@@ -43,9 +43,8 @@ fn child_relationships_ownership_final_results_and_cancellation_are_durable() {
             .into_iter()
             .find(|s| s.id == first.session_id)
             .unwrap()
-            .agent
-            .as_deref(),
-        Some("worker")
+            .agent,
+        "worker"
     );
     assert!(
         db.submit(

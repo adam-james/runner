@@ -343,7 +343,7 @@ impl App {
         if let Some(owner) = sessions
             .iter()
             .find(|s| Some(&s.id) == self.session.as_ref())
-            .and_then(|s| s.agent.as_ref())
+            .map(|s| &s.agent)
         {
             self.agent = owner.clone();
         }
@@ -390,7 +390,7 @@ impl App {
             .sessions
             .iter()
             .find(|s| Some(&s.id) == session.as_ref())
-            .and_then(|s| s.agent.as_ref())
+            .map(|s| &s.agent)
         {
             self.agent = owner.clone();
         }
@@ -635,6 +635,7 @@ mod tests {
     fn session(id: &str, updated_at: i64) -> Session {
         Session {
             id: id.into(),
+            agent: "default".into(),
             updated_at,
             ..Session::default()
         }
@@ -935,7 +936,7 @@ mod tests {
     fn selecting_a_session_restores_its_locked_agent() {
         let mut app = app(None);
         let mut saved = session("saved", 1);
-        saved.agent = Some("reader".into());
+        saved.agent = "reader".into();
         app.update(Msg::Sessions(vec![saved]));
         app.select(Some("saved".into()));
         assert_eq!(app.agent, "reader");
