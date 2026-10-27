@@ -224,6 +224,14 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     let height = area.height.saturating_sub(2) as usize;
     let total = paragraph.line_count(area.width.saturating_sub(2));
     let max = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+    // `scroll` counts from the bottom, so while scrolled up, new lines would
+    // push what's being read off the top; scroll up by as many to hold it.
+    // Only for the same pane size: a resize rewraps everything anyway.
+    let (width, last_height, last_max) = app.layout;
+    if app.scroll > 0 && (width, last_height) == (area.width, area.height) {
+        app.scroll = app.scroll.saturating_add(max.saturating_sub(last_max));
+    }
+    app.layout = (area.width, area.height, max);
     // Clamped here, where the height is known, so scrolling back down never
     // has to work through lines past the top.
     app.scroll = app.scroll.min(max);
@@ -551,6 +559,41 @@ mod tests {
         let top = screen(&mut app, 0);
         assert!(top.contains("> prompt 0 "), "{top}");
         assert!(top.contains("End to follow"));
+    }
+
+    #[test]
+    fn streaming_text_doesnt_move_a_scrolled_up_view() {
+        let mut app = App::new(vec![], "default".into(), Some("trip".into()));
+        let runs: Vec<_> = (0..40)
+            .map(|i| run(&format!("r{i:02}"), &format!("prompt {i}"), "completed"))
+            .chain([run("live", "streaming", "running")])
+            .collect();
+        app.update(Msg::Runs("trip".into(), runs));
+        let stream = |app: &mut App, text: &str| {
+            app.update(Msg::RunEvent {
+                generation: 0,
+                run_id: "live".into(),
+                data: serde_json::json!({"kind":"text","text":text}),
+            })
+        };
+        stream(&mut app, "first line");
+        screen(&mut app, 0);
+        app.update(Msg::Scroll(10));
+        let before = screen(&mut app, 0);
+        stream(&mut app, "\nmore\nand more\nand more still");
+        let after = screen(&mut app, 0);
+        let pane = |screen: &str| -> Vec<String> {
+            // The conversation's rows, without its title (which shows the offset).
+            screen.lines().skip(1).take(10).map(String::from).collect()
+        };
+        assert_eq!(pane(&before), pane(&after), "{before}\n---\n{after}");
+        assert_eq!(app.scroll, 13);
+
+        // Following the bottom still shows new output as it comes.
+        app.scroll = 0;
+        screen(&mut app, 0);
+        stream(&mut app, "\nthe newest line");
+        assert!(screen(&mut app, 0).contains("the newest line"));
     }
 
     #[test]
