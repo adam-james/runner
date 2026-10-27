@@ -136,7 +136,7 @@ unknown definition is rejected. Unknown submission fields are rejected.
 
 Run records contain `id`, `session_id`, `agent`, `prompt`, `status`,
 `created_at` (Unix milliseconds), `deadline_secs`, `cancel_requested`, and
-nullable `error`. Session records contain `id` and `created_at`.
+nullable `error`. Session records contain `id`, `created_at`, and nullable `agent` (bound atomically on the first submission). Runs with a different agent are rejected; an omitted agent resumes the owner or uses `default` for an unbound session.
 
 Each SSE frame has event name `run`, a durable integer `id`, and JSON data:
 

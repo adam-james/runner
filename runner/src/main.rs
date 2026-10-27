@@ -43,7 +43,7 @@ enum Command {
         prompt: String,
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition to run; `default` if omitted.
+        /// The agent to run; resumes the session agent, or `default` for a new session.
         #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
@@ -55,7 +55,7 @@ enum Command {
     Chat {
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition each turn runs; `default` if omitted.
+        /// The session agent; uses the saved agent, or `default` for a new session.
         #[arg(long)]
         agent: Option<String>,
         #[arg(long, default_value_t = service::default_deadline())]
@@ -65,7 +65,7 @@ enum Command {
     Tui {
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition new turns run; `default` if omitted. Can be
+        /// The session agent; uses the saved agent, or `default` for a new session. Can be
         /// changed from inside.
         #[arg(long)]
         agent: Option<String>,
@@ -248,7 +248,7 @@ async fn main() -> Result<()> {
             agent,
             deadline_secs,
         } => {
-            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            let agent = session_agent(&client, session.as_deref(), agent).await?;
             let agents = client.agents().await?;
             let details = known_agent(&agents, &agent)?;
             let (session, existing) = open_session(&client, session).await?;
@@ -271,7 +271,7 @@ async fn main() -> Result<()> {
             agent,
             deadline_secs,
         } => {
-            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            let agent = session_agent(&client, session.as_deref(), agent).await?;
             let agents = client.agents().await?;
             known_agent(&agents, &agent)?;
             // Without --session it starts on a new session, which its first
@@ -323,6 +323,30 @@ async fn main() -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// Resume with the session's owner, rejecting explicit changes before reading history.
+async fn session_agent(
+    client: &Client,
+    session: Option<&str>,
+    agent: Option<String>,
+) -> Result<String> {
+    let owner = client
+        .sessions()
+        .await?
+        .into_iter()
+        .find(|s| Some(s.id.as_str()) == session)
+        .and_then(|s| s.agent);
+    if let (Some(owner), Some(requested)) = (&owner, &agent)
+        && owner != requested
+    {
+        anyhow::bail!(
+            "session is locked to agent '{owner}'; create a new session to use agent '{requested}'"
+        );
+    }
+    Ok(agent
+        .or(owner)
+        .unwrap_or_else(|| host::DEFAULT_AGENT.to_string()))
 }
 
 /// The daemon's definition of `agent`, checked up front so a typo doesn't

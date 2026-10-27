@@ -641,6 +641,21 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     );
     let run = client.runs(Some("a")).await.unwrap();
     assert_eq!(run[0].agent, "notools");
+    let resumed = chat(&data, &["--session", "a"], "");
+    assert!(resumed.starts_with("runner · agent notools · session a · "));
+    for command in ["chat", "run"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.arg("--data-dir")
+            .arg(&data)
+            .args([command, "--session", "a", "--agent", "default"]);
+        if command == "run" {
+            cmd.arg("switch");
+        }
+        let output = cmd.stdin(Stdio::null()).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("create a new session"));
+    }
+    assert_eq!(client.runs(Some("a")).await.unwrap().len(), 1);
 
     let output = Command::new(env!("CARGO_BIN_EXE_runner"))
         .arg("--data-dir")

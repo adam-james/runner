@@ -178,7 +178,7 @@ impl Drop for LocalInstance {
 pub struct Submit {
     pub prompt: String,
     pub session_id: Option<String>,
-    /// An agent definition's name; `default` if omitted.
+    /// An agent definition's name; session owner or `default` if omitted.
     pub agent: Option<String>,
     #[serde(default = "default_deadline")]
     pub deadline_secs: u64,
@@ -344,8 +344,20 @@ async fn submit(
     State(s): State<Service>,
     Json(input): Json<Submit>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let session_id = input.session_id.clone();
+    let owner =
+        s.db.blocking(move |db| {
+            Ok(db
+                .sessions()?
+                .into_iter()
+                .find(|session| Some(&session.id) == session_id.as_ref())
+                .and_then(|session| session.agent))
+        })
+        .await
+        .map_err(internal)?;
     let agent = input
         .agent
+        .or(owner)
         .unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
     if !s.agents.iter().any(|known| known.name == agent) {
         return Err(ApiError(
