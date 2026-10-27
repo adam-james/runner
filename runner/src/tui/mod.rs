@@ -170,7 +170,7 @@ async fn submit(
     let session = match session {
         Some(session) => session,
         None => {
-            let session = client.create_session(None).await?;
+            let session = client.create_session(None, agent.clone()).await?;
             let id = session.id.clone();
             send.send(Msg::Created {
                 generation,

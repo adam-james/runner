@@ -128,7 +128,7 @@ shows failed and cancelled turns, marked as not saved to the conversation.
 | Enter | send the prompt; open the highlighted session |
 | Ctrl-N | new session, to run something alongside the others |
 | Ctrl-O | pick a past session (↑/↓, then Enter) |
-| Ctrl-A | choose the agent for the next turns |
+| Ctrl-A | start a new session with another agent |
 | ↑/↓, PgUp/PgDn, mouse wheel | scroll the conversation (End follows new output) |
 | Tab / Shift-Tab | move between the prompt, Sessions, Runs and Conversation |
 | Esc, then c | cancel the highlighted run in the Runs pane, after a confirmation |
@@ -144,7 +144,7 @@ Queue additional turns while detached with
 `running_runs` and `queued_runs` counts for each session.
 `--session` on `run` requires an existing session. `--agent` on `run` and `chat`
 picks a named agent definition from the config's `[agents.<name>]` tables (see
-`runner.toml`); without it, runs use `default`.
+`runner.toml`); without it, existing sessions use their locked agent and new sessions use `default`.
 
 Agents can delegate to explicitly allowed configured specialists using host
 `delegate` and `wait` tools. Try `runner chat --agent coordinator` for sports and
@@ -509,6 +509,20 @@ runner chat                          # new session
 runner sessions list                 # list saved sessions
 runner chat --session trip           # create or resume a named session
 ```
+
+Sessions lock to an agent at creation, before any runs are submitted.
+`runner sessions create NAME --agent AGENT` chooses that agent (default: `default`).
+The session creation API requires an `agent` field. Later turns cannot change agents: an explicit mismatch returns
+an error with a hint to create a new session. Omitting `--agent` resumes the
+session's agent. TUI Ctrl-A starts a fresh session with the selected agent.
+This prevents one agent from inheriting another agent's tool results or sending
+its history to another provider. The lock binds the configured agent name;
+changes to that definition still take effect after a daemon restart.
+
+On upgrade, existing sessions lock to their most recent run's agent (submission
+order breaks timestamp ties). Older queued turns naming another agent fail
+without executing. Existing empty sessions migrate to `default`. Existing history
+is retained; upgrading does not remove data already shared between agents.
 
 New sessions receive UUIDs. `chat --session ID` creates a named session if it
 isn't saved yet, while `run --session ID` requires an existing session. IDs

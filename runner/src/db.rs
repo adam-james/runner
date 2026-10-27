@@ -19,6 +19,8 @@ struct Signals {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Session {
+    /// Set at session creation; never changes.
+    pub agent: String,
     pub id: String,
     pub created_at: i64,
     #[serde(default)]
@@ -209,7 +211,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 4 {
+        if version > 5 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -261,6 +263,38 @@ impl Database {
             )?;
             tx.commit()?;
         }
+        if version < 5 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN agent TEXT NOT NULL DEFAULT 'default';
+                 UPDATE sessions SET agent=COALESCE((SELECT agent FROM runs
+                     WHERE session_id=sessions.id ORDER BY created_at DESC, rowid DESC LIMIT 1), 'default');
+                 PRAGMA user_version=5;",
+            )?;
+            // Old queued turns must not execute under another agent's history.
+            let mismatches = {
+                let mut stmt = tx.prepare(
+                    "SELECT r.id FROM runs r JOIN sessions s ON s.id=r.session_id
+                    WHERE r.status='queued' AND r.agent!=s.agent",
+                )?;
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in mismatches {
+                let error =
+                    "session is locked to another agent after upgrade; create a new session";
+                tx.execute(
+                    "UPDATE runs SET status='failed', error=?2 WHERE id=?1",
+                    params![id, error],
+                )?;
+                append_event(
+                    &tx,
+                    &id,
+                    json!({"kind":"status","status":"failed","error":error}),
+                )?;
+            }
+            tx.commit()?;
+        }
         Ok(Self(
             Arc::new(Mutex::new(conn)),
             Arc::new(Signals {
@@ -270,19 +304,20 @@ impl Database {
         ))
     }
 
-    pub fn create_session(&self, id: Option<String>) -> Result<Session> {
+    pub fn create_session(&self, id: Option<String>, agent: String) -> Result<Session> {
         let id = id.unwrap_or_else(new_id);
         host::check_session_id(&id)?;
         let created_at = now();
         let session = Session {
+            agent,
             id,
             created_at,
             updated_at: created_at,
             ..Session::default()
         };
         self.0.lock().unwrap().execute(
-            "INSERT INTO sessions VALUES (?1, ?2)",
-            params![session.id, session.created_at],
+            "INSERT INTO sessions (id, created_at, agent) VALUES (?1, ?2, ?3)",
+            params![session.id, session.created_at, session.agent],
         )?;
         Ok(session)
     }
@@ -298,7 +333,8 @@ impl Database {
                 max(s.created_at, COALESCE(MAX(r.created_at), 0)),
                 (SELECT status FROM runs WHERE session_id=s.id
                     ORDER BY created_at DESC, rowid DESC LIMIT 1),
-                EXISTS (SELECT 1 FROM runs WHERE session_id=s.id AND parent_run_id IS NOT NULL)
+                EXISTS (SELECT 1 FROM runs WHERE session_id=s.id AND parent_run_id IS NOT NULL),
+                s.agent
              FROM sessions s LEFT JOIN runs r ON r.session_id=s.id
              GROUP BY s.id ORDER BY s.created_at, s.rowid",
         )?;
@@ -316,6 +352,7 @@ impl Database {
                     updated_at: row.get(5)?,
                     last_status: row.get(6)?,
                     delegated: row.get(7)?,
+                    agent: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -352,10 +389,23 @@ impl Database {
             }
             None => {
                 let id = new_id();
-                tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![id, now()])?;
+                tx.execute(
+                    "INSERT INTO sessions (id, created_at, agent) VALUES (?1, ?2, ?3)",
+                    params![id, now(), agent],
+                )?;
                 id
             }
         };
+        let owner: String = tx.query_row(
+            "SELECT agent FROM sessions WHERE id=?1",
+            [&session_id],
+            |r| r.get(0),
+        )?;
+        if owner != agent {
+            bail!(
+                "session '{session_id}' is locked to agent '{owner}'; create a new session to use agent '{agent}'"
+            );
+        }
         let id = new_id();
         let run = Run {
             id: id.clone(),
@@ -612,8 +662,8 @@ impl Database {
             deadline_at: Some(deadline_at),
         };
         tx.execute(
-            "INSERT INTO sessions VALUES (?1,?2)",
-            params![run.session_id, timestamp],
+            "INSERT INTO sessions (id,created_at,agent) VALUES (?1,?2,?3)",
+            params![run.session_id, timestamp, agent],
         )?;
         tx.execute("INSERT INTO runs (id,session_id,agent,prompt,status,created_at,deadline_secs,parent_run_id,root_run_id,depth,deadline_at)
             VALUES (?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9,?10)",

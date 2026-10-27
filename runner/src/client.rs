@@ -79,9 +79,13 @@ impl Client {
         Ok(self.request(method, path, body).await?.json().await?)
     }
 
-    pub async fn create_session(&self, id: Option<String>) -> Result<Session> {
-        self.json(Method::POST, "/v1/sessions", Some(json!({"id":id})))
-            .await
+    pub async fn create_session(&self, id: Option<String>, agent: String) -> Result<Session> {
+        self.json(
+            Method::POST,
+            "/v1/sessions",
+            Some(json!({"id":id,"agent":agent})),
+        )
+        .await
     }
 
     pub async fn agents(&self) -> Result<Vec<host::AgentInfo>> {

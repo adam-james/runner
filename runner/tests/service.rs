@@ -261,10 +261,26 @@ async fn runs_execute_the_agent_definition_they_name() {
         listed.iter().map(|r| &r.id).collect::<Vec<_>>(),
         [&other.id]
     );
-    // Omitting the agent picks `default`, and a session isn't tied to one.
+    let rejected = h
+        .client
+        .post(format!("{}/v1/runs", h.url))
+        .bearer_auth("test-token")
+        .json(&json!({"session_id":run.session_id,"agent":"default","prompt":"switch"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        rejected
+            .text()
+            .await
+            .unwrap()
+            .contains("create a new session")
+    );
+    // Omitting the agent resumes the session owner.
     let followup = h.submit(Some(&run.session_id), "which agent", 5).await;
-    assert_eq!(followup.agent, "default");
-    for (run, agent) in [(&run, "researcher"), (&followup, "default")] {
+    assert_eq!(followup.agent, "researcher");
+    for (run, agent) in [(&run, "researcher"), (&followup, "researcher")] {
         h.wait_status(&run.id, "completed").await;
         let text: String =
             h.db.events(&run.id, 0)
@@ -280,7 +296,9 @@ async fn runs_execute_the_agent_definition_they_name() {
 #[tokio::test]
 async fn capacity_and_session_order_are_enforced() {
     let h = Harness::new(2).await;
-    let session = h.db.create_session(Some("shared".into())).unwrap();
+    let session =
+        h.db.create_session(Some("shared".into()), "default".into())
+            .unwrap();
     let first = h.submit(Some(&session.id), "wait", 5).await;
     h.wait_status(&first.id, "running").await;
     let second = h.submit(Some(&session.id), "second", 5).await;
@@ -364,7 +382,9 @@ async fn failed_terminal_writes_are_retried_and_release_the_session() {
              WHEN NEW.status <> 'running' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         )
         .unwrap();
-    let session = h.db.create_session(Some("stuck".into())).unwrap();
+    let session =
+        h.db.create_session(Some("stuck".into()), "default".into())
+            .unwrap();
     let broken = h.submit(Some(&session.id), "hello", 5).await;
     let later = h.submit(Some(&session.id), "later", 5).await;
     h.wait_status(&broken.id, "running").await;
@@ -494,7 +514,8 @@ fn a_version_1_database_gains_transcripts_and_keeps_its_runs() {
     // What a daemon from before transcripts moved into SQLite left behind.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE transcripts;
+        "ALTER TABLE sessions DROP COLUMN agent;
+        DROP TABLE transcripts;
         DROP TABLE run_results;
         DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
         ALTER TABLE runs DROP COLUMN parent_run_id;
@@ -732,7 +753,9 @@ fn database_files_are_private_in_a_shared_directory() {
 #[tokio::test]
 async fn only_completed_runs_save_their_turn_in_the_same_commit() {
     let h = Harness::new(1).await;
-    let session = h.db.create_session(Some("kept".into())).unwrap();
+    let session =
+        h.db.create_session(Some("kept".into()), "default".into())
+            .unwrap();
     let transcript = || h.db.transcript(&session.id).unwrap();
     let first = h.submit(Some(&session.id), "first", 5).await;
     h.wait_status(&first.id, "completed").await;
@@ -806,7 +829,7 @@ async fn session_responses_report_current_work_counts() {
         .client
         .post(format!("{}/v1/sessions", h.url))
         .bearer_auth("test-token")
-        .json(&json!({"id":"counts"}))
+        .json(&json!({"id":"counts","agent":"default"}))
         .send()
         .await
         .unwrap()
@@ -852,7 +875,150 @@ async fn session_responses_report_current_work_counts() {
     assert_eq!(session.last_status.as_deref(), Some("cancelled"));
     assert!(session.updated_at >= third.created_at);
     let legacy: runner::db::Session =
-        serde_json::from_value(json!({"id":"old", "created_at":0})).unwrap();
+        serde_json::from_value(json!({"id":"old", "created_at":0,"agent":"default"})).unwrap();
     assert_eq!((legacy.running_runs, legacy.queued_runs), (0, 0));
+    h.close().await;
+}
+
+#[test]
+fn sessions_are_bound_at_creation_and_keep_their_agent_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let db = Database::open(&path).unwrap();
+    let session = db
+        .create_session(Some("locked".into()), "reader".into())
+        .unwrap();
+    assert_eq!(session.agent, "reader");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        conn.execute("UPDATE sessions SET agent=NULL WHERE id='locked'", [])
+            .is_err()
+    );
+    drop(conn);
+    assert!(
+        db.submit(
+            Some(session.id.clone()),
+            "researcher".into(),
+            "hello".into(),
+            60
+        )
+        .is_err()
+    );
+    assert!(db.runs(Some("locked")).unwrap().is_empty());
+    let run = db
+        .submit(Some(session.id), "reader".into(), "hello".into(), 60)
+        .unwrap();
+    db.cancel(&run.id).unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.sessions().unwrap()[0].agent, "reader");
+    let error = db
+        .submit(Some("locked".into()), "other".into(), "hello".into(), 60)
+        .unwrap_err();
+    assert!(error.to_string().contains("create a new session"));
+    assert_eq!(db.runs(Some("locked")).unwrap().len(), 1);
+    db.submit(Some("locked".into()), run.agent, "again".into(), 60)
+        .unwrap();
+}
+
+#[test]
+fn mixed_sessions_migrate_to_the_latest_agent_and_fail_incompatible_queued_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let db = Database::open(&path).unwrap();
+    let old = db
+        .submit(None, "reader".into(), "first".into(), 60)
+        .unwrap();
+    let latest = db
+        .submit(
+            Some(old.session_id.clone()),
+            "reader".into(),
+            "second".into(),
+            60,
+        )
+        .unwrap();
+    db.create_session(Some("empty".into()), "default".into())
+        .unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE runs SET agent='researcher', created_at=(SELECT created_at FROM runs WHERE id=?1) WHERE id=?2", rusqlite::params![old.id, latest.id]).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN agent; PRAGMA user_version=4;")
+        .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    let sessions = db.sessions().unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|s| s.id == old.session_id)
+            .unwrap()
+            .agent,
+        "researcher"
+    );
+    assert_eq!(
+        sessions.iter().find(|s| s.id == "empty").unwrap().agent,
+        "default"
+    );
+    assert_eq!(db.run(&old.id).unwrap().unwrap().status, "failed");
+    assert_eq!(db.claim().unwrap().unwrap().id, latest.id);
+    assert!(
+        db.submit(Some(old.session_id), "reader".into(), "again".into(), 60)
+            .is_err()
+    );
+    drop(db);
+    assert!(Database::open(&path).is_ok());
+}
+
+#[tokio::test]
+async fn session_creation_requires_a_known_agent_before_any_runs() {
+    let h = Harness::new(1).await;
+    for (body, status) in [
+        (
+            json!({"id":"missing"}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"id":"null", "agent":null}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"id":"unknown", "agent":"missing"}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = h
+            .client
+            .post(format!("{}/v1/sessions", h.url))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    assert!(h.db.sessions().unwrap().is_empty());
+    let response = h
+        .client
+        .post(format!("{}/v1/sessions", h.url))
+        .bearer_auth("test-token")
+        .json(&json!({"id":"research", "agent":"researcher"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let session: runner::db::Session = response.json().await.unwrap();
+    assert_eq!(session.agent, "researcher");
+    assert!(
+        h.db.submit(
+            Some(session.id.clone()),
+            "default".into(),
+            "switch".into(),
+            60
+        )
+        .is_err()
+    );
+    assert!(h.db.runs(Some(&session.id)).unwrap().is_empty());
+    let run = h.submit(Some(&session.id), "hello", 5).await;
+    assert_eq!(run.agent, "researcher");
     h.close().await;
 }

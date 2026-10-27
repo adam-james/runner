@@ -22,7 +22,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter", "send the prompt · open the highlighted session"),
     ("Ctrl-N", "new session, to run something alongside this one"),
     ("Ctrl-O", "pick a past session (↑/↓, Enter)"),
-    ("Ctrl-A", "choose the agent for the next turns"),
+    ("Ctrl-A", "new session with another agent"),
     (
         "↑/↓ PgUp/PgDn",
         "scroll the conversation; also the mouse wheel",
@@ -379,7 +379,7 @@ fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup) {
                 .collect(),
         ),
         Popup::Agents(selected) => (
-            " Agent for the next turns · Enter picks, Esc keeps ",
+            " New session agent · Enter picks, Esc keeps ",
             app.agents
                 .iter()
                 .enumerate()
@@ -486,6 +486,7 @@ mod tests {
         app.update(Msg::Sessions(vec![
             Session {
                 id: "trip".into(),
+                agent: "default".into(),
                 running_runs: 1,
                 title: Some("Weather in Seattle?".into()),
                 updated_at: 2,
@@ -493,6 +494,7 @@ mod tests {
             },
             Session {
                 id: "older".into(),
+                agent: "default".into(),
                 title: Some("Plan a weekend".into()),
                 last_status: Some("failed".into()),
                 updated_at: 1,

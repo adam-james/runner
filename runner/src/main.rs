@@ -43,7 +43,7 @@ enum Command {
         prompt: String,
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition to run; `default` if omitted.
+        /// The agent to run; resumes the session agent, or `default` for a new session.
         #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
@@ -55,7 +55,7 @@ enum Command {
     Chat {
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition each turn runs; `default` if omitted.
+        /// The session agent; uses the saved agent, or `default` for a new session.
         #[arg(long)]
         agent: Option<String>,
         #[arg(long, default_value_t = service::default_deadline())]
@@ -65,7 +65,7 @@ enum Command {
     Tui {
         #[arg(long)]
         session: Option<String>,
-        /// The agent definition new turns run; `default` if omitted. Can be
+        /// The session agent; uses the saved agent, or `default` for a new session. Can be
         /// changed from inside.
         #[arg(long)]
         agent: Option<String>,
@@ -165,6 +165,9 @@ enum Sessions {
     List,
     Create {
         id: Option<String>,
+        /// Agent this session will use for its lifetime.
+        #[arg(long, default_value = host::DEFAULT_AGENT)]
+        agent: String,
     },
     /// The audit records of every run in the session, a run at a time.
     Audit {
@@ -248,10 +251,10 @@ async fn main() -> Result<()> {
             agent,
             deadline_secs,
         } => {
-            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            let agent = session_agent(&client, session.as_deref(), agent).await?;
             let agents = client.agents().await?;
             let details = known_agent(&agents, &agent)?;
-            let (session, existing) = open_session(&client, session).await?;
+            let (session, existing) = open_session(&client, session, &agent).await?;
             ui::banner(details, &session);
             let result = chat(
                 &client,
@@ -271,13 +274,13 @@ async fn main() -> Result<()> {
             agent,
             deadline_secs,
         } => {
-            let agent = agent.unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
+            let agent = session_agent(&client, session.as_deref(), agent).await?;
             let agents = client.agents().await?;
             known_agent(&agents, &agent)?;
             // Without --session it starts on a new session, which its first
             // prompt creates, so just looking leaves no empty sessions behind.
             let session = match session {
-                Some(id) => Some(open_session(&client, Some(id)).await?.0),
+                Some(id) => Some(open_session(&client, Some(id), &agent).await?.0),
                 None => None,
             };
             let session = runner::tui::run(client, agents, agent, session, deadline_secs).await?;
@@ -315,14 +318,38 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&client.sessions().await?)?
             ),
-            Sessions::Create { id } => println!(
+            Sessions::Create { id, agent } => println!(
                 "{}",
-                serde_json::to_string_pretty(&client.create_session(id).await?)?
+                serde_json::to_string_pretty(&client.create_session(id, agent).await?)?
             ),
             Sessions::Audit { id, json } => print_audit(&client.session_audit(&id).await?, json)?,
         },
     }
     Ok(())
+}
+
+/// Resume with the session's owner, rejecting explicit changes before reading history.
+async fn session_agent(
+    client: &Client,
+    session: Option<&str>,
+    agent: Option<String>,
+) -> Result<String> {
+    let owner = client
+        .sessions()
+        .await?
+        .into_iter()
+        .find(|s| Some(s.id.as_str()) == session)
+        .map(|s| s.agent);
+    if let (Some(owner), Some(requested)) = (&owner, &agent)
+        && owner != requested
+    {
+        anyhow::bail!(
+            "session is locked to agent '{owner}'; create a new session to use agent '{requested}'"
+        );
+    }
+    Ok(agent
+        .or(owner)
+        .unwrap_or_else(|| host::DEFAULT_AGENT.to_string()))
 }
 
 /// The daemon's definition of `agent`, checked up front so a typo doesn't
@@ -412,7 +439,11 @@ async fn components(
 
 /// The named session, created if it isn't saved yet, or a new one; and
 /// whether it already existed.
-async fn open_session(client: &Client, session: Option<String>) -> Result<(String, bool)> {
+async fn open_session(
+    client: &Client,
+    session: Option<String>,
+    agent: &str,
+) -> Result<(String, bool)> {
     Ok(match session {
         Some(id) => {
             let existing = client
@@ -421,11 +452,16 @@ async fn open_session(client: &Client, session: Option<String>) -> Result<(Strin
                 .iter()
                 .any(|session| session.id == id);
             if !existing {
-                client.create_session(Some(id.clone())).await?;
+                client
+                    .create_session(Some(id.clone()), agent.to_string())
+                    .await?;
             }
             (id, existing)
         }
-        None => (client.create_session(None).await?.id, false),
+        None => (
+            client.create_session(None, agent.to_string()).await?.id,
+            false,
+        ),
     })
 }
 

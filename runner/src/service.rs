@@ -178,7 +178,7 @@ impl Drop for LocalInstance {
 pub struct Submit {
     pub prompt: String,
     pub session_id: Option<String>,
-    /// An agent definition's name; `default` if omitted.
+    /// An agent definition's name; session owner or `default` if omitted.
     pub agent: Option<String>,
     #[serde(default = "default_deadline")]
     pub deadline_secs: u64,
@@ -192,6 +192,7 @@ pub fn default_deadline() -> u64 {
 #[serde(deny_unknown_fields)]
 struct CreateSession {
     id: Option<String>,
+    agent: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -319,10 +320,16 @@ async fn create_session(
     State(s): State<Service>,
     Json(input): Json<CreateSession>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if !s.agents.iter().any(|known| known.name == input.agent) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent '{}'", input.agent),
+        ));
+    }
     Ok((
         StatusCode::CREATED,
         Json(
-            s.db.blocking(move |db| db.create_session(input.id))
+            s.db.blocking(move |db| db.create_session(input.id, input.agent))
                 .await
                 .map_err(bad)?,
         ),
@@ -344,8 +351,20 @@ async fn submit(
     State(s): State<Service>,
     Json(input): Json<Submit>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let session_id = input.session_id.clone();
+    let owner =
+        s.db.blocking(move |db| {
+            Ok(db
+                .sessions()?
+                .into_iter()
+                .find(|session| Some(&session.id) == session_id.as_ref())
+                .map(|session| session.agent))
+        })
+        .await
+        .map_err(internal)?;
     let agent = input
         .agent
+        .or(owner)
         .unwrap_or_else(|| host::DEFAULT_AGENT.to_string());
     if !s.agents.iter().any(|known| known.name == agent) {
         return Err(ApiError(

@@ -681,6 +681,22 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
+    let created = Command::new(env!("CARGO_BIN_EXE_runner"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["sessions", "create", "preselected", "--agent", "notools"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let session: runner::db::Session = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(session.agent, "notools");
+    assert!(client.runs(Some("preselected")).await.unwrap().is_empty());
+    let resumed_empty = chat(&data, &["--session", "preselected"], "");
+    assert!(resumed_empty.starts_with("runner · agent notools · session preselected · "));
     let named = chat(&data, &["--session", "a", "--agent", "notools"], "hi\n");
     assert!(
         named.starts_with("runner · agent notools · session a · "),
@@ -713,6 +729,21 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
     );
     let run = client.runs(Some("a")).await.unwrap();
     assert_eq!(run[0].agent, "notools");
+    let resumed = chat(&data, &["--session", "a"], "");
+    assert!(resumed.starts_with("runner · agent notools · session a · "));
+    for command in ["chat", "run"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_runner"));
+        cmd.arg("--data-dir")
+            .arg(&data)
+            .args([command, "--session", "a", "--agent", "default"]);
+        if command == "run" {
+            cmd.arg("switch");
+        }
+        let output = cmd.stdin(Stdio::null()).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("create a new session"));
+    }
+    assert_eq!(client.runs(Some("a")).await.unwrap().len(), 1);
 
     let output = Command::new(env!("CARGO_BIN_EXE_runner"))
         .arg("--data-dir")
@@ -1011,7 +1042,10 @@ async fn an_unreadable_transcript_fails_the_turn_without_details() {
 async fn conversations_are_kept_in_the_service_database() {
     let fixture = Fixture::new();
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
-    let session = db.create_session(Some("kept".into())).unwrap().id;
+    let session = db
+        .create_session(Some("kept".into()), "default".into())
+        .unwrap()
+        .id;
     let text = |run: &str| -> String {
         db.events(run, 0)
             .unwrap()
@@ -1430,7 +1464,7 @@ async fn chat_catches_up_pending_and_new_turns_before_accepting_input() {
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
     client
-        .create_session(Some("catch-up".into()))
+        .create_session(Some("catch-up".into()), "default".into())
         .await
         .unwrap();
     let history = client
@@ -1494,7 +1528,10 @@ async fn ctrl_c_detaches_chat_and_watch_successfully_without_cancelling_work() {
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
-    client.create_session(Some("detach".into())).await.unwrap();
+    client
+        .create_session(Some("detach".into()), "default".into())
+        .await
+        .unwrap();
     let active = client
         .submit(Some("detach".into()), None, "wait".into(), 30)
         .await
@@ -1555,7 +1592,10 @@ async fn connection_failure_during_catch_up_does_not_offer_an_idle_prompt() {
     let data = fixture.dir.path().join("service");
     let daemon = start(&fixture, &data);
     let client = connect(&data).await;
-    client.create_session(Some("lost".into())).await.unwrap();
+    client
+        .create_session(Some("lost".into()), "default".into())
+        .await
+        .unwrap();
     let active = client
         .submit(Some("lost".into()), None, "wait".into(), 30)
         .await
@@ -1917,7 +1957,7 @@ async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
 
     // A session's trail is each of its runs' trails, a run at a time.
     let session = client
-        .create_session(Some("audited".into()))
+        .create_session(Some("audited".into()), "default".into())
         .await
         .unwrap()
         .id;

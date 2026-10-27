@@ -344,6 +344,13 @@ impl App {
     fn sessions(&mut self, mut sessions: Vec<Session>) {
         sessions.retain(|session| !session.delegated || self.session.as_ref() == Some(&session.id));
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        if let Some(owner) = sessions
+            .iter()
+            .find(|s| Some(&s.id) == self.session.as_ref())
+            .map(|s| &s.agent)
+        {
+            self.agent = owner.clone();
+        }
         self.sessions = sessions;
         if self.focus != Focus::Sessions {
             self.session_cursor = self.session.clone();
@@ -383,6 +390,14 @@ impl App {
 
     /// Shows `session` instead of the current one: a new session if `None`.
     fn select(&mut self, session: Option<String>) -> Action {
+        if let Some(owner) = self
+            .sessions
+            .iter()
+            .find(|s| Some(&s.id) == session.as_ref())
+            .map(|s| &s.agent)
+        {
+            self.agent = owner.clone();
+        }
         self.session_cursor = session.clone();
         self.session = session.clone();
         self.turns.clear();
@@ -578,7 +593,10 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(agent) = self.agents.get(index) {
                         self.agent = agent.name.clone();
-                        self.status = Some((false, format!("next turns run agent {}", agent.name)));
+                        let action = self.select(None);
+                        self.status =
+                            Some((false, format!("new session with agent {}", self.agent)));
+                        return vec![action];
                     }
                 }
                 KeyCode::Esc => {}
@@ -621,6 +639,7 @@ mod tests {
     fn session(id: &str, updated_at: i64) -> Session {
         Session {
             id: id.into(),
+            agent: "default".into(),
             updated_at,
             ..Session::default()
         }
@@ -918,6 +937,16 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_session_restores_its_locked_agent() {
+        let mut app = app(None);
+        let mut saved = session("saved", 1);
+        saved.agent = "reader".into();
+        app.update(Msg::Sessions(vec![saved]));
+        app.select(Some("saved".into()));
+        assert_eq!(app.agent, "reader");
+    }
+
+    #[test]
     fn the_agent_can_be_changed_from_the_prompt_box() {
         let mut app = app(Some("s"));
         app.update(press(KeyCode::Char('a')));
@@ -926,6 +955,8 @@ mod tests {
         app.update(press(KeyCode::Down));
         app.update(press(KeyCode::Enter));
         assert_eq!(app.agent, "reader");
+        assert!(app.session.is_none());
+        assert!(app.turns.is_empty());
         assert_eq!(app.input, "a");
         assert_eq!(app.update(ctrl('c')), vec![Action::Quit]);
         app.update(press(KeyCode::Tab));

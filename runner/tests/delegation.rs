@@ -37,6 +37,24 @@ fn child_relationships_ownership_final_results_and_cancellation_are_durable() {
         .delegate(&parent.id, "worker", "child", Some(10))
         .unwrap();
     assert_ne!(first.session_id, parent.session_id);
+    assert_eq!(
+        db.sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == first.session_id)
+            .unwrap()
+            .agent,
+        "worker"
+    );
+    assert!(
+        db.submit(
+            Some(first.session_id.clone()),
+            "other".into(),
+            "switch".into(),
+            30
+        )
+        .is_err()
+    );
     assert_eq!(first.parent_run_id.as_deref(), Some(parent.id.as_str()));
     assert_eq!(first.root_run_id, parent.id);
     assert_eq!(first.depth, 1);
@@ -203,7 +221,8 @@ fn version_two_database_keeps_existing_transcripts_during_delegation_upgrade() {
     drop(db);
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE run_results;
+        "ALTER TABLE sessions DROP COLUMN agent;
+        DROP TABLE run_results;
         DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
         ALTER TABLE runs DROP COLUMN parent_run_id;
         ALTER TABLE runs DROP COLUMN root_run_id;

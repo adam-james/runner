@@ -29,13 +29,8 @@ the reason to pick runner.
 
 ## 2. Enforce capabilities at the moment they matter
 
-- lock each session to one agent for its whole life
-  - why: history (including tool results) carries across a session's runs, so switching agents combines capabilities no single agent has, e.g. `reader` reads a secret, then `researcher` can leak it via `web_search`; it can also hand history to a different provider
-  - runs are already locked to their agent (set at submit, never updated); the session is the gap
-  - record the agent on the session at creation or first run (schema change); reject runs naming a different agent
-  - switching agents means a new session: TUI Ctrl-A opens one; `chat`/`run --session X --agent Y` with a mismatch errors with a hint
-  - existing mixed-agent sessions lock to their most recent agent
-  - later, if missed: explicit handoff to a new session seeded with prompts and replies only (no tool results), behind a confirmation
+- ~~lock each session to one agent for its whole life~~ done: required agent at creation, mismatch errors, migration, and TUI switches start new sessions
+  - later: explicit handoff to a new session seeded with prompts and replies only (no tool results), behind a confirmation
   - longer term: taint tracking of history from sensitive tools instead of a blanket lock
 - dynamic tool config and permissioning
   - per-run grants, e.g. "this run may write to `~/.runner/files` until it ends"; record every decision in the audit log
