@@ -79,6 +79,7 @@ max_model_calls = 1
 [agents.auditor]
 provider = "fixture"
 inspect_components = true
+read_audit_trails = true
 "#,
                 quote(target.join("test_provider.wasm")),
                 quote(target.join("test_tool.wasm")),
@@ -269,6 +270,77 @@ async fn inspect_component_reads_configured_components_without_secrets() {
 
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
+async fn audit_trail_reads_other_runs_but_never_its_own() {
+    let fixture = Fixture::new();
+    let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(fixture.runtime().await.host)),
+        1,
+        stop.clone(),
+    ));
+    let finished = |id: &str| {
+        db.events(id, 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.data["kind"] == "tool_finished")
+            .unwrap()
+            .data
+    };
+    let reviewed = db
+        .submit(None, "default".into(), "hello".into(), 30)
+        .unwrap();
+    wait(&db, &reviewed.id, "completed").await;
+
+    let prompt = format!(r#"named-tool:audit_trail:{{"run_id":"{}"}}"#, reviewed.id);
+    let review = db.submit(None, "auditor".into(), prompt, 30).unwrap();
+    wait(&db, &review.id, "completed").await;
+    assert_eq!(finished(&review.id)["ok"], true);
+    let text: String = db
+        .events(&review.id, 0)
+        .unwrap()
+        .iter()
+        .filter(|event| event.data["kind"] == "text")
+        .map(|event| event.data["text"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        text.starts_with(&format!("Audit trail of run {}:", reviewed.id)),
+        "{text}"
+    );
+    assert!(text.contains("\nTrail problems:\nnone\n"), "{text}");
+    assert!(text.contains(r#""action":"provider.chat""#), "{text}");
+
+    // Its own session is refused, and the call is audited as a host tool's.
+    let session = db.create_session(None).unwrap().id;
+    let prompt = format!(r#"named-tool:audit_trail:{{"session_id":"{session}"}}"#);
+    let own = db
+        .submit(Some(session), "auditor".into(), prompt, 30)
+        .unwrap();
+    wait(&db, &own.id, "completed").await;
+    let error = finished(&own.id)["error"].to_string();
+    assert!(error.contains("delegation tree"), "{error}");
+    let call = db
+        .audit(&own.id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.data["action"] == "tool.call")
+        .unwrap()
+        .data;
+    assert_eq!(call["component"]["kind"], "host");
+    assert_eq!(call["component"]["name"], "audit_trail");
+
+    // Only agents granted the tool have it.
+    let prompt = format!(r#"named-tool:audit_trail:{{"run_id":"{}"}}"#, reviewed.id);
+    let denied = db.submit(None, "default".into(), prompt, 30).unwrap();
+    wait(&db, &denied.id, "completed").await;
+    assert_eq!(finished(&denied.id)["error"], "no such tool: audit_trail");
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
 async fn agent_definitions_only_get_the_tools_they_name() {
     let fixture = Fixture::new();
     let runtime = fixture.runtime().await;
@@ -287,7 +359,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
                 name: "auditor".into(),
                 provider: "fixture".into(),
                 model: "fixture".into(),
-                tools: vec!["inspect_component".into()],
+                tools: vec!["audit_trail".into(), "inspect_component".into()],
                 delegates: vec![],
                 max_tokens: host::DEFAULT_MAX_TOKENS,
                 max_model_calls: None,

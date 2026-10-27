@@ -257,6 +257,24 @@ Limits and failures:
 - A delegated child is its own run, with its own trail; the parent's shows
   the `delegate` and `wait` calls.
 
+Agents with `read_audit_trails = true` get a host `audit_trail` tool that
+reads a run's or session's trail, so an agent can review what runs did (the
+`security_auditor` above reviews what components could do). The example
+`run_auditor` agent flags denied requests, limits, traps, timeouts, gaps in the
+trail and tools reaching hosts or directories their purpose doesn't need:
+
+```bash
+runner run --agent run_auditor "Audit session SESSION_ID."
+```
+
+The tool leads with problems in the trail, each component's hosts and
+directories, and the notable records, then lists every record as JSON as far
+as 60 KiB allows. It never reads its own run's trail, or any run's in its
+delegation tree, since that run's tools could otherwise plant text for it.
+Strings in records can still be chosen by a guest (a tool name the model asked
+for, a request's host), so they stay JSON-quoted and the agent is told to
+treat them as data. It needs the daemon.
+
 ### Verify the service
 
 The standard tests use deterministic execution without API keys. The additional

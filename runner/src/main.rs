@@ -383,6 +383,10 @@ async fn components(
                             "'{name}' is a host tool that reads configured components; \
                              it runs no component"
                         ),
+                        "audit_trail" => bail!(
+                            "'{name}' is a host tool that reads other runs' audit trails; \
+                             it runs no component"
+                        ),
                         _ => {}
                     }
                 }

@@ -2,6 +2,7 @@ mod activity;
 mod audit;
 pub mod delegation;
 pub mod inspect;
+pub mod trails;
 mod transcript;
 pub mod wat;
 
@@ -81,6 +82,10 @@ struct AgentConfig {
     /// configured component's imports, exports and config capabilities.
     #[serde(default)]
     inspect_components: bool,
+    /// Grants the host's `audit_trail` tool, which reads other runs' and
+    /// sessions' audit records (never its own run's). Needs the service.
+    #[serde(default)]
+    read_audit_trails: bool,
     /// The system prompt sent with each model request; without one,
     /// `DEFAULT_SYSTEM_PROMPT`.
     system_prompt: Option<String>,
@@ -100,6 +105,7 @@ struct AgentDefinition {
     tools: BTreeMap<String, ComponentConfig>,
     delegates: Vec<String>,
     inspect_components: bool,
+    read_audit_trails: bool,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_model_calls: Option<u32>,
@@ -150,7 +156,10 @@ fn validate_table_key(kind: &str, name: &str) -> Result<()> {
 fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinition>> {
     for name in config.tools.keys() {
         validate_table_key("tool", name)?;
-        if matches!(name.as_str(), "delegate" | "wait" | wat::TOOL) {
+        if matches!(
+            name.as_str(),
+            "delegate" | "wait" | wat::TOOL | trails::TOOL
+        ) {
             bail!("tool name '{name}' is reserved for a host tool");
         }
     }
@@ -215,6 +224,7 @@ fn resolve_agents(config: &RunnerConfig) -> Result<BTreeMap<String, AgentDefinit
                 tools,
                 delegates: agent.delegates.clone(),
                 inspect_components: agent.inspect_components,
+                read_audit_trails: agent.read_audit_trails,
                 system_prompt: agent.system_prompt.clone(),
                 max_tokens: agent.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 max_model_calls: agent.max_model_calls,
@@ -922,6 +932,8 @@ struct SessionComponents {
     audit: audit::AuditCell,
     /// Set for definitions with `inspect_components`.
     inspector: Option<Arc<RunnerConfig>>,
+    /// Whether the definition has `read_audit_trails`.
+    audit_trails: bool,
 }
 
 fn sort_tool_definitions(definitions: &mut [ToolDefinition]) {
@@ -1068,7 +1080,8 @@ impl SessionComponents {
         let inspector = (name == wat::TOOL)
             .then_some(self.inspector.clone())
             .flatten();
-        let host_tool = matches!(name, "delegate" | "wait") || inspector.is_some();
+        let audit_trails = name == trails::TOOL && self.audit_trails;
+        let host_tool = matches!(name, "delegate" | "wait") || inspector.is_some() || audit_trails;
         let component = match self.tools.get(name) {
             Some(tool) => tool.audit.id.clone(),
             None => Arc::new(audit::ComponentId {
@@ -1086,6 +1099,9 @@ impl SessionComponents {
             let (result, decision, outcome) = if host_tool {
                 let result = match inspector {
                     Some(config) => wat::call(config, input).await.map(cap_tool_output),
+                    None if audit_trails => {
+                        trails::call(delegation, input).await.map(cap_tool_output)
+                    }
                     None => delegation::call(delegation, targets, name, input).await,
                 };
                 let outcome = if result.is_ok() { "ok" } else { "error" };
@@ -1407,6 +1423,9 @@ impl Runtime {
                 if definition.inspect_components {
                     tools.push(wat::TOOL.into());
                 }
+                if definition.read_audit_trails {
+                    tools.push(trails::TOOL.into());
+                }
                 tools.sort();
                 AgentInfo {
                     name: name.clone(),
@@ -1581,6 +1600,9 @@ impl Runtime {
         if let Some(config) = &inspector {
             definitions.extend(wat::definitions(config));
         }
+        if definition.read_audit_trails {
+            definitions.extend(trails::definitions());
+        }
         sort_tool_definitions(&mut definitions);
         Ok(SessionComponents {
             provider,
@@ -1588,6 +1610,7 @@ impl Runtime {
             tool_definitions: definitions,
             audit,
             inspector,
+            audit_trails: definition.read_audit_trails,
         })
     }
 }
@@ -2133,7 +2156,7 @@ mod tests {
             )
             .is_err()
         );
-        for name in ["delegate", "wait", "inspect_component"] {
+        for name in ["delegate", "wait", "inspect_component", "audit_trail"] {
             assert!(agents("[agents.default]\nprovider = \"main\"", &[name, "docs"]).is_err());
         }
     }
@@ -2333,6 +2356,10 @@ mod tests {
         assert!(agents["security_auditor"].inspect_components);
         assert!(agents["security_auditor"].tools.is_empty());
         assert!(!agents["default"].inspect_components);
+        assert!(agents["run_auditor"].read_audit_trails);
+        assert!(agents["run_auditor"].inspect_components);
+        assert!(agents["run_auditor"].tools.is_empty());
+        assert!(!agents["security_auditor"].read_audit_trails);
         assert_eq!(
             agents["reader"].tools.keys().collect::<Vec<_>>(),
             ["read_file"]
