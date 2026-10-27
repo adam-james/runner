@@ -160,21 +160,64 @@ directory.
 
 ## Roadmap
 
-1. **Scheduling:** add durable one-off and cron schedules with explicit time
-   zones and API/CLI management. Each occurrence creates an ordinary run in a
-   fresh session. Unique occurrence IDs prevent duplicate enqueueing. Skip
-   missed recurring occurrences and enqueue overdue one-off tasks once when
-   the daemon returns. No wake-from-sleep or remote execution initially.
-2. **Dynamic agents:** temporary specialists and constrained overrides of static
-   definitions. Host-approved models, tools, and targets bound their authority;
-   define lifetime, quotas, and persistence before implementation. Static
-   delegation is implemented; see [delegation](delegation.md).
-3. **Desktop:** use the same API for sessions, live output, run trees,
-   cancellation, and scheduling. Desktop and CLI share a daemon. Choose the UI
-   framework when implementation starts; it does not determine the runtime.
+The focus is background agents that are secure and auditable: nobody watches
+a background run, so what it may do is fixed before it starts, anything beyond
+that waits for an approval that defaults to deny, and the audit log is how you
+find out what happened. Agents are the unit of capability; there's no
+separate grant system. Each milestone ships something usable on its own;
+[todo.md](../todo.md) tracks the details.
+
+1. **Agent versions:** at the start of each run, the host snapshots the
+   resolved agent definition: provider and model, each tool's allowed hosts,
+   header names and the hosts they go to (never values), directory, limits,
+   and component digest, plus delegates, flags, and a hash of the system
+   prompt. The snapshot's hash is the agent version. The service stores each
+   distinct version once and records it on the run and in its audit trail, so
+   a run can be checked against what it was allowed after `runner.toml` has
+   changed. Sessions stay locked to the agent name; each run records its
+   version.
+2. **Schedules pinned to an agent version:** add durable one-off and cron
+   schedules with explicit time zones and API/CLI management. Each occurrence
+   creates an ordinary run in a fresh session. Unique occurrence IDs prevent
+   duplicate enqueueing. Skip missed recurring occurrences and enqueue overdue
+   one-off tasks once when the daemon returns. No wake-from-sleep or remote
+   execution initially. A schedule names an agent and pins the version it was
+   created with; if the version changes, the schedule pauses until it's
+   approved again.
+3. **Run summaries, alerts, and notifications:** the host summarizes every background run
+   from its audit records, without a model: hosts reached, denials, errors,
+   trail gaps, and pending approvals. Denials, gaps, and hosts a schedule has
+   never reached before raise alerts, and only flagged runs go to the
+   `run_auditor` agent. Audit records, and the agent versions they reference,
+   are kept longer than their runs, since background runs are reviewed later.
+   The user is notified in the foreground when a background run finishes,
+   fails, or raises an alert, as a desktop notification and in the TUI; each
+   schedule chooses every finish, only failures and alerts, or never.
+   Notifications are durable records, so none are lost while no client is
+   connected, and their text is written by the host (task, outcome, duration,
+   flags), never taken from the model's reply, which a prompt injection could
+   steer. Approval requests use the same channel.
+4. **Asynchronous approvals:** tools declare side-effecting actions in their
+   WIT interface. Such an action pauses its run durably, surviving restarts,
+   until it's approved or denied from the CLI, TUI, or a remote client.
+   Approvals expire, and an expired approval is a denial. Agents may hold
+   standing approvals for routine, narrow actions, as part of their version.
+   Every approval, denial, and expiry is audited.
+5. **Desktop:** use the same API for sessions, live output, run trees,
+   cancellation, schedules, summaries, notifications, and approvals. Desktop
+   and CLI share a daemon. Choose the UI framework when implementation starts;
+   it does not determine the runtime.
+
+Deferred: dynamic agents (temporary specialists and overrides of static
+definitions created at runtime), since a background agent that defines new
+agents is hard to audit; static delegation fits the focus (see
+[delegation](delegation.md)). If revisited, host-approved models, tools, and
+targets bound their authority, and lifetime, quotas, and persistence are
+defined before implementation. Memory across a schedule's runs waits for the
+milestones above, since it's how a prompt injection would persist.
 
 Remote serving, multi-user authorization, automatic retries, durable stack
-checkpoints, and distributed workers are outside this milestone.
+checkpoints, and distributed workers are outside these milestones.
 
 ## Host activity logs
 
