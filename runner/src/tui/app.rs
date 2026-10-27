@@ -214,6 +214,9 @@ pub struct App {
     pub cursor: usize,
     /// Conversation lines scrolled up from the bottom; 0 follows new output.
     pub scroll: u16,
+    /// The conversation pane's width, height and furthest scroll when last
+    /// drawn, so lines that arrive while scrolled up don't move the view.
+    pub layout: (u16, u16, u16),
     pub popup: Option<Popup>,
     /// A notice, or an error if `true`, shown in the status bar until the next key.
     pub status: Option<(bool, String)>,
@@ -238,6 +241,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             scroll: 0,
+            layout: (0, 0, 0),
             popup: None,
             status: None,
             creating: false,
