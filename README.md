@@ -218,6 +218,7 @@ nobody watching:
 
 ```bash
 runner schedules add --agent researcher --at 2026-10-29T07:00 --tz Europe/Warsaw "Morning brief"
+runner schedules add --in 2s "Say hello"   # or 5m, 1h30m: handy for testing
 runner schedules list
 runner schedules show ID      # the schedule and its history: what was done to it and what it ran
 runner schedules pause ID

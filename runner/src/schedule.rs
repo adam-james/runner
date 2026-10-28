@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
@@ -30,6 +30,37 @@ pub fn fire_time(at: &str, tz: &str) -> Result<(String, i64)> {
         anyhow!("{civil} is skipped or repeated in {tz} by a clock change; pick another time")
     })?;
     Ok((civil.to_string(), zoned.timestamp().as_millisecond()))
+}
+
+/// The longest delay `fire_after` takes: a year.
+pub const MAX_DELAY_SECS: u64 = 366 * 86400;
+
+/// When `secs` seconds from now is: the local time in `tz`, to the second,
+/// and Unix milliseconds. A delay always names one instant, so unlike
+/// `fire_time` it's never ambiguous across a clock change.
+pub fn fire_after(secs: u64, tz: &str) -> Result<(String, i64)> {
+    if !(1..=MAX_DELAY_SECS).contains(&secs) {
+        bail!("delay must be between 1 second and a year");
+    }
+    let zone = jiff::tz::TimeZone::get(tz).map_err(|_| anyhow!("unknown time zone '{tz}'"))?;
+    let instant = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(secs as i64);
+    let at = instant
+        .to_zoned(zone)
+        .datetime()
+        .round(jiff::Unit::Second)
+        .context("rounding a fire time")?;
+    Ok((at.to_string(), instant.as_millisecond()))
+}
+
+/// A delay like `2s`, `90s`, `5m` or `1h30m`, in whole seconds.
+pub fn parse_delay(text: &str) -> Result<u64> {
+    let delay: jiff::SignedDuration = text
+        .parse()
+        .with_context(|| format!("invalid delay '{text}': use e.g. 2s, 5m or 1h30m"))?;
+    if delay.subsec_nanos() != 0 || delay.as_secs() < 1 {
+        bail!("invalid delay '{text}': use a whole number of seconds, at least 1");
+    }
+    Ok(delay.as_secs() as u64)
 }
 
 /// Pauses schedules whose agents changed while the daemon was stopped,
@@ -85,5 +116,22 @@ mod tests {
         assert!(fire_time("2026-10-25T02:30", "Europe/Warsaw").is_err());
         assert!(fire_time("2026-10-29T07:00", "Mars/Olympus").is_err());
         assert!(fire_time("tomorrow", "UTC").is_err());
+    }
+
+    #[test]
+    fn delays_are_whole_seconds_from_now() {
+        assert_eq!(parse_delay("2s").unwrap(), 2);
+        assert_eq!(parse_delay("1m30s").unwrap(), 90);
+        assert_eq!(parse_delay("1h").unwrap(), 3600);
+        for bad in ["0s", "1.5s", "-2s", "soon", ""] {
+            assert!(parse_delay(bad).is_err(), "{bad}");
+        }
+        let before = crate::db::now();
+        let (at, ms) = fire_after(2, "UTC").unwrap();
+        assert!((before + 2000..before + 3000).contains(&ms), "{ms}");
+        assert!(!at.contains('.'), "{at}");
+        assert!(fire_after(0, "UTC").is_err());
+        assert!(fire_after(MAX_DELAY_SECS + 1, "UTC").is_err());
+        assert!(fire_after(2, "Mars/Olympus").is_err());
     }
 }

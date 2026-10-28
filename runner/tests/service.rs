@@ -1484,3 +1484,35 @@ async fn the_scheduler_pauses_changed_schedules_at_startup_and_fires_due_ones() 
     scheduler.await.unwrap();
     h.close().await;
 }
+
+#[tokio::test]
+async fn a_schedule_can_fire_a_delay_from_now_instead_of_at_a_time() {
+    let h = Harness::new(1).await;
+    let create = |body: Value| h.api(reqwest::Method::POST, "/v1/schedules", Some(body));
+    let before = db_now();
+    let (status, schedule) = create(
+        json!({"id":"soon", "agent":"default", "prompt":"p", "in_secs":2, "tz":"Europe/Warsaw"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{schedule}");
+    let fires = schedule["next_fire_at"].as_i64().unwrap();
+    assert!(
+        (before + 2000..db_now() + 2000).contains(&fires),
+        "{schedule}"
+    );
+    assert!(
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(h.db.fire_due(fires, &pin_of(&h.executor)).unwrap().len(), 1);
+    for body in [
+        json!({"agent":"default", "prompt":"p", "tz":"UTC"}),
+        json!({"agent":"default", "prompt":"p", "tz":"UTC", "in_secs":2, "at":"2999-01-01T07:00"}),
+        json!({"agent":"default", "prompt":"p", "tz":"UTC", "in_secs":0}),
+    ] {
+        let (status, error) = create(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    }
+    h.close().await;
+}

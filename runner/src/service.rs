@@ -216,8 +216,10 @@ struct CreateSchedule {
     id: Option<String>,
     agent: String,
     prompt: String,
-    /// A local time in `tz`, e.g. `2026-10-29T07:00`.
-    at: String,
+    /// A local time in `tz`, e.g. `2026-10-29T07:00`; or `in_secs`.
+    at: Option<String>,
+    /// Seconds from now, e.g. for testing; or `at`.
+    in_secs: Option<u64>,
     /// An IANA time zone name, e.g. `Europe/Warsaw`; required, so a
     /// schedule never depends on the daemon's own zone.
     tz: String,
@@ -580,7 +582,12 @@ async fn create_schedule(
             format!("unknown agent '{}'", input.agent),
         )
     })?;
-    let (at, next_fire_at) = crate::schedule::fire_time(&input.at, &input.tz).map_err(bad)?;
+    let (at, next_fire_at) = match (&input.at, input.in_secs) {
+        (Some(at), None) => crate::schedule::fire_time(at, &input.tz),
+        (None, Some(secs)) => crate::schedule::fire_after(secs, &input.tz),
+        _ => Err(anyhow::anyhow!("give one of `at` and `in_secs`")),
+    }
+    .map_err(bad)?;
     if next_fire_at < crate::db::now() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,

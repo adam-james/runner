@@ -147,12 +147,16 @@ enum Agents {
 
 #[derive(Subcommand)]
 enum Schedules {
-    /// Run a prompt once, at a local time, in a fresh session.
+    /// Run a prompt once, at a local time or after a delay, in a fresh session.
+    #[command(group(clap::ArgGroup::new("when").required(true).args(["at", "delay"])))]
     Add {
         prompt: String,
         /// When, e.g. 2026-10-29T07:00.
         #[arg(long)]
-        at: String,
+        at: Option<String>,
+        /// How long from now instead, e.g. 2s, 5m or 1h30m.
+        #[arg(long = "in", value_name = "DELAY", value_parser = runner::schedule::parse_delay)]
+        delay: Option<u64>,
         /// An IANA time zone, e.g. Europe/Warsaw; this system's if omitted.
         #[arg(long)]
         tz: Option<String>,
@@ -389,6 +393,7 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
         Schedules::Add {
             prompt,
             at,
+            delay,
             tz,
             agent,
             id,
@@ -405,7 +410,7 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
             };
             print(
                 &client
-                    .create_schedule(id, agent, prompt, at, tz, deadline_secs)
+                    .create_schedule(id, agent, prompt, at, delay, tz, deadline_secs)
                     .await?,
             )?
         }

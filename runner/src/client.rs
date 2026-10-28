@@ -155,20 +155,25 @@ impl Client {
             .await
     }
 
-    /// Schedules a prompt to run once at local time `at` in time zone `tz`.
+    /// Schedules a prompt to run once, at local time `at` in time zone
+    /// `tz` or `in_secs` seconds from now; give one of the two.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_schedule(
         &self,
         id: Option<String>,
         agent: String,
         prompt: String,
-        at: String,
+        at: Option<String>,
+        in_secs: Option<u64>,
         tz: String,
         deadline: u64,
     ) -> Result<Schedule> {
         self.json(
             Method::POST,
             "/v1/schedules",
-            Some(json!({"id":id,"agent":agent,"prompt":prompt,"at":at,"tz":tz,"deadline_secs":deadline})),
+            Some(
+                json!({"id":id,"agent":agent,"prompt":prompt,"at":at,"in_secs":in_secs,"tz":tz,"deadline_secs":deadline}),
+            ),
         )
         .await
     }

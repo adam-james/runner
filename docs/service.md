@@ -127,7 +127,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |
-| `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`; pins the agent's versions; returns schedule, HTTP 201 |
+| `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
 | `GET /v1/schedules` | List schedules that haven't been deleted |
 | `GET /v1/schedules/{id}` | Inspect a schedule, deleted ones included |
 | `GET /v1/schedules/{id}/history` | What was done to it and what it did, oldest first |
@@ -234,7 +234,9 @@ checkpoints, and distributed workers are outside these milestones.
 ## Schedules
 
 A **schedule** runs a prompt once, at a local time in an explicit IANA time
-zone, as an ordinary run in a fresh session locked to its agent. The time is
+zone, as an ordinary run in a fresh session locked to its agent, or a delay
+from now (`in_secs`, e.g. for testing), whose local time is then stored to the
+second. The time is
 stored as given, with the zone, and as the instant it names; a local time that
 a clock change skips or repeats is refused. Schedule ids follow session ids'
 rules. Statuses are `active`, `paused`, `done` (fired) and `deleted`.
