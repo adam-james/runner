@@ -23,10 +23,9 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl-N", "new session, to run something alongside this one"),
     ("Ctrl-O", "pick a past session (↑/↓, Enter)"),
     ("Ctrl-A", "new session with another agent"),
-    (
-        "↑/↓ PgUp/PgDn",
-        "scroll the conversation; also the mouse wheel",
-    ),
+    ("↑/↓ PgUp/PgDn", "scroll the conversation"),
+    ("Drag to select", "copy with your terminal’s usual shortcut"),
+    ("Paste", "use your terminal’s usual shortcut in the prompt"),
     ("Home / End", "top of the conversation / follow new output"),
     ("Tab / Shift-Tab", "move between panes"),
     ("Esc", "leave the prompt box, for one-letter keys:"),
@@ -557,7 +556,7 @@ mod tests {
         app.update(Msg::Runs("trip".into(), runs));
         let bottom = screen(&mut app, 0);
         assert!(bottom.contains("> prompt 39") && !bottom.contains("> prompt 0 "));
-        app.update(Msg::Scroll(i16::MAX));
+        app.scroll = u16::MAX;
         let top = screen(&mut app, 0);
         assert!(top.contains("> prompt 0 "), "{top}");
         assert!(top.contains("End to follow"));
@@ -580,7 +579,7 @@ mod tests {
         };
         stream(&mut app, "first line");
         screen(&mut app, 0);
-        app.update(Msg::Scroll(10));
+        app.scroll = 10;
         let before = screen(&mut app, 0);
         stream(&mut app, "\nmore\nand more\nand more still");
         let after = screen(&mut app, 0);
