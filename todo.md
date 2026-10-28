@@ -39,7 +39,12 @@ In order; each step ships something usable on its own.
    - next: `runs audit` could show where a run went beyond its version (it can't today, since the host enforces the version, but it would catch a host bug)
 2. schedules pinned to an agent version - one-off and cron schedules (see docs/service.md); each occurrence is an ordinary run in a fresh session
    - done: one-off schedules (`runner schedules`, `/v1/schedules`), pinned to the versions of their agent and every agent it can delegate to; checked at startup, when due, and when the run starts; a changed agent pauses the schedule until `approve`, which reports what changed
-   - next: recurring cron schedules with time zones: DST rules (skip a time that doesn't happen, fire once for one that happens twice), skip missed occurrences, and skip an occurrence while the previous one is still running
+   - next: recurring cron schedules with time zones: skip missed occurrences, and skip an occurrence while the previous one is still running
+     - parse and step cron with `croner`, and replace `jiff` with `chrono` + `chrono-tz` so there's one time library; only `fire_time`, `fire_after` and `parse_delay` in `runner/src/schedule.rs` (and their tests) use jiff
+     - take croner's DST rules (Vixie cron) for recurring schedules rather than writing our own: in a spring-forward gap a fixed-time job runs right after the gap and interval jobs skip the gap; in a fall-back overlap a fixed-time job runs once and interval jobs run in both passes
+     - one-offs keep refusing an `--at` time a clock change skips or repeats
+     - trade-off: `chrono-tz` builds the zone database into the binary, so zone rule updates need a rebuild (jiff reads the system's on macOS and Linux)
+     - a recurring schedule stays `active` between runs; a run refused because its agent changed moves the schedule to its next occurrence instead of re-arming the old time
    - later: `approve` could show the changed fields before re-pinning and ask to confirm, rather than reporting them after
    - read-only background agents (e.g. a morning brief) are safe and useful at this step
 3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
