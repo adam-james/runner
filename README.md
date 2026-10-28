@@ -129,14 +129,17 @@ shows failed and cancelled turns, marked as not saved to the conversation.
 | Ctrl-N | new session, to run something alongside the others |
 | Ctrl-O | pick a past session (↑/↓, then Enter) |
 | Ctrl-A | start a new session with another agent |
-| ↑/↓, PgUp/PgDn, mouse wheel | scroll the conversation (End follows new output) |
+| ↑/↓, PgUp/PgDn | scroll the conversation (End follows new output) |
 | Tab / Shift-Tab | move between the prompt, Sessions, Runs and Conversation |
 | Esc, then c | cancel the highlighted run in the Runs pane, after a confirmation |
 | ? (outside the prompt) | show the keys |
 | Ctrl-C, or q outside the prompt | quit; runs keep going in the daemon |
 
-The TUI captures the mouse for scrolling, so hold Shift (Option in some macOS
-terminals) while dragging to select text.
+Drag to select text and copy with your terminal’s usual shortcut (for example,
+Cmd-C on macOS or Ctrl-Shift-C on Linux). Paste into the prompt with your
+terminal’s paste shortcut. Multiline pastes stay in the prompt until you press
+Enter to send. The TUI leaves mouse selection to the terminal; use ↑/↓ or
+PgUp/PgDn to scroll the conversation.
 
 Queue additional turns while detached with
 `runner run --session SESSION "next prompt" --detach`. A watcher shows

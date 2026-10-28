@@ -12,8 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
 use crossterm::execute;
 use futures_util::StreamExt;
@@ -27,8 +26,6 @@ use app::{Action, App, Msg};
 const POLL: Duration = Duration::from_secs(1);
 /// How often the screen redraws without other news, for elapsed times.
 const TICK: Duration = Duration::from_millis(100);
-/// Conversation lines one mouse wheel notch scrolls.
-const WHEEL_LINES: i16 = 3;
 
 /// Runs the TUI until the user quits, and returns the session it was
 /// showing, if it had one. Without `session`, it starts on a new session,
@@ -42,7 +39,8 @@ pub async fn run(
 ) -> Result<Option<String>> {
     // Also installs a panic hook that puts the terminal back.
     let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+    // Leave the mouse to the terminal so dragging selects text for copying.
+    execute!(io::stdout(), EnableBracketedPaste)?;
     let result = event_loop(
         &mut terminal,
         Arc::new(client),
@@ -52,7 +50,7 @@ pub async fn run(
         deadline_secs,
     )
     .await;
-    execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste).ok();
+    execute!(io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
     result
 }
@@ -190,18 +188,13 @@ async fn submit(
         .await
 }
 
-/// Keys, pastes, the mouse wheel and resizes, as messages.
+/// Keys, pastes and resizes, as messages.
 async fn read_terminal(send: mpsc::UnboundedSender<Msg>) {
     let mut events = EventStream::new();
     while let Some(Ok(event)) = events.next().await {
         let msg = match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => Msg::Key(key),
             Event::Paste(text) => Msg::Paste(text),
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => Msg::Scroll(WHEEL_LINES),
-                MouseEventKind::ScrollDown => Msg::Scroll(-WHEEL_LINES),
-                _ => continue,
-            },
             Event::Resize(..) => Msg::Tick,
             _ => continue,
         };

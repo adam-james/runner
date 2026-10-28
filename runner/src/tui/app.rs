@@ -14,8 +14,6 @@ const PAGE: u16 = 10;
 pub enum Msg {
     Key(KeyEvent),
     Paste(String),
-    /// Conversation lines to scroll up (or down, if negative), from the mouse wheel.
-    Scroll(i16),
     /// Redraws the elapsed-time indicators.
     Tick,
     Sessions(Vec<Session>),
@@ -258,7 +256,6 @@ impl App {
                     self.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 }
             }
-            Msg::Scroll(lines) => self.scroll = self.scroll.saturating_add_signed(lines),
             Msg::Tick => {}
             Msg::Sessions(sessions) => self.sessions(sessions),
             Msg::Runs(session, runs) => return self.runs(session, runs),
@@ -904,13 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn multiline_paste_focuses_the_prompt_without_submitting() {
+        let mut app = app(Some("s"));
+        app.focus = Focus::Conversation;
+        let actions = app.update(Msg::Paste("first\r\nsecond\rthird\n".into()));
+        assert!(actions.is_empty());
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input, "first\nsecond\nthird\n");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
     fn the_prompt_box_scrolls_the_conversation() {
         let mut app = app(Some("s"));
         app.update(press(KeyCode::Up));
         app.update(press(KeyCode::PageUp));
-        app.update(Msg::Scroll(3));
-        assert_eq!(app.scroll, 1 + PAGE + 3);
-        app.update(Msg::Scroll(-100));
+        assert_eq!(app.scroll, 1 + PAGE);
+        app.update(press(KeyCode::PageDown));
+        assert_eq!(app.scroll, 1);
+        app.update(press(KeyCode::Down));
+        app.update(press(KeyCode::Down));
         assert_eq!(app.scroll, 0);
         assert!(app.input.is_empty());
     }
