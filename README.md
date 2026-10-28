@@ -208,16 +208,17 @@ leaves the conversation as it was. Local background work requires the machine to
 be awake and the daemon running.
 
 See [service architecture and roadmap](docs/service.md) for the API and the
-next milestones: recurring schedules, run summaries, alerts and
-notifications, asynchronous approvals, and desktop clients.
+next milestones: run summaries, alerts and notifications, asynchronous
+approvals, and desktop clients.
 
 ### Schedules
 
-A schedule runs a prompt once, at a local time, in a fresh session, with
-nobody watching:
+A schedule runs a prompt once at a local time, or on a cron schedule, each
+time in a fresh session, with nobody watching:
 
 ```bash
 runner schedules add --agent researcher --at 2026-10-29T07:00 --tz Europe/Warsaw "Morning brief"
+runner schedules add --agent researcher --cron "0 7 * * MON-FRI" --tz Europe/Warsaw "Morning brief"
 runner schedules add --in 2s "Say hello"   # or 5m, 1h30m: handy for testing
 runner schedules list
 runner schedules show ID      # the schedule and its history: what was done to it and what it ran
@@ -226,10 +227,20 @@ runner schedules resume ID
 runner schedules rm ID
 ```
 
-`--tz` is an IANA time zone and defaults to this system's. A time that a
-clock change skips or repeats is refused rather than guessed at. If the
-daemon was stopped when a schedule fell due, it runs once when the daemon
+`--tz` is an IANA time zone and defaults to this system's. A one-off time
+that a clock change skips or repeats is refused rather than guessed at. If the
+daemon was stopped when a one-off fell due, it runs once when the daemon
 starts again.
+
+`--cron` takes the five fields of Vixie cron (minute, hour, day of month,
+month, day of week) and follows its rules for clock changes: a fixed-time job
+whose time is skipped runs right after the gap, and runs once when a time
+repeats; an interval job such as `*/15 * * * *` skips the gap and runs in both
+passes of a repeat. A recurring schedule never makes up for lost time: an
+occurrence more than a minute late, e.g. because the daemon was stopped or the
+machine slept, is skipped, and so is one whose previous run hasn't finished.
+Skips are recorded in `schedules show`. Time zone rules are built into
+runner, so a change to a zone's rules needs a new build.
 
 A schedule is pinned to the [agent versions](#audit-log) it was approved for:
 its agent's, and those of every agent it can reach by delegating, since a

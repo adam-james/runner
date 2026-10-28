@@ -127,7 +127,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |
-| `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
+| `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) or `"cron": "0 7 * * MON-FRI"` (recurring) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
 | `GET /v1/schedules` | List schedules that haven't been deleted |
 | `GET /v1/schedules/{id}` | Inspect a schedule, deleted ones included |
 | `GET /v1/schedules/{id}/history` | What was done to it and what it did, oldest first |
@@ -186,8 +186,8 @@ separate grant system. Each milestone ships something usable on its own;
    a run can be checked against what it was allowed after `runner.toml` has
    changed. Sessions stay locked to the agent name; each run records its
    version.
-2. **Schedules pinned to an agent version:** one-off schedules are done (see
-   [Schedules](#schedules)); recurring cron schedules come next. Durable
+2. **Schedules pinned to an agent version:** done; see
+   [Schedules](#schedules). Durable
    one-off and cron schedules with explicit time zones and API/CLI
    management. Each occurrence
    creates an ordinary run in a fresh session. Unique occurrence IDs prevent
@@ -233,13 +233,22 @@ checkpoints, and distributed workers are outside these milestones.
 
 ## Schedules
 
-A **schedule** runs a prompt once, at a local time in an explicit IANA time
-zone, as an ordinary run in a fresh session locked to its agent, or a delay
-from now (`in_secs`, e.g. for testing), whose local time is then stored to the
-second. The time is
-stored as given, with the zone, and as the instant it names; a local time that
-a clock change skips or repeats is refused. Schedule ids follow session ids'
-rules. Statuses are `active`, `paused`, `done` (fired) and `deleted`.
+A **schedule** runs a prompt as an ordinary run in a fresh session locked to
+its agent: once, at a local time in an explicit IANA time zone or a delay from
+now (`in_secs`, e.g. for testing), whose local time is then stored to the
+second; or on a five-field cron expression read in the zone. A one-off's time
+is stored as given, with the zone, and as the instant it names; a local time
+that a clock change skips or repeats is refused. A recurring schedule's `at`
+and `next_fire_at` are its next occurrence. Schedule ids follow session ids'
+rules. Statuses are `active`, `paused`, `done` (a one-off that fired, or a
+recurring schedule with no occurrences left) and `deleted`.
+
+Cron expressions are parsed and stepped by `croner`, whose clock change rules
+are Vixie cron's: in a spring-forward gap a fixed-time job (one whose minute
+and hour are single values) runs right after the gap and an interval job skips
+the gap; in a fall-back overlap a fixed-time job runs once and an interval job
+runs in both passes. Zone rules come from `chrono-tz`, built into the binary,
+so a change to them needs a rebuild.
 
 A schedule is pinned to agent versions: its agent's and those of every agent
 it can reach by delegating, transitively, since a version names delegates
@@ -254,8 +263,9 @@ pin is checked:
 - **when it falls due**, which pauses it instead of enqueuing a run;
 - **when its run starts**, since a run queued before a restart would
   otherwise start under the new config. The run fails with the agents that
-  changed, its schedule pauses, and the occurrence is given back: a refused
-  run never executed, so approving the schedule makes it fire again.
+  changed and its schedule pauses. A one-off's occurrence is given back: a
+  refused run never executed, so approving the schedule makes it fire again.
+  A recurring schedule keeps its next occurrence instead.
 
 Delegated child runs aren't checked separately: their root was checked when
 it started, and no version can change while it runs.
@@ -267,13 +277,19 @@ queued, not if it's running.
 
 The scheduler looks for due schedules every second. Each fires in one
 transaction that creates the session and run, records `fired` in the
-schedule's history and marks it `done`. Occurrence ids
+schedule's history, and marks a one-off `done` or moves a recurring schedule
+to its next occurrence after now. Occurrence ids
 (`<schedule id>@<scheduled Unix ms>`) are unique, so an occurrence is never
 enqueued twice. A one-off that fell due while the daemon was stopped fires
-once when it starts. There is no wake from sleep. A schedule's history
-records `created`, `paused`, `resumed`, `approved`, `fired`, `refused` and
-`deleted`, with the reason, runs and versions involved; it's metadata only,
-like audit records.
+once when it starts. A recurring schedule doesn't make up for lost time: an
+occurrence more than a minute late is skipped as `missed`, and one whose
+previous run is still queued or running is skipped as
+`previous run unfinished`, so its runs never overlap. A paused schedule that's
+resumed or approved after its next occurrence passed skips it the same way.
+There is no wake from sleep. A schedule's history records `created`,
+`paused`, `resumed`, `approved`, `fired`, `skipped`, `refused` and `deleted`,
+with the reason, runs and versions involved; it's metadata only, like audit
+records.
 
 ## Host activity logs
 

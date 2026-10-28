@@ -99,21 +99,28 @@ pub struct AgentVersion {
     pub definition: Value,
 }
 
-/// A task to run once at a set time, as its agent was when it was approved.
+/// A task to run once at a set time, or on a cron schedule, as its agent
+/// was when it was approved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub id: String,
     pub agent: String,
     pub prompt: String,
-    /// The local time it fires at, in `tz`, e.g. `2026-10-29T07:00:00`.
+    /// The local time it next fires at, in `tz`, e.g. `2026-10-29T07:00:00`;
+    /// for a recurring schedule, its next occurrence.
     pub at: String,
     /// An IANA time zone name, e.g. `Europe/Warsaw`.
     pub tz: String,
-    /// When it next fires (Unix milliseconds); `None` once it has fired or
+    /// For a recurring schedule, its cron expression, e.g. `0 7 * * *`, read
+    /// in `tz`; `None` for a one-off.
+    #[serde(default)]
+    pub cron: Option<String>,
+    /// When it next fires (Unix milliseconds); `None` once it's done or
     /// been deleted.
     pub next_fire_at: Option<i64>,
     pub deadline_secs: u64,
-    /// `active`, `paused`, `done` (fired) or `deleted`.
+    /// `active`, `paused`, `done` (a one-off that fired, or a recurring
+    /// schedule with no occurrences left) or `deleted`.
     pub status: String,
     /// What its runs may use; see `host::version::pin`.
     pub pinned_versions: Pin,
@@ -197,11 +204,12 @@ fn read_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         pinned_versions: from_json(8, &row.get::<_, String>(8)?)?,
         paused_reason: row.get(9)?,
         created_at: row.get(10)?,
+        cron: row.get(11)?,
         changed_agents: Vec::new(),
     })
 }
 
-const SCHEDULE_COLUMNS: &str = "id, agent, prompt, at, tz, next_fire_at, deadline_secs, status, pinned_versions, paused_reason, created_at";
+const SCHEDULE_COLUMNS: &str = "id, agent, prompt, at, tz, next_fire_at, deadline_secs, status, pinned_versions, paused_reason, created_at, cron";
 
 /// Appends to a schedule's history: what was done to it and what it did.
 fn schedule_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
@@ -350,7 +358,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 7 {
+        if version > 8 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -497,6 +505,16 @@ impl Database {
                 "CREATE UNIQUE INDEX IF NOT EXISTS runs_by_occurrence ON runs(occurrence_id);
                  PRAGMA user_version=7;",
             )?;
+            tx.commit()?;
+        }
+        if version < 8 {
+            let tx = conn.unchecked_transaction()?;
+            // Recurring schedules: a cron expression, read in the
+            // schedule's zone; one-offs have none.
+            if !has_column(&tx, "schedules", "cron")? {
+                tx.execute_batch("ALTER TABLE schedules ADD COLUMN cron TEXT;")?;
+            }
+            tx.execute_batch("PRAGMA user_version=8;")?;
             tx.commit()?;
         }
         Ok(Self(
@@ -1134,9 +1152,10 @@ impl Database {
         upsert_transcript(&self.0.lock().unwrap(), session_id, messages)
     }
 
-    /// Creates an active schedule that fires at `next_fire_at`, pinned to
-    /// `pin`, and stores the definitions in `versions` so what it was
-    /// approved for can be read back after the config changes.
+    /// Creates an active schedule that fires at `next_fire_at`, and then on
+    /// `cron` if it's recurring, pinned to `pin`, and stores the definitions
+    /// in `versions` so what it was approved for can be read back after the
+    /// config changes.
     #[allow(clippy::too_many_arguments)]
     pub fn create_schedule(
         &self,
@@ -1145,6 +1164,7 @@ impl Database {
         prompt: String,
         at: String,
         tz: String,
+        cron: Option<String>,
         next_fire_at: i64,
         deadline_secs: u64,
         pin: Pin,
@@ -1164,6 +1184,7 @@ impl Database {
             prompt,
             at,
             tz,
+            cron,
             next_fire_at: Some(next_fire_at),
             deadline_secs,
             status: "active".into(),
@@ -1183,7 +1204,7 @@ impl Database {
         }
         store_versions(&tx, versions)?;
         tx.execute(
-            &format!("INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"),
+            &format!("INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
             params![
                 schedule.id,
                 schedule.agent,
@@ -1196,12 +1217,13 @@ impl Database {
                 serde_json::to_string(&schedule.pinned_versions)?,
                 schedule.paused_reason,
                 schedule.created_at,
+                schedule.cron,
             ],
         )?;
         schedule_event(
             &tx,
             &schedule.id,
-            json!({"kind":"created", "next_fire_at":next_fire_at, "versions":schedule.pinned_versions}),
+            json!({"kind":"created", "cron":schedule.cron, "next_fire_at":next_fire_at, "versions":schedule.pinned_versions}),
         )?;
         tx.commit()?;
         Ok(schedule)
@@ -1393,7 +1415,11 @@ impl Database {
     /// Enqueues every active schedule due at `now` as a run in a fresh
     /// session, if `current` still gives its pin; otherwise pauses it.
     /// Each schedule fires in its own transaction, and an occurrence that
-    /// was already enqueued is never enqueued again. Returns the new runs.
+    /// was already enqueued is never enqueued again. A recurring schedule
+    /// then moves to its next occurrence after `now`; it skips, rather than
+    /// runs, an occurrence more than `LATE_LIMIT_MS` late, so missed ones
+    /// aren't made up, and one whose previous run hasn't finished. Returns
+    /// the new runs.
     pub fn fire_due(&self, now: i64, current: &dyn Fn(&str) -> Option<Pin>) -> Result<Vec<Run>> {
         let due = {
             let conn = self.0.lock().unwrap();
@@ -1414,7 +1440,7 @@ impl Database {
                 self.pause_schedule(&schedule.id, &version_change_reason(&changed))?;
                 continue;
             }
-            if let Some(run) = self.fire(&schedule)? {
+            if let Some(run) = self.fire(&schedule, now)? {
                 runs.push(run);
             }
         }
@@ -1423,8 +1449,9 @@ impl Database {
 
     /// Fails scheduled run `id`, which was refused before it started
     /// because its agent changed, and pauses its schedule with `reason`.
-    /// The occurrence is given back, so approving the schedule again makes
-    /// it fire again: a refused run never executed anything.
+    /// A one-off's occurrence is given back, so approving the schedule
+    /// again makes it fire again: a refused run never executed anything. A
+    /// recurring schedule keeps its next occurrence instead.
     pub fn refuse_scheduled_run(&self, id: &str, reason: &str) -> Result<()> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1469,9 +1496,17 @@ impl Database {
         Ok(())
     }
 
-    fn fire(&self, schedule: &Schedule) -> Result<Option<Run>> {
+    fn fire(&self, schedule: &Schedule, due_at: i64) -> Result<Option<Run>> {
         let scheduled_for = schedule.next_fire_at.context("due schedule has a time")?;
         let occurrence = format!("{}@{scheduled_for}", schedule.id);
+        // A cron expression was checked when its schedule was created; one
+        // that no longer steps ends the schedule rather than failing every
+        // tick.
+        let next = schedule.cron.as_ref().and_then(|cron| {
+            crate::schedule::next_occurrence(cron, &schedule.tz, due_at.max(scheduled_for))
+                .ok()
+                .flatten()
+        });
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         // Re-read under the transaction: it may have been paused or deleted
@@ -1489,7 +1524,28 @@ impl Database {
             [&occurrence],
             |r| r.get(0),
         )?;
+        let skipped = if enqueued || schedule.cron.is_none() {
+            None
+        } else if due_at - scheduled_for > crate::schedule::LATE_LIMIT_MS {
+            Some(json!({"reason":"missed"}))
+        } else {
+            tx.query_row(
+                "SELECT id FROM runs WHERE schedule_id=?1 AND status IN ('queued','running')
+                 LIMIT 1",
+                [&schedule.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|previous| json!({"reason":"previous run unfinished", "run_id":previous}))
+        };
+        let next_fire_at = next.as_ref().map(|(_, ms)| *ms);
         let run = if enqueued {
+            None
+        } else if let Some(mut skipped) = skipped {
+            skipped["kind"] = json!("skipped");
+            skipped["scheduled_for"] = json!(scheduled_for);
+            skipped["next_fire_at"] = json!(next_fire_at);
+            schedule_event(&tx, &schedule.id, skipped)?;
             None
         } else {
             let timestamp = now();
@@ -1535,14 +1591,22 @@ impl Database {
             schedule_event(
                 &tx,
                 &schedule.id,
-                json!({"kind":"fired", "run_id":run.id, "scheduled_for":scheduled_for}),
+                json!({"kind":"fired", "run_id":run.id, "scheduled_for":scheduled_for,
+                    "next_fire_at":next_fire_at}),
             )?;
             Some(run)
         };
-        tx.execute(
-            "UPDATE schedules SET status='done', next_fire_at=NULL WHERE id=?1",
-            [&schedule.id],
-        )?;
+        match next {
+            // Recurring: stays active, due at its next occurrence.
+            Some((at, ms)) => tx.execute(
+                "UPDATE schedules SET at=?2, next_fire_at=?3 WHERE id=?1",
+                params![schedule.id, at, ms],
+            )?,
+            None => tx.execute(
+                "UPDATE schedules SET status='done', next_fire_at=NULL WHERE id=?1",
+                [&schedule.id],
+            )?,
+        };
         tx.commit()?;
         if let Some(run) = &run {
             self.notify(&run.id);
