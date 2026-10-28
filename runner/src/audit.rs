@@ -179,9 +179,8 @@ fn notable(data: &Value) -> bool {
             ))
 }
 
-/// A record as one line of JSON, with its run, minus fields every record
-/// shares. JSON quotes and escapes every string, guest-influenced or not.
-fn review_line(record: &Event) -> String {
+/// A record with its run, minus fields every record shares and empty ones.
+pub(crate) fn compact(record: &Event) -> Value {
     let mut line = serde_json::Map::new();
     line.insert("run".into(), record.run_id.clone().into());
     if let Value::Object(fields) = &record.data {
@@ -191,7 +190,13 @@ fn review_line(record: &Event) -> String {
             }
         }
     }
-    Value::Object(line).to_string()
+    Value::Object(line)
+}
+
+/// A record as one line of JSON, as `compact` gives it. JSON quotes and
+/// escapes every string, guest-influenced or not.
+pub(crate) fn review_line(record: &Event) -> String {
+    compact(record).to_string()
 }
 
 /// Which hosts each component asked for, and how many requests the host

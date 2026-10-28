@@ -342,6 +342,7 @@ impl Service {
             .route("/v1/runs/{id}/cancel", post(cancel))
             .route("/v1/runs/{id}/events", get(events))
             .route("/v1/runs/{id}/audit", get(audit))
+            .route("/v1/runs/{id}/summary", get(summary))
             .route("/v1/schedules", get(list_schedules).post(create_schedule))
             .route(
                 "/v1/schedules/{id}",
@@ -550,6 +551,25 @@ async fn audit(
             .await
             .map_err(internal)?,
     ))
+}
+
+/// What a run and the runs it delegated to did, from their audit records;
+/// see `crate::summary`.
+async fn summary(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<crate::summary::Summary>, ApiError> {
+    let lookup = id.clone();
+    let (runs, records) =
+        s.db.blocking(move |db| db.tree_audit(&lookup))
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))?;
+    let run = runs
+        .iter()
+        .find(|run| run.id == id)
+        .expect("tree has its root");
+    Ok(Json(crate::summary::summarize(run, &runs, &records)))
 }
 
 /// The audit records of every run in a session, under the same token as

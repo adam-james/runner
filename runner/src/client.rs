@@ -150,6 +150,12 @@ impl Client {
             .await
     }
 
+    /// What a run and the runs it delegated to did, from their audit records.
+    pub async fn summary(&self, id: &str) -> Result<crate::summary::Summary> {
+        self.json(Method::GET, &format!("/v1/runs/{id}/summary"), None)
+            .await
+    }
+
     pub async fn session_audit(&self, id: &str) -> Result<Vec<Event>> {
         self.json(Method::GET, &format!("/v1/sessions/{id}/audit"), None)
             .await

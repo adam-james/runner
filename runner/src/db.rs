@@ -829,6 +829,47 @@ impl Database {
         .collect()
     }
 
+    /// Run `id` and every run it delegated to, transitively, oldest first,
+    /// with their audit records a run at a time, as `session_audit` orders
+    /// them. `None` if there's no such run.
+    pub fn tree_audit(&self, id: &str) -> Result<Option<(Vec<Run>, Vec<Event>)>> {
+        const TREE: &str = "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL
+            SELECT runs.id FROM runs JOIN tree ON runs.parent_run_id=tree.id)";
+        let conn = self.0.lock().unwrap();
+        let runs = {
+            let mut stmt = conn.prepare(&format!(
+                "{TREE} SELECT {RUN_COLUMNS} FROM runs WHERE id IN tree ORDER BY created_at, rowid"
+            ))?;
+            stmt.query_map(params![id], read_run)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !runs.iter().any(|run| run.id == id) {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!(
+            "{TREE} SELECT a.id, a.run_id, a.data FROM audit_events a WHERE a.run_id IN tree
+             ORDER BY (SELECT MIN(id) FROM audit_events WHERE run_id=a.run_id), a.id"
+        ))?;
+        let records = stmt
+            .query_map(params![id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (seq, run_id, data) = row?;
+                Ok(Event {
+                    id: seq,
+                    run_id,
+                    data: serde_json::from_str(&data)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some((runs, records)))
+    }
+
     /// Whether any run in `session_id` belongs to the delegation tree rooted
     /// at `root_run_id`.
     pub fn session_in_tree(&self, session_id: &str, root_run_id: &str) -> Result<bool> {
