@@ -1476,6 +1476,16 @@ impl Runtime {
         self.versions.get(agent).cloned()
     }
 
+    /// Every agent definition's version, by agent name.
+    pub fn agent_versions(&self) -> BTreeMap<String, version::AgentVersion> {
+        self.versions.as_ref().clone()
+    }
+
+    /// What runs of `agent` would use now; see `version::pin`.
+    pub fn pin(&self, agent: &str) -> Option<version::Pin> {
+        version::pin(&self.agents(), agent)
+    }
+
     fn digest(&self, path: &str) -> Option<String> {
         self.digests.get(path).cloned()
     }
@@ -1765,6 +1775,11 @@ impl std::error::Error for TurnFailed {}
 
 pub fn check_session_id(id: &str) -> Result<()> {
     validate_session_id(id)
+}
+
+/// Schedule ids follow session ids' rules.
+pub fn check_schedule_id(id: &str) -> Result<()> {
+    validate_name("schedule id", id)
 }
 
 #[cfg(test)]

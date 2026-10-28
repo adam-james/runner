@@ -2142,3 +2142,72 @@ async fn components_without_a_memory_cap_get_the_default_one() {
         false
     );
 }
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn a_schedule_pin_covers_delegates_and_a_scheduled_run_executes_when_it_holds() {
+    let fixture = delegation_fixture();
+    let runtime = fixture.runtime().await.host;
+    let pin = runtime.pin("coordinator").unwrap();
+    assert_eq!(
+        pin.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["coordinator", "lead", "leaf"]
+    );
+    for (agent, version) in &pin {
+        assert_eq!(&runtime.agent_version(agent).unwrap().id, version);
+    }
+    // Editing only a delegate leaves the coordinator's own version alone,
+    // since a snapshot names delegates, but not its pin.
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replace(
+            "Leaf specialist instructions.",
+            "Leaf, now with more reach.",
+        ),
+    )
+    .unwrap();
+    let edited = fixture.runtime().await.host;
+    assert_eq!(
+        edited.agent_version("coordinator").unwrap().id,
+        pin["coordinator"]
+    );
+    assert_eq!(
+        host::version::changed(&pin, edited.pin("coordinator").as_ref()),
+        ["leaf"]
+    );
+
+    // A scheduled run whose pin holds executes like any other.
+    let db = Database::open(&fixture.dir.path().join("schedules.sqlite3")).unwrap();
+    db.create_schedule(
+        Some("brief".into()),
+        "coordinator".into(),
+        "delegate:leaf:hello".into(),
+        "2999-01-01T00:00:00".into(),
+        "UTC".into(),
+        1,
+        10,
+        edited.pin("coordinator").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let pins = edited.clone();
+    let run = db
+        .fire_due(i64::MAX, &|agent| pins.pin(agent))
+        .unwrap()
+        .remove(0);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(edited)),
+        2,
+        stop.clone(),
+    ));
+    let run = wait(&db, &run.id, "completed").await;
+    assert_eq!(
+        db.run_agent_version(&run.id).unwrap(),
+        Some(pin["coordinator"].clone())
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}

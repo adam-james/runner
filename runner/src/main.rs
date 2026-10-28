@@ -84,6 +84,12 @@ enum Command {
         #[command(subcommand)]
         command: Agents,
     },
+    /// Prompts that run later, each pinned to the agent versions it was
+    /// approved for. A schedule whose agent changes pauses until approved.
+    Schedules {
+        #[command(subcommand)]
+        command: Schedules,
+    },
     /// What configured tools can reach: network hosts, injected headers
     /// (names only), files and limits.
     Tools {
@@ -137,6 +143,47 @@ enum Agents {
     /// What runs of an agent version were allowed: the definition it
     /// snapshots, as JSON. Runs' audit trails name their version.
     Version { id: String },
+}
+
+#[derive(Subcommand)]
+enum Schedules {
+    /// Run a prompt once, at a local time, in a fresh session.
+    Add {
+        prompt: String,
+        /// When, e.g. 2026-10-29T07:00.
+        #[arg(long)]
+        at: String,
+        /// An IANA time zone, e.g. Europe/Warsaw; this system's if omitted.
+        #[arg(long)]
+        tz: Option<String>,
+        #[arg(long, default_value = host::DEFAULT_AGENT)]
+        agent: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value_t = service::default_deadline())]
+        deadline_secs: u64,
+    },
+    List,
+    /// A schedule and its history: what was done to it and what it ran.
+    Show {
+        id: String,
+    },
+    Pause {
+        id: String,
+    },
+    /// Resume a paused schedule whose agents haven't changed.
+    Resume {
+        id: String,
+    },
+    /// Pin a schedule to its agents' current versions and make it active,
+    /// e.g. after a config change paused it. Inspect what changed first
+    /// with `schedules show` and `agents version`.
+    Approve {
+        id: String,
+    },
+    Rm {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +362,7 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&client.agent_version(&id).await?)?
             ),
         },
+        Command::Schedules { command } => schedules(&client, command).await?,
         Command::Tools {
             command: Tools::Components(command),
         } => components(&client, host::inspect::ComponentKind::Tool, command).await?,
@@ -333,6 +381,64 @@ async fn main() -> Result<()> {
             Sessions::Audit { id, json } => print_audit(&client.session_audit(&id).await?, json)?,
         },
     }
+    Ok(())
+}
+
+async fn schedules(client: &Client, command: Schedules) -> Result<()> {
+    match command {
+        Schedules::Add {
+            prompt,
+            at,
+            tz,
+            agent,
+            id,
+            deadline_secs,
+        } => {
+            let tz = match tz {
+                Some(tz) => tz,
+                None => jiff::tz::TimeZone::system()
+                    .iana_name()
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("can't tell this system's time zone; pass --tz")
+                    })?,
+            };
+            print(
+                &client
+                    .create_schedule(id, agent, prompt, at, tz, deadline_secs)
+                    .await?,
+            )?
+        }
+        Schedules::List => print(&client.schedules().await?)?,
+        Schedules::Show { id } => print(&serde_json::json!({
+            "schedule": client.schedule(&id).await?,
+            "history": client.schedule_history(&id).await?,
+        }))?,
+        Schedules::Pause { id } => print(&client.schedule_action(&id, "pause").await?)?,
+        Schedules::Resume { id } => print(&client.schedule_action(&id, "resume").await?)?,
+        Schedules::Approve { id } => {
+            let approval = client.approve_schedule(&id).await?;
+            for change in &approval.changes {
+                let fields = change
+                    .fields
+                    .as_ref()
+                    .map_or("definition not stored".into(), |f| f.join(", "));
+                eprintln!(
+                    "{}: {} -> {} ({fields})",
+                    change.agent,
+                    change.from.as_deref().unwrap_or("none"),
+                    change.to.as_deref().unwrap_or("none"),
+                );
+            }
+            print(&approval)?
+        }
+        Schedules::Rm { id } => print(&client.delete_schedule(&id).await?)?,
+    }
+    Ok(())
+}
+
+fn print(value: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 

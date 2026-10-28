@@ -9,6 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use host::version::Pin;
+
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>, Arc<Signals>);
 
@@ -60,6 +62,13 @@ pub struct Run {
     pub depth: u32,
     #[serde(default)]
     pub deadline_at: Option<i64>,
+    /// The schedule whose occurrence this run is.
+    #[serde(default)]
+    pub schedule_id: Option<String>,
+    /// For a scheduled run, the agent versions its schedule was approved
+    /// for. It runs only if they're still what the daemon would use.
+    #[serde(default)]
+    pub pinned_versions: Option<Pin>,
 }
 
 impl Run {
@@ -85,9 +94,44 @@ pub struct Event {
 pub struct AgentVersion {
     pub id: String,
     pub agent: String,
-    /// When a run first used it.
-    pub first_used_at: i64,
+    /// When a run first used it or a schedule was approved for it.
+    pub first_seen_at: i64,
     pub definition: Value,
+}
+
+/// A task to run once at a set time, as its agent was when it was approved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: String,
+    pub agent: String,
+    pub prompt: String,
+    /// The local time it fires at, in `tz`, e.g. `2026-10-29T07:00:00`.
+    pub at: String,
+    /// An IANA time zone name, e.g. `Europe/Warsaw`.
+    pub tz: String,
+    /// When it next fires (Unix milliseconds); `None` once it has fired or
+    /// been deleted.
+    pub next_fire_at: Option<i64>,
+    pub deadline_secs: u64,
+    /// `active`, `paused`, `done` (fired) or `deleted`.
+    pub status: String,
+    /// What its runs may use; see `host::version::pin`.
+    pub pinned_versions: Pin,
+    pub paused_reason: Option<String>,
+    pub created_at: i64,
+    /// Agents whose version is no longer what it's pinned to. Worked out
+    /// by the service against its current config, not stored.
+    #[serde(default)]
+    pub changed_agents: Vec<String>,
+}
+
+/// Why a scheduled occurrence was refused or its schedule paused, shown to
+/// clients. Names only agents, which come from the config.
+pub fn version_change_reason(changed: &[String]) -> String {
+    format!(
+        "agent versions changed since approval: {}",
+        changed.join(", ")
+    )
 }
 
 pub fn new_id() -> String {
@@ -116,10 +160,94 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         root_run_id: row.get(10)?,
         depth: row.get(11)?,
         deadline_at: row.get(12)?,
+        schedule_id: row.get(13)?,
+        pinned_versions: row
+            .get::<_, Option<String>>(14)?
+            .map(|text| from_json(14, &text))
+            .transpose()?,
     })
 }
 
-const RUN_COLUMNS: &str = "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error, parent_run_id, root_run_id, depth, deadline_at";
+const RUN_COLUMNS: &str = "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error, parent_run_id, root_run_id, depth, deadline_at, schedule_id, pinned_versions";
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        params![table, column],
+        |row| row.get(0),
+    )?)
+}
+
+fn from_json<T: serde::de::DeserializeOwned>(column: usize, text: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn read_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
+    Ok(Schedule {
+        id: row.get(0)?,
+        agent: row.get(1)?,
+        prompt: row.get(2)?,
+        at: row.get(3)?,
+        tz: row.get(4)?,
+        next_fire_at: row.get(5)?,
+        deadline_secs: row.get(6)?,
+        status: row.get(7)?,
+        pinned_versions: from_json(8, &row.get::<_, String>(8)?)?,
+        paused_reason: row.get(9)?,
+        created_at: row.get(10)?,
+        changed_agents: Vec::new(),
+    })
+}
+
+const SCHEDULE_COLUMNS: &str = "id, agent, prompt, at, tz, next_fire_at, deadline_secs, status, pinned_versions, paused_reason, created_at";
+
+/// Appends to a schedule's history: what was done to it and what it did.
+fn schedule_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
+    tx.execute(
+        "INSERT INTO schedule_events (schedule_id, created_at, data) VALUES (?1, ?2, ?3)",
+        params![id, now(), data.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Stores each of `versions` that isn't stored yet.
+fn store_versions(tx: &Connection, versions: &[host::version::AgentVersion]) -> Result<()> {
+    for version in versions {
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_versions (id, agent, first_seen_at, definition)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                version.id,
+                version.definition["agent"].as_str().unwrap_or_default(),
+                now(),
+                version.definition.to_string()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Cancels a schedule's occurrences that haven't started, so pausing or
+/// deleting it stops them too. Returns their ids.
+fn cancel_queued_occurrences(tx: &Connection, schedule: &str) -> Result<Vec<String>> {
+    let ids = {
+        let mut stmt =
+            tx.prepare("SELECT id FROM runs WHERE schedule_id=?1 AND status='queued'")?;
+        stmt.query_map([schedule], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in &ids {
+        tx.execute(
+            "UPDATE runs SET cancel_requested=1, status='cancelled' WHERE id=?1",
+            [id],
+        )?;
+        append_event(tx, id, json!({"kind":"cancellation_requested"}))?;
+        append_event(tx, id, json!({"kind":"status","status":"cancelled"}))?;
+    }
+    Ok(ids)
+}
 
 fn upsert_transcript(tx: &Connection, session_id: &str, messages: &str) -> Result<()> {
     tx.execute(
@@ -222,7 +350,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 6 {
+        if version > 7 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -327,6 +455,48 @@ impl Database {
                 )?;
             }
             tx.execute_batch("PRAGMA user_version=6;")?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = conn.unchecked_transaction()?;
+            // Schedules: tasks that run later, pinned to the agent versions
+            // they were approved for. Versions are now also stored when a
+            // schedule is approved, before any run uses them. Occurrence ids
+            // are unique, so no occurrence is ever enqueued twice. Like the
+            // previous step, this tolerates what it adds already existing.
+            if has_column(&tx, "agent_versions", "first_used_at")? {
+                tx.execute_batch(
+                    "ALTER TABLE agent_versions RENAME COLUMN first_used_at TO first_seen_at;",
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schedules (id TEXT PRIMARY KEY, agent TEXT NOT NULL,
+                     prompt TEXT NOT NULL, at TEXT NOT NULL, tz TEXT NOT NULL,
+                     next_fire_at INTEGER, deadline_secs INTEGER NOT NULL,
+                     status TEXT NOT NULL, pinned_versions TEXT NOT NULL,
+                     paused_reason TEXT, created_at INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS due_schedules ON schedules(status, next_fire_at);
+                 CREATE TABLE IF NOT EXISTS schedule_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     schedule_id TEXT NOT NULL REFERENCES schedules(id),
+                     created_at INTEGER NOT NULL, data TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS schedule_events_by_schedule
+                     ON schedule_events(schedule_id, id);",
+            )?;
+            for (column, definition) in [
+                ("schedule_id", "TEXT REFERENCES schedules(id)"),
+                ("occurrence_id", "TEXT"),
+                ("pinned_versions", "TEXT"),
+            ] {
+                if !has_column(&tx, "runs", column)? {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE runs ADD COLUMN {column} {definition};"
+                    ))?;
+                }
+            }
+            tx.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS runs_by_occurrence ON runs(occurrence_id);
+                 PRAGMA user_version=7;",
+            )?;
             tx.commit()?;
         }
         Ok(Self(
@@ -447,6 +617,8 @@ impl Database {
             root_run_id: id,
             depth: 0,
             deadline_at: None,
+            schedule_id: None,
+            pinned_versions: None,
             session_id,
             agent,
             prompt,
@@ -548,7 +720,7 @@ impl Database {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT OR IGNORE INTO agent_versions (id, agent, first_used_at, definition)
+            "INSERT OR IGNORE INTO agent_versions (id, agent, first_seen_at, definition)
              VALUES (?1, ?2, ?3, ?4)",
             params![version, agent, now(), definition.to_string()],
         )?;
@@ -564,7 +736,7 @@ impl Database {
         let conn = self.0.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT agent, first_used_at, definition FROM agent_versions WHERE id=?1",
+                "SELECT agent, first_seen_at, definition FROM agent_versions WHERE id=?1",
                 params![id],
                 |row| {
                     Ok((
@@ -575,11 +747,11 @@ impl Database {
                 },
             )
             .optional()?;
-        row.map(|(agent, first_used_at, definition)| {
+        row.map(|(agent, first_seen_at, definition)| {
             Ok(AgentVersion {
                 id: id.to_string(),
                 agent,
-                first_used_at,
+                first_seen_at,
                 definition: serde_json::from_str(&definition)?,
             })
         })
@@ -758,6 +930,8 @@ impl Database {
             root_run_id: parent.root_run_id,
             depth: parent.depth + 1,
             deadline_at: Some(deadline_at),
+            schedule_id: None,
+            pinned_versions: None,
         };
         tx.execute(
             "INSERT INTO sessions (id,created_at,agent) VALUES (?1,?2,?3)",
@@ -948,6 +1122,422 @@ impl Database {
 
     pub fn save_transcript(&self, session_id: &str, messages: &str) -> Result<()> {
         upsert_transcript(&self.0.lock().unwrap(), session_id, messages)
+    }
+
+    /// Creates an active schedule that fires at `next_fire_at`, pinned to
+    /// `pin`, and stores the definitions in `versions` so what it was
+    /// approved for can be read back after the config changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule(
+        &self,
+        id: Option<String>,
+        agent: String,
+        prompt: String,
+        at: String,
+        tz: String,
+        next_fire_at: i64,
+        deadline_secs: u64,
+        pin: Pin,
+        versions: &[host::version::AgentVersion],
+    ) -> Result<Schedule> {
+        if prompt.trim().is_empty() || prompt.len() > 256 * 1024 {
+            bail!("prompt must contain 1–262144 bytes");
+        }
+        if !(1..=86400).contains(&deadline_secs) {
+            bail!("deadline_secs must be between 1 and 86400");
+        }
+        let id = id.unwrap_or_else(new_id);
+        host::check_schedule_id(&id)?;
+        let schedule = Schedule {
+            id,
+            agent,
+            prompt,
+            at,
+            tz,
+            next_fire_at: Some(next_fire_at),
+            deadline_secs,
+            status: "active".into(),
+            pinned_versions: pin,
+            paused_reason: None,
+            created_at: now(),
+            changed_agents: Vec::new(),
+        };
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schedules WHERE id=?1)",
+            [&schedule.id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            bail!("schedule '{}' already exists", schedule.id);
+        }
+        store_versions(&tx, versions)?;
+        tx.execute(
+            &format!("INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"),
+            params![
+                schedule.id,
+                schedule.agent,
+                schedule.prompt,
+                schedule.at,
+                schedule.tz,
+                schedule.next_fire_at,
+                schedule.deadline_secs,
+                schedule.status,
+                serde_json::to_string(&schedule.pinned_versions)?,
+                schedule.paused_reason,
+                schedule.created_at,
+            ],
+        )?;
+        schedule_event(
+            &tx,
+            &schedule.id,
+            json!({"kind":"created", "next_fire_at":next_fire_at, "versions":schedule.pinned_versions}),
+        )?;
+        tx.commit()?;
+        Ok(schedule)
+    }
+
+    /// Every schedule that hasn't been deleted, oldest first.
+    pub fn schedules(&self) -> Result<Vec<Schedule>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE status!='deleted'
+             ORDER BY created_at, rowid"
+        ))?;
+        Ok(stmt
+            .query_map([], read_schedule)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn schedule(&self, id: &str) -> Result<Option<Schedule>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id=?1"),
+                [id],
+                read_schedule,
+            )
+            .optional()?)
+    }
+
+    /// What was done to a schedule and what it did, oldest first. Each
+    /// record's `id` orders it among all schedules' records.
+    pub fn schedule_history(&self, id: &str) -> Result<Vec<Event>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, data FROM schedule_events WHERE schedule_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (seq, at, data) = row?;
+            let mut data: Value = serde_json::from_str(&data)?;
+            data["at"] = json!(at);
+            Ok(Event {
+                id: seq,
+                run_id: String::new(),
+                data,
+            })
+        })
+        .collect()
+    }
+
+    /// Changes a schedule's status from one of `from` to `to`, recording
+    /// `kind` in its history, and returns it. Pausing or deleting also
+    /// cancels its occurrences that haven't started.
+    fn transition(
+        &self,
+        id: &str,
+        from: &[&str],
+        to: &str,
+        reason: Option<&str>,
+        kind: &str,
+    ) -> Result<Schedule> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let schedule = tx
+            .query_row(
+                &format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id=?1"),
+                [id],
+                read_schedule,
+            )
+            .optional()?
+            .context("schedule not found")?;
+        if !from.contains(&schedule.status.as_str()) {
+            bail!("schedule '{id}' is {}", schedule.status);
+        }
+        let next_fire_at = if to == "deleted" {
+            None
+        } else {
+            schedule.next_fire_at
+        };
+        tx.execute(
+            "UPDATE schedules SET status=?2, paused_reason=?3, next_fire_at=?4 WHERE id=?1",
+            params![id, to, reason, next_fire_at],
+        )?;
+        let cancelled = if matches!(to, "paused" | "deleted") {
+            cancel_queued_occurrences(&tx, id)?
+        } else {
+            Vec::new()
+        };
+        schedule_event(
+            &tx,
+            id,
+            json!({"kind":kind, "reason":reason, "cancelled_runs":cancelled}),
+        )?;
+        tx.commit()?;
+        self.signal_cancelled(cancelled);
+        drop(conn);
+        Ok(self.schedule(id)?.expect("schedule exists"))
+    }
+
+    /// Pauses an active schedule, e.g. because its agent changed.
+    pub fn pause_schedule(&self, id: &str, reason: &str) -> Result<Schedule> {
+        self.transition(id, &["active"], "paused", Some(reason), "paused")
+    }
+
+    /// Resumes a paused schedule. The caller checks its pin still holds.
+    pub fn resume_schedule(&self, id: &str) -> Result<Schedule> {
+        self.transition(id, &["paused"], "active", None, "resumed")
+    }
+
+    pub fn delete_schedule(&self, id: &str) -> Result<Schedule> {
+        self.transition(
+            id,
+            &["active", "paused", "done"],
+            "deleted",
+            None,
+            "deleted",
+        )
+    }
+
+    /// Re-pins an active or paused schedule to `pin`, storing the
+    /// definitions in `versions`, and makes it active. Returns it and the
+    /// pin it had before.
+    pub fn approve_schedule(
+        &self,
+        id: &str,
+        pin: Pin,
+        versions: &[host::version::AgentVersion],
+    ) -> Result<(Schedule, Pin)> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let schedule = tx
+            .query_row(
+                &format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id=?1"),
+                [id],
+                read_schedule,
+            )
+            .optional()?
+            .context("schedule not found")?;
+        if !matches!(schedule.status.as_str(), "active" | "paused") {
+            bail!("schedule '{id}' is {}", schedule.status);
+        }
+        store_versions(&tx, versions)?;
+        tx.execute(
+            "UPDATE schedules SET status='active', paused_reason=NULL, pinned_versions=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&pin)?],
+        )?;
+        schedule_event(
+            &tx,
+            id,
+            json!({"kind":"approved", "from":schedule.pinned_versions, "to":pin}),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        Ok((
+            self.schedule(id)?.expect("schedule exists"),
+            schedule.pinned_versions,
+        ))
+    }
+
+    /// Pauses every active schedule whose pin no longer matches `current`,
+    /// what the daemon would run each agent with now. Returns them.
+    pub fn pause_changed_schedules(
+        &self,
+        current: &dyn Fn(&str) -> Option<Pin>,
+    ) -> Result<Vec<Schedule>> {
+        let mut paused = Vec::new();
+        for schedule in self.schedules()? {
+            if schedule.status != "active" {
+                continue;
+            }
+            let changed = host::version::changed(
+                &schedule.pinned_versions,
+                current(&schedule.agent).as_ref(),
+            );
+            if !changed.is_empty() {
+                paused.push(self.pause_schedule(&schedule.id, &version_change_reason(&changed))?);
+            }
+        }
+        Ok(paused)
+    }
+
+    /// Enqueues every active schedule due at `now` as a run in a fresh
+    /// session, if `current` still gives its pin; otherwise pauses it.
+    /// Each schedule fires in its own transaction, and an occurrence that
+    /// was already enqueued is never enqueued again. Returns the new runs.
+    pub fn fire_due(&self, now: i64, current: &dyn Fn(&str) -> Option<Pin>) -> Result<Vec<Run>> {
+        let due = {
+            let conn = self.0.lock().unwrap();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SCHEDULE_COLUMNS} FROM schedules
+                 WHERE status='active' AND next_fire_at<=?1 ORDER BY next_fire_at, rowid"
+            ))?;
+            stmt.query_map([now], read_schedule)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut runs = Vec::new();
+        for schedule in due {
+            let changed = host::version::changed(
+                &schedule.pinned_versions,
+                current(&schedule.agent).as_ref(),
+            );
+            if !changed.is_empty() {
+                self.pause_schedule(&schedule.id, &version_change_reason(&changed))?;
+                continue;
+            }
+            if let Some(run) = self.fire(&schedule)? {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Fails scheduled run `id`, which was refused before it started
+    /// because its agent changed, and pauses its schedule with `reason`.
+    /// The occurrence is given back, so approving the schedule again makes
+    /// it fire again: a refused run never executed anything.
+    pub fn refuse_scheduled_run(&self, id: &str, reason: &str) -> Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (schedule, occurrence): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT schedule_id, occurrence_id FROM runs WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if tx.execute(
+            "UPDATE runs SET status='failed', error=?2, occurrence_id=NULL
+             WHERE id=?1 AND status='running'",
+            params![id, reason],
+        )? == 1
+        {
+            append_event(
+                &tx,
+                id,
+                json!({"kind":"status", "status":"failed", "error":reason}),
+            )?;
+            if let Some(schedule) = schedule {
+                // Schedule ids can't contain '@'.
+                let scheduled_for = occurrence.and_then(|o| {
+                    o.rsplit_once('@')
+                        .and_then(|(_, at)| at.parse::<i64>().ok())
+                });
+                tx.execute(
+                    "UPDATE schedules SET status='paused', paused_reason=?2,
+                         next_fire_at=COALESCE(next_fire_at, ?3)
+                     WHERE id=?1 AND status IN ('active','done')",
+                    params![schedule, reason, scheduled_for],
+                )?;
+                schedule_event(
+                    &tx,
+                    &schedule,
+                    json!({"kind":"refused", "run_id":id, "reason":reason}),
+                )?;
+            }
+        }
+        tx.commit()?;
+        self.notify(id);
+        self.1.cancellations.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn fire(&self, schedule: &Schedule) -> Result<Option<Run>> {
+        let scheduled_for = schedule.next_fire_at.context("due schedule has a time")?;
+        let occurrence = format!("{}@{scheduled_for}", schedule.id);
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Re-read under the transaction: it may have been paused or deleted
+        // since it was found due.
+        let status: String = tx.query_row(
+            "SELECT status FROM schedules WHERE id=?1",
+            [&schedule.id],
+            |r| r.get(0),
+        )?;
+        if status != "active" {
+            return Ok(None);
+        }
+        let enqueued: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE occurrence_id=?1)",
+            [&occurrence],
+            |r| r.get(0),
+        )?;
+        let run = if enqueued {
+            None
+        } else {
+            let timestamp = now();
+            let id = new_id();
+            let run = Run {
+                id: id.clone(),
+                session_id: new_id(),
+                agent: schedule.agent.clone(),
+                prompt: schedule.prompt.clone(),
+                status: "queued".into(),
+                created_at: timestamp,
+                deadline_secs: schedule.deadline_secs,
+                cancel_requested: false,
+                error: None,
+                parent_run_id: None,
+                root_run_id: id,
+                depth: 0,
+                deadline_at: None,
+                schedule_id: Some(schedule.id.clone()),
+                pinned_versions: Some(schedule.pinned_versions.clone()),
+            };
+            tx.execute(
+                "INSERT INTO sessions (id, created_at, agent) VALUES (?1, ?2, ?3)",
+                params![run.session_id, timestamp, run.agent],
+            )?;
+            tx.execute(
+                "INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs,
+                     root_run_id, schedule_id, occurrence_id, pinned_versions)
+                 VALUES (?1,?2,?3,?4,'queued',?5,?6,?1,?7,?8,?9)",
+                params![
+                    run.id,
+                    run.session_id,
+                    run.agent,
+                    run.prompt,
+                    timestamp,
+                    run.deadline_secs,
+                    schedule.id,
+                    occurrence,
+                    serde_json::to_string(&schedule.pinned_versions)?,
+                ],
+            )?;
+            append_event(&tx, &run.id, json!({"kind":"status", "status":"queued"}))?;
+            schedule_event(
+                &tx,
+                &schedule.id,
+                json!({"kind":"fired", "run_id":run.id, "scheduled_for":scheduled_for}),
+            )?;
+            Some(run)
+        };
+        tx.execute(
+            "UPDATE schedules SET status='done', next_fire_at=NULL WHERE id=?1",
+            [&schedule.id],
+        )?;
+        tx.commit()?;
+        if let Some(run) = &run {
+            self.notify(&run.id);
+        }
+        Ok(run)
     }
 
     pub fn recover(&self) -> Result<()> {

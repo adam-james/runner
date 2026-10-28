@@ -20,6 +20,9 @@ struct FakeExecutor {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     sessions: Arc<Mutex<HashMap<String, usize>>>,
+    /// The version each agent runs with now, as if the config had changed
+    /// since the service started; unset agents keep the service's.
+    versions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Executor for FakeExecutor {
@@ -74,6 +77,13 @@ impl Executor for FakeExecutor {
             events(json!({"kind":"text", "text":run.prompt}));
             Ok(transcript)
         })
+    }
+
+    /// What the harness's agents pin to: their own version, empty unless
+    /// changed, and no delegates.
+    fn pin(&self, agent: &str) -> Option<host::version::Pin> {
+        let version = self.versions.lock().unwrap().get(agent).cloned();
+        Some([(agent.to_string(), version.unwrap_or_default())].into())
     }
 }
 
@@ -1052,5 +1062,425 @@ async fn session_creation_requires_a_known_agent_before_any_runs() {
     assert!(h.db.runs(Some(&session.id)).unwrap().is_empty());
     let run = h.submit(Some(&session.id), "hello", 5).await;
     assert_eq!(run.agent, "researcher");
+    h.close().await;
+}
+
+impl Harness {
+    async fn api(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", self.url))
+            .bearer_auth("test-token");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        (status, response.json().await.unwrap_or_default())
+    }
+
+    /// Creates a schedule over the API due an hour from now, then makes it
+    /// due already, as if that hour had passed.
+    async fn due_schedule(&self, id: &str, prompt: &str) -> Value {
+        let at = jiff::Zoned::now()
+            .with_time_zone(jiff::tz::TimeZone::UTC)
+            .checked_add(jiff::Span::new().hours(1))
+            .unwrap()
+            .datetime()
+            .to_string();
+        let (status, schedule) = self
+            .api(
+                reqwest::Method::POST,
+                "/v1/schedules",
+                Some(json!({"id":id, "agent":"default", "prompt":prompt, "at":at, "tz":"UTC"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{schedule}");
+        let conn = rusqlite::Connection::open(self._dir.path().join("state.sqlite3")).unwrap();
+        conn.execute("UPDATE schedules SET next_fire_at=1 WHERE id=?1", [id])
+            .unwrap();
+        schedule
+    }
+}
+
+/// What the harness's executor pins `agent` to: see `FakeExecutor::pin`.
+fn pin_of(executor: &FakeExecutor) -> impl Fn(&str) -> Option<host::version::Pin> + '_ {
+    |agent| executor.pin(agent)
+}
+
+#[tokio::test]
+async fn a_one_off_schedule_fires_once_as_a_run_in_a_fresh_session() {
+    let h = Harness::new(1).await;
+    let schedule = h.due_schedule("brief", "morning brief").await;
+    assert_eq!(schedule["status"], "active");
+    assert_eq!(schedule["pinned_versions"], json!({"default":""}));
+    assert_eq!(schedule["changed_agents"], json!([]));
+    let runs = h.db.fire_due(db_now(), &pin_of(&h.executor)).unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.schedule_id.as_deref(), Some("brief"));
+    assert_eq!(run.prompt, "morning brief");
+    // Firing again, e.g. on the next tick or after a restart, enqueues nothing.
+    assert!(
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    let run = h.wait_status(&run.id, "completed").await;
+    let session =
+        h.db.sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == run.session_id)
+            .unwrap();
+    assert_eq!(
+        (
+            session.agent.as_str(),
+            session.running_runs,
+            session.queued_runs
+        ),
+        ("default", 0, 0)
+    );
+    assert_eq!(h.db.runs(Some(&run.session_id)).unwrap().len(), 1);
+    let (_, schedule) = h
+        .api(reqwest::Method::GET, "/v1/schedules/brief", None)
+        .await;
+    assert_eq!(schedule["status"], "done");
+    assert_eq!(schedule["next_fire_at"], Value::Null);
+    let (_, history) = h
+        .api(reqwest::Method::GET, "/v1/schedules/brief/history", None)
+        .await;
+    let kinds: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["kind"].clone())
+        .collect();
+    assert_eq!(kinds, ["created", "fired"]);
+    assert_eq!(history[1]["data"]["run_id"], json!(run.id));
+    h.close().await;
+}
+
+fn db_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn a_changed_agent_pauses_its_schedule_until_it_is_approved_again() {
+    let h = Harness::new(1).await;
+    h.due_schedule("brief", "morning brief").await;
+    // An edit to the agent, e.g. a new tool, gives it a new version.
+    h.executor
+        .versions
+        .lock()
+        .unwrap()
+        .insert("default".into(), "sha256:new".into());
+    assert!(
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    let schedule = h.db.schedule("brief").unwrap().unwrap();
+    assert_eq!(schedule.status, "paused");
+    assert_eq!(
+        schedule.paused_reason.as_deref(),
+        Some("agent versions changed since approval: default")
+    );
+    assert!(h.db.runs(None).unwrap().is_empty());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn resuming_needs_unchanged_agents_and_approving_re_pins() {
+    let h = Harness::new(1).await;
+    h.due_schedule("brief", "morning brief").await;
+    let harness = &h;
+    let post = |action: &str| {
+        let path = format!("/v1/schedules/brief/{action}");
+        async move { harness.api(reqwest::Method::POST, &path, None).await }
+    };
+    let (status, paused) = post("pause").await;
+    assert_eq!(
+        (status, paused["status"].as_str()),
+        (StatusCode::OK, Some("paused"))
+    );
+    assert_eq!(post("pause").await.0, StatusCode::CONFLICT);
+    // Paused schedules don't fire, even when due.
+    assert!(
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(post("resume").await.1["status"], "active");
+    assert_eq!(post("pause").await.0, StatusCode::OK);
+
+    // The service's own agents changing is what resume and approve check;
+    // stand in for a config edit by repinning the stored schedule.
+    let conn = rusqlite::Connection::open(h._dir.path().join("state.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE schedules SET pinned_versions='{\"default\":\"sha256:old\"}' WHERE id='brief'",
+        [],
+    )
+    .unwrap();
+    let (status, error) = post("resume").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        error["error"].as_str().unwrap().contains("approve"),
+        "{error}"
+    );
+    let (_, listed) = h.api(reqwest::Method::GET, "/v1/schedules", None).await;
+    assert_eq!(listed[0]["changed_agents"], json!(["default"]));
+
+    let (status, approval) = post("approve").await;
+    assert_eq!(status, StatusCode::OK, "{approval}");
+    assert_eq!(approval["schedule"]["status"], "active");
+    assert_eq!(
+        approval["schedule"]["pinned_versions"],
+        json!({"default":""})
+    );
+    assert_eq!(approval["schedule"]["changed_agents"], json!([]));
+    assert_eq!(
+        approval["changes"],
+        json!([{"agent":"default", "from":"sha256:old", "to":"", "fields":null}])
+    );
+    let (_, history) = h
+        .api(reqwest::Method::GET, "/v1/schedules/brief/history", None)
+        .await;
+    let kinds: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["kind"].clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["created", "paused", "resumed", "paused", "approved"]
+    );
+    assert_eq!(
+        h.db.fire_due(db_now(), &pin_of(&h.executor)).unwrap().len(),
+        1
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn a_run_queued_under_an_old_version_is_refused_and_fires_again_once_approved() {
+    let h = Harness::new(1).await;
+    h.due_schedule("brief", "morning brief").await;
+    // Hold the worker's only slot so the occurrence stays queued.
+    let blocker = h.submit(None, "wait", 60).await;
+    h.wait_status(&blocker.id, "running").await;
+    let run =
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .remove(0);
+    // A restart under an edited config, between enqueueing and starting.
+    h.executor
+        .versions
+        .lock()
+        .unwrap()
+        .insert("default".into(), "sha256:new".into());
+    h.db.cancel(&blocker.id).unwrap();
+    let refused = h.wait_status(&run.id, "failed").await;
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("agent versions changed since approval: default")
+    );
+    assert_eq!(
+        *h.executor
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&run.session_id)
+            .unwrap_or(&0),
+        0
+    );
+    let schedule = h.db.schedule("brief").unwrap().unwrap();
+    assert_eq!(schedule.status, "paused");
+    assert_eq!(schedule.next_fire_at, Some(1));
+    // Approved for what it runs now, it fires its one occurrence again.
+    h.executor.versions.lock().unwrap().clear();
+    let conn = rusqlite::Connection::open(h._dir.path().join("state.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE schedules SET pinned_versions='{\"default\":\"sha256:new\"}' WHERE id='brief'",
+        [],
+    )
+    .unwrap();
+    let (status, _) = h
+        .api(reqwest::Method::POST, "/v1/schedules/brief/approve", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let again =
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .remove(0);
+    h.wait_status(&again.id, "completed").await;
+    let (_, history) = h
+        .api(reqwest::Method::GET, "/v1/schedules/brief/history", None)
+        .await;
+    let kinds: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["kind"].clone())
+        .collect();
+    assert_eq!(kinds, ["created", "fired", "refused", "approved", "fired"]);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn pausing_or_deleting_a_schedule_cancels_its_queued_occurrence() {
+    let h = Harness::new(1).await;
+    let blocker = h.submit(None, "wait", 60).await;
+    h.wait_status(&blocker.id, "running").await;
+    h.due_schedule("brief", "morning brief").await;
+    let run =
+        h.db.fire_due(db_now(), &pin_of(&h.executor))
+            .unwrap()
+            .remove(0);
+    // A fired one-off is done, but can still be deleted.
+    let (status, deleted) = h
+        .api(reqwest::Method::DELETE, "/v1/schedules/brief", None)
+        .await;
+    assert_eq!(
+        (status, deleted["status"].as_str()),
+        (StatusCode::OK, Some("deleted"))
+    );
+    assert_eq!(h.db.run(&run.id).unwrap().unwrap().status, "cancelled");
+    let (_, listed) = h.api(reqwest::Method::GET, "/v1/schedules", None).await;
+    assert_eq!(listed, json!([]));
+    assert_eq!(
+        h.api(reqwest::Method::POST, "/v1/schedules/brief/approve", None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        h.api(reqwest::Method::GET, "/v1/schedules/nope", None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    h.db.cancel(&blocker.id).unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn schedules_need_a_known_agent_an_explicit_zone_and_a_future_time() {
+    let h = Harness::new(1).await;
+    let create = |body: Value| h.api(reqwest::Method::POST, "/v1/schedules", Some(body));
+    let ok =
+        json!({"agent":"default", "prompt":"p", "at":"2999-01-01T07:00", "tz":"Europe/Warsaw"});
+    let with = |key: &str, value: Value| {
+        let mut body = ok.clone();
+        body[key] = value;
+        body
+    };
+    for (body, needle) in [
+        (with("agent", json!("nobody")), "unknown agent"),
+        (with("tz", json!("Mars/Olympus")), "unknown time zone"),
+        (with("at", json!("2000-01-01T07:00")), "already passed"),
+        (with("at", json!("soon")), "invalid time"),
+        (with("prompt", json!(" ")), "prompt"),
+        (with("id", json!("../x")), "invalid schedule id"),
+    ] {
+        let (status, error) = create(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(error["error"].as_str().unwrap().contains(needle), "{error}");
+    }
+    let mut no_zone = ok.clone();
+    no_zone.as_object_mut().unwrap().remove("tz");
+    assert_eq!(create(no_zone).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, schedule) = create(with("id", json!("brief"))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(schedule["at"], "2999-01-01T07:00:00");
+    assert_eq!(
+        create(with("id", json!("brief"))).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    h.close().await;
+}
+
+#[test]
+fn a_version_6_database_gains_schedules_and_keeps_its_agent_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let db = Database::open(&path).unwrap();
+    let run = db
+        .submit(None, "default".into(), "before".into(), 60)
+        .unwrap();
+    db.record_agent_version(&run.id, "sha256:01", "default", &json!({"agent":"default"}))
+        .unwrap();
+    drop(db);
+    // What a daemon from before schedules left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP INDEX runs_by_occurrence;
+         ALTER TABLE runs DROP COLUMN occurrence_id;
+         ALTER TABLE runs DROP COLUMN pinned_versions;
+         ALTER TABLE runs DROP COLUMN schedule_id;
+         DROP TABLE schedule_events; DROP TABLE schedules;
+         ALTER TABLE agent_versions RENAME COLUMN first_seen_at TO first_used_at;
+         PRAGMA user_version=6;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.agent_version("sha256:01").unwrap().unwrap().agent,
+        "default"
+    );
+    assert_eq!(db.run(&run.id).unwrap().unwrap().schedule_id, None);
+    assert!(db.schedules().unwrap().is_empty());
+    drop(db);
+    assert!(Database::open(&path).is_ok());
+}
+
+#[tokio::test]
+async fn the_scheduler_pauses_changed_schedules_at_startup_and_fires_due_ones() {
+    let h = Harness::new(1).await;
+    h.due_schedule("brief", "morning brief").await;
+    h.due_schedule("changed", "other").await;
+    let conn = rusqlite::Connection::open(h._dir.path().join("state.sqlite3")).unwrap();
+    // Due an hour from now, so only the startup check can pause it.
+    conn.execute(
+        "UPDATE schedules SET next_fire_at=?1, pinned_versions='{\"default\":\"sha256:old\"}' WHERE id='changed'",
+        [db_now() + 3_600_000],
+    )
+    .unwrap();
+    let stop = CancellationToken::new();
+    let scheduler = tokio::spawn(runner::schedule::scheduler(
+        h.db.clone(),
+        h.executor.clone(),
+        stop.clone(),
+    ));
+    let run = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(run) =
+                h.db.runs(None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.schedule_id.is_some())
+            {
+                break run;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(run.schedule_id.as_deref(), Some("brief"));
+    h.wait_status(&run.id, "completed").await;
+    assert_eq!(h.db.schedule("changed").unwrap().unwrap().status, "paused");
+    stop.cancel();
+    scheduler.await.unwrap();
     h.close().await;
 }

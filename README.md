@@ -208,8 +208,44 @@ leaves the conversation as it was. Local background work requires the machine to
 be awake and the daemon running.
 
 See [service architecture and roadmap](docs/service.md) for the API and the
-next milestones: agent versions, schedules pinned to them, run summaries,
-alerts and notifications, asynchronous approvals, and desktop clients.
+next milestones: recurring schedules, run summaries, alerts and
+notifications, asynchronous approvals, and desktop clients.
+
+### Schedules
+
+A schedule runs a prompt once, at a local time, in a fresh session, with
+nobody watching:
+
+```bash
+runner schedules add --agent researcher --at 2026-10-29T07:00 --tz Europe/Warsaw "Morning brief"
+runner schedules list
+runner schedules show ID      # the schedule and its history: what was done to it and what it ran
+runner schedules pause ID
+runner schedules resume ID
+runner schedules rm ID
+```
+
+`--tz` is an IANA time zone and defaults to this system's. A time that a
+clock change skips or repeats is refused rather than guessed at. If the
+daemon was stopped when a schedule fell due, it runs once when the daemon
+starts again.
+
+A schedule is pinned to the [agent versions](#audit-log) it was approved for:
+its agent's, and those of every agent it can reach by delegating, since a
+version names delegates only. If `runner.toml` or a component changes any of
+them, the schedule pauses instead of running, so an edit made for chat can't
+quietly widen what an unattended run can do. The check happens when the
+daemon starts, when the schedule falls due, and again just before its run
+starts, so a run queued before a restart can't start under the new config.
+`list` and `show` name the changed agents. Look at what changed with
+`runner agents version ID`, then:
+
+```bash
+runner schedules approve ID   # pin it to the current versions and make it active
+```
+
+A run that was refused because its agent changed doesn't use up the
+schedule's time: once approved, it runs. Recurring schedules come next.
 
 ### Audit log
 
@@ -258,7 +294,8 @@ holds the provider and model, each tool's allowed hosts, header names and the
 hosts they go to (never values), directory, limits and component digest, plus
 host tools, delegates, limits and a hash of the system prompt. Its id is the
 snapshot's SHA-256, so any change to the config or a component's bytes makes a
-new version. `agents list` shows each agent's current one.
+new version. `agents list` shows each agent's current one, and
+[schedules](#schedules) are pinned to them.
 
 ```bash
 runner agents version sha256:3f9a…   # what runs of that version were allowed, as JSON

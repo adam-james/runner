@@ -7,8 +7,8 @@ use reqwest::{Client as HttpClient, Method, Response};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::db::{Event, Run, Session};
-use crate::service::ConnectionInfo;
+use crate::db::{Event, Run, Schedule, Session};
+use crate::service::{Approval, ConnectionInfo};
 use crate::ui::Ui;
 
 /// A terminal run failure, distinct from a transport or protocol error.
@@ -152,6 +152,56 @@ impl Client {
 
     pub async fn session_audit(&self, id: &str) -> Result<Vec<Event>> {
         self.json(Method::GET, &format!("/v1/sessions/{id}/audit"), None)
+            .await
+    }
+
+    /// Schedules a prompt to run once at local time `at` in time zone `tz`.
+    pub async fn create_schedule(
+        &self,
+        id: Option<String>,
+        agent: String,
+        prompt: String,
+        at: String,
+        tz: String,
+        deadline: u64,
+    ) -> Result<Schedule> {
+        self.json(
+            Method::POST,
+            "/v1/schedules",
+            Some(json!({"id":id,"agent":agent,"prompt":prompt,"at":at,"tz":tz,"deadline_secs":deadline})),
+        )
+        .await
+    }
+
+    pub async fn schedules(&self) -> Result<Vec<Schedule>> {
+        self.json(Method::GET, "/v1/schedules", None).await
+    }
+
+    pub async fn schedule(&self, id: &str) -> Result<Schedule> {
+        self.json(Method::GET, &format!("/v1/schedules/{id}"), None)
+            .await
+    }
+
+    /// What was done to a schedule and what it did, oldest first.
+    pub async fn schedule_history(&self, id: &str) -> Result<Vec<Event>> {
+        self.json(Method::GET, &format!("/v1/schedules/{id}/history"), None)
+            .await
+    }
+
+    /// `pause` or `resume`.
+    pub async fn schedule_action(&self, id: &str, action: &str) -> Result<Schedule> {
+        self.json(Method::POST, &format!("/v1/schedules/{id}/{action}"), None)
+            .await
+    }
+
+    /// Re-pins a schedule to its agents' current versions.
+    pub async fn approve_schedule(&self, id: &str) -> Result<Approval> {
+        self.json(Method::POST, &format!("/v1/schedules/{id}/approve"), None)
+            .await
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<Schedule> {
+        self.json(Method::DELETE, &format!("/v1/schedules/{id}"), None)
             .await
     }
 

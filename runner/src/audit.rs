@@ -426,7 +426,7 @@ mod tests {
         let version = AgentVersion {
             id: "sha256:01".into(),
             agent: "researcher".into(),
-            first_used_at: 0,
+            first_seen_at: 0,
             definition: json!({"tools":[{"name":"web_search",
                 "allowed_hosts":["api.tavily.com"]}]}),
         };

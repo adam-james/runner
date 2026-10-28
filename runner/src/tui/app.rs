@@ -630,6 +630,8 @@ mod tests {
             root_run_id: id.into(),
             depth: 0,
             deadline_at: None,
+            schedule_id: None,
+            pinned_versions: None,
         }
     }
 
