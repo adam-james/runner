@@ -6,7 +6,11 @@
 //! out the run's error too, since a failed turn's error is the agent's own
 //! message and a prompt injection could steer it. The few guest-influenced
 //! strings it keeps (hosts, tool names) are rendered JSON-quoted.
-use std::collections::BTreeMap;
+//!
+//! Its alerts are what a person should look at: denials, an incomplete
+//! trail (which leaves "no denials" meaningless), and, for a scheduled run,
+//! a host none of the schedule's earlier runs reached.
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +27,9 @@ pub struct Summary {
     pub schedule_id: Option<String>,
     /// The run's status, e.g. `completed` or `failed`.
     pub status: String,
+    /// What needs a person's attention; empty when nothing does.
+    #[serde(default)]
+    pub alerts: Vec<Alert>,
     /// Runs in its tree: it and every run it delegated to, transitively.
     pub runs: usize,
     /// Of those, the ones still queued or running, whose records may be
@@ -45,6 +52,16 @@ pub struct Summary {
     pub errors: Listed,
     /// Why the records might not be the whole story; see `audit::check`.
     pub trail_problems: Vec<String>,
+}
+
+/// Something in a summary that needs a person's attention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    /// `denied`, `trail` or `new_host`.
+    pub kind: String,
+    /// What happened, written by the host. A guest-influenced string in it,
+    /// such as a host, is JSON-quoted.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,13 +105,21 @@ fn error(data: &Value) -> bool {
 }
 
 /// Summarizes `run` from the runs in its tree, `tree` (including `run`),
-/// and their audit records, `records`, a run at a time.
-pub fn summarize(run: &Run, tree: &[Run], records: &[Event]) -> Summary {
+/// and their audit records, `records`, a run at a time. `known_hosts` are
+/// the hosts its schedule's earlier runs reached, if it's a scheduled run
+/// that has any earlier ones.
+pub fn summarize(
+    run: &Run,
+    tree: &[Run],
+    records: &[Event],
+    known_hosts: Option<&BTreeSet<String>>,
+) -> Summary {
     let mut summary = Summary {
         run_id: run.id.clone(),
         agent: run.agent.clone(),
         schedule_id: run.schedule_id.clone(),
         status: run.status.clone(),
+        alerts: Vec::new(),
         runs: tree.len(),
         unfinished_runs: tree.iter().filter(|r| !r.terminal()).count(),
         turns: 0,
@@ -156,11 +181,64 @@ pub fn summarize(run: &Run, tree: &[Run], records: &[Event]) -> Summary {
             denied,
         })
         .collect();
+    summary.alerts = alerts(&summary, known_hosts);
     summary
 }
 
-/// `summary` as text: a headline, then the hosts reached, denials, errors
-/// and trail problems. Guest-influenced strings stay JSON-quoted, so none
+fn alerts(summary: &Summary, known_hosts: Option<&BTreeSet<String>>) -> Vec<Alert> {
+    let quoted = |text: &str| json!(text).to_string();
+    let alert = |kind: &str, message: String| Alert {
+        kind: kind.into(),
+        message,
+    };
+    let mut alerts = Vec::new();
+    if summary.denials.total > 0 {
+        alerts.push(alert(
+            "denied",
+            format!(
+                "the host denied {} action{}",
+                summary.denials.total,
+                if summary.denials.total == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    // A run still going always looks unfinished; its trail is checked once
+    // the whole tree has ended.
+    if summary.unfinished_runs == 0 && !summary.trail_problems.is_empty() {
+        alerts.push(alert(
+            "trail",
+            format!(
+                "the audit trail is incomplete ({} problem{}), so this summary may be too",
+                summary.trail_problems.len(),
+                if summary.trail_problems.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        ));
+    }
+    if let Some(known) = known_hosts {
+        let mut new = BTreeSet::new();
+        for access in &summary.hosts {
+            if access.allowed > 0 && !known.contains(&access.host) && new.insert(&access.host) {
+                alerts.push(alert(
+                    "new_host",
+                    format!(
+                        "{} {} reached {}, which no earlier run of this schedule did",
+                        access.kind,
+                        quoted(&access.component),
+                        quoted(&access.host)
+                    ),
+                ));
+            }
+        }
+    }
+    alerts
+}
+
+/// `summary` as text: a headline and its alerts, then the hosts reached,
+/// denials, errors and trail problems. Guest-influenced strings stay JSON-quoted, so none
 /// can start a line of its own.
 pub fn render(summary: &Summary) -> String {
     let quoted = |text: &str| json!(text).to_string();
@@ -198,6 +276,12 @@ pub fn render(summary: &Summary) -> String {
             .map(|(action, n)| format!("{action} {n}"))
             .collect();
         out.push_str(&format!("actions: {}\n", actions.join(", ")));
+    }
+    if !summary.alerts.is_empty() {
+        out.push_str(&format!("\nalerts ({}):\n", summary.alerts.len()));
+        for alert in &summary.alerts {
+            out.push_str(&format!("  {}: {}\n", alert.kind, alert.message));
+        }
     }
     let mut section = |title: String, lines: Vec<String>| {
         out.push_str(&format!("\n{title}:\n"));
@@ -294,7 +378,12 @@ mod tests {
     #[test]
     fn a_summary_counts_hosts_denials_and_errors_without_the_runs_error_text() {
         let root = run("r", "completed");
-        let summary = summarize(&root, std::slice::from_ref(&root), &records("r", &turn()));
+        let summary = summarize(
+            &root,
+            std::slice::from_ref(&root),
+            &records("r", &turn()),
+            None,
+        );
         assert_eq!(
             (summary.runs, summary.unfinished_runs, summary.turns),
             (1, 0, 1)
@@ -324,7 +413,7 @@ mod tests {
         let mut trail = records("r", &turn());
         // The child is still running: no turn.finished yet.
         trail.extend(records("c", &turn()[..2]));
-        let summary = summarize(&root, &[root.clone(), child], &trail);
+        let summary = summarize(&root, &[root.clone(), child], &trail, None);
         assert_eq!(
             (summary.runs, summary.unfinished_runs, summary.turns),
             (2, 1, 2)
@@ -338,15 +427,95 @@ mod tests {
         );
     }
 
+    fn kinds(summary: &Summary) -> Vec<&str> {
+        summary.alerts.iter().map(|a| a.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn denials_raise_an_alert() {
+        let root = run("r", "completed");
+        let summary = summarize(
+            &root,
+            std::slice::from_ref(&root),
+            &records("r", &turn()),
+            None,
+        );
+        assert_eq!(
+            summary.alerts,
+            [Alert {
+                kind: "denied".into(),
+                message: "the host denied 1 action".into()
+            }]
+        );
+        let mut quiet = turn();
+        quiet.remove(3);
+        for (seq, record) in quiet.iter_mut().enumerate() {
+            record["seq"] = json!(seq + 1);
+        }
+        quiet.last_mut().unwrap()["records"] = json!(5);
+        let summary = summarize(
+            &root,
+            std::slice::from_ref(&root),
+            &records("r", &quiet),
+            None,
+        );
+        assert!(summary.alerts.is_empty(), "{:?}", summary.alerts);
+    }
+
+    #[test]
+    fn an_incomplete_trail_raises_an_alert_once_the_tree_has_ended() {
+        let (root, child) = (run("r", "completed"), run("c", "running"));
+        let mut trail = records("r", &turn());
+        trail.extend(records("c", &turn()[..2]));
+        let tree = [root.clone(), child];
+        assert_eq!(kinds(&summarize(&root, &tree, &trail, None)), ["denied"]);
+        let tree = [root.clone(), run("c", "interrupted")];
+        let summary = summarize(&root, &tree, &trail, None);
+        assert_eq!(kinds(&summary), ["denied", "trail"]);
+        assert_eq!(
+            summary.alerts[1].message,
+            "the audit trail is incomplete (1 problem), so this summary may be too"
+        );
+    }
+
+    #[test]
+    fn a_host_no_earlier_run_reached_raises_an_alert() {
+        let root = run("r", "completed");
+        let summarize = |known: Option<&BTreeSet<String>>| {
+            summarize(
+                &root,
+                std::slice::from_ref(&root),
+                &records("r", &turn()),
+                known,
+            )
+        };
+        // The schedule's first run: nothing to compare with.
+        assert_eq!(kinds(&summarize(None)), ["denied"]);
+        let known = BTreeSet::from(["api.tavily.com".to_string()]);
+        // evil.example is new but was denied, which is already an alert.
+        assert_eq!(kinds(&summarize(Some(&known))), ["denied"]);
+        let summary = summarize(Some(&BTreeSet::new()));
+        assert_eq!(kinds(&summary), ["denied", "new_host"]);
+        assert_eq!(
+            summary.alerts[1].message,
+            r#"tool "web_search" reached "api.tavily.com", which no earlier run of this schedule did"#
+        );
+        let text = render(&summary);
+        assert!(
+            text.contains("\nalerts (2):\n  denied: the host denied 1 action\n  new_host: tool "),
+            "{text}"
+        );
+    }
+
     #[test]
     fn only_a_completed_run_needs_audit_records() {
         let cancelled = run("r", "cancelled");
-        let summary = summarize(&cancelled, std::slice::from_ref(&cancelled), &[]);
+        let summary = summarize(&cancelled, std::slice::from_ref(&cancelled), &[], None);
         assert!(summary.trail_problems.is_empty());
         assert_eq!(summary.duration_ms, None);
         let completed = run("r", "completed");
         assert_eq!(
-            summarize(&completed, std::slice::from_ref(&completed), &[])
+            summarize(&completed, std::slice::from_ref(&completed), &[], None)
                 .trail_problems
                 .len(),
             1
@@ -362,7 +531,12 @@ mod tests {
                 "host":"evil.example"}));
         }
         let root = run("r", "failed");
-        let summary = summarize(&root, std::slice::from_ref(&root), &records("r", &trail));
+        let summary = summarize(
+            &root,
+            std::slice::from_ref(&root),
+            &records("r", &trail),
+            None,
+        );
         assert_eq!(summary.denials.total, MAX_LISTED + 10);
         assert_eq!(summary.denials.records.len(), MAX_LISTED);
         assert!(render(&summary).contains("  [10 more]\n"));
@@ -377,6 +551,7 @@ mod tests {
             &root,
             std::slice::from_ref(&root),
             &records("r", &trail),
+            None,
         ));
         assert!(text.starts_with("run r (agent researcher, schedule brief): completed\n"));
         assert!(text.contains("1 run, 1 turn, 1.500s\n"), "{text}");

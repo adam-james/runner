@@ -520,19 +520,16 @@ impl WasiHttpHooks for SandboxHooks {
         });
         if !allowed {
             drop(fut);
-            return Box::new(
-                async move {
-                    guard.finish("denied", 0, None);
-                    // No ticket means the turn is out of audit slots, and an
-                    // unrecorded request is refused like one off the list.
-                    if let Some(ticket) = ticket {
-                        ticket.finish(audit::Decision::Denied, "not_allowed_host");
-                    }
-                    Err(wasmtime_wasi_http::Error::HttpRequestDenied)
-                }
-                .instrument(span)
-                .with_current_subscriber(),
-            );
+            // Recorded now rather than when the returned future runs: a guest
+            // can drop that future unpolled, and the dropped ticket would then
+            // record an allowed, interrupted request instead of a denial.
+            guard.finish("denied", 0, None);
+            // No ticket means the turn is out of audit slots, and an
+            // unrecorded request is refused like one off the list.
+            if let Some(ticket) = ticket {
+                ticket.finish(audit::Decision::Denied, "not_allowed_host");
+            }
+            return Box::new(async { Err(wasmtime_wasi_http::Error::HttpRequestDenied) });
         }
         let (added, withheld) = self.add_headers(&mut request, &host);
         if let Some(ticket) = &mut ticket {
@@ -1944,6 +1941,9 @@ mod tests {
             &mut hooks,
             format!("http://127.0.0.1:{port}/DROP_SECRET"),
         ));
+        // A denied request whose future the guest drops unpolled is still
+        // a denial.
+        drop(call(&mut hooks, "http://denied.invalid/DROPPED".into()));
 
         let text = serde_json::to_string(&*records.lock().unwrap()).unwrap();
         for secret in ["CONFIG_SECRET_VALUE", "PATH_SECRET", "QUERY", "DROP_SECRET"] {
@@ -1971,6 +1971,7 @@ mod tests {
                     ("denied", "not_allowed_host"),
                     ("allowed", "transport_error"),
                     ("allowed", "interrupted"),
+                    ("denied", "not_allowed_host"),
                 ]
             );
             assert_eq!(http[0]["status"], 204);
@@ -1984,7 +1985,7 @@ mod tests {
 
         // Filling the log, even with denied requests, refuses everything
         // after, allowed hosts included, rather than letting it go unrecorded.
-        for _ in 4..audit::MAX_EVENTS_PER_TURN {
+        for _ in 5..audit::MAX_EVENTS_PER_TURN {
             assert!(
                 call(&mut hooks, "http://denied.invalid/".into())
                     .await

@@ -870,6 +870,39 @@ impl Database {
         Ok(Some((runs, records)))
     }
 
+    /// The hosts that runs of `schedule` before run `id`, or any run they
+    /// delegated to, made an allowed request to: what the schedule is known
+    /// to reach. `None` if no run of it came before `id`, so there's nothing
+    /// to compare with.
+    pub fn schedule_hosts_before(
+        &self,
+        schedule: &str,
+        id: &str,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        let conn = self.0.lock().unwrap();
+        let earlier: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE schedule_id=?1
+                 AND rowid < (SELECT rowid FROM runs WHERE id=?2))",
+            params![schedule, id],
+            |r| r.get(0),
+        )?;
+        if !earlier {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT json_extract(a.data, '$.host') FROM audit_events a
+             JOIN runs r ON r.id=a.run_id JOIN runs root ON root.id=r.root_run_id
+             WHERE root.schedule_id=?1 AND root.rowid < (SELECT rowid FROM runs WHERE id=?2)
+               AND json_extract(a.data, '$.action')='http.request'
+               AND json_extract(a.data, '$.decision')='allowed'
+               AND json_extract(a.data, '$.host') IS NOT NULL",
+        )?;
+        Ok(Some(
+            stmt.query_map(params![schedule, id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?,
+        ))
+    }
+
     /// Whether any run in `session_id` belongs to the delegation tree rooted
     /// at `root_run_id`.
     pub fn session_in_tree(&self, session_id: &str, root_run_id: &str) -> Result<bool> {

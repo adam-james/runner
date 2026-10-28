@@ -47,7 +47,8 @@ In order; each step ships something usable on its own.
    - ~~host-made summary of every background run from its audit records, no model involved~~ done: `runner runs summary` / `GET /v1/runs/{id}/summary`, over the run's whole delegation tree: hosts reached, denials, errors, withheld credentials, trail problems; leaves out the run's error text
      - next: pending approvals, once step 4 exists
      - next: store each background run's summary when it finishes, for notifications and for when audit retention prunes its records
-   - alerts on denials, trail gaps, and a host the schedule has never reached before
+   - ~~alerts on denials, trail gaps, and a host the schedule has never reached before~~ done: a summary's `alerts`, computed with it; a schedule's first run sets its host baseline, and trail alerts wait until the whole tree has ended
+     - next: keep a table of each schedule's known hosts if comparing against every earlier run's audit records gets slow
    - `run_auditor` only when the summary flags something
    - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert

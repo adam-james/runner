@@ -560,16 +560,35 @@ async fn summary(
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<crate::summary::Summary>, ApiError> {
     let lookup = id.clone();
-    let (runs, records) =
-        s.db.blocking(move |db| db.tree_audit(&lookup))
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))?;
+    let (runs, records, known_hosts) =
+        s.db.blocking(move |db| {
+            let Some((runs, records)) = db.tree_audit(&lookup)? else {
+                return Ok(None);
+            };
+            // A scheduled run is compared with its schedule's earlier runs.
+            let schedule = runs
+                .iter()
+                .find(|run| run.id == lookup)
+                .and_then(|run| run.schedule_id.clone());
+            let known_hosts = match schedule {
+                Some(schedule) => db.schedule_hosts_before(&schedule, &lookup)?,
+                None => None,
+            };
+            Ok(Some((runs, records, known_hosts)))
+        })
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))?;
     let run = runs
         .iter()
         .find(|run| run.id == id)
         .expect("tree has its root");
-    Ok(Json(crate::summary::summarize(run, &runs, &records)))
+    Ok(Json(crate::summary::summarize(
+        run,
+        &runs,
+        &records,
+        known_hosts.as_ref(),
+    )))
 }
 
 /// The audit records of every run in a session, under the same token as
