@@ -119,6 +119,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | Method and route | Input / behavior |
 | --- | --- |
 | `GET /v1/agents` | List agent definitions, sorted by name, as `[{"name": "default", "provider": "openai", "model": "gpt-5", "tools": ["get_scores"]}, ...]` |
+| `GET /v1/agent-versions/{id}` | What runs of an agent version were allowed: `{"id", "agent", "first_used_at", "definition"}`; 404 if no run has used it |
 | `POST /v1/sessions` | `{ "id": "optional-name", "agent": "default" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |

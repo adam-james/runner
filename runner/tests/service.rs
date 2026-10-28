@@ -114,6 +114,7 @@ impl Harness {
                     delegates: vec![],
                     max_tokens: host::DEFAULT_MAX_TOKENS,
                     max_model_calls: None,
+                    version: String::new(),
                     tool_access: Default::default(),
                 })
                 .into(),
@@ -212,6 +213,37 @@ async fn detached_runs_replay_and_reconnect_over_http() {
 }
 
 #[tokio::test]
+async fn agent_versions_are_stored_once_and_served_by_id() {
+    let h = Harness::new(1).await;
+    let run =
+        h.db.submit(None, "default".into(), "task".into(), 60)
+            .unwrap();
+    let definition = json!({"schema":1, "agent":"default", "tools":[]});
+    for _ in 0..2 {
+        h.db.record_agent_version(&run.id, "sha256:01", "default", &definition)
+            .unwrap();
+    }
+    assert_eq!(
+        h.db.run_agent_version(&run.id).unwrap().as_deref(),
+        Some("sha256:01")
+    );
+    let get = |id: &str| {
+        h.client
+            .get(format!("{}/v1/agent-versions/{id}", h.url))
+            .bearer_auth("test-token")
+            .send()
+    };
+    let version: Value = get("sha256:01").await.unwrap().json().await.unwrap();
+    assert_eq!(version["agent"], "default");
+    assert_eq!(version["definition"], definition);
+    assert_eq!(
+        get("sha256:02").await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    h.close().await;
+}
+
+#[tokio::test]
 async fn runs_execute_the_agent_definition_they_name() {
     let h = Harness::new(1).await;
     let agents: Value = h
@@ -229,7 +261,7 @@ async fn runs_execute_the_agent_definition_they_name() {
         json!(
             ["default", "researcher"].map(|name| json!({"name":name, "provider":"openai",
             "model":"gpt-5", "tools":["web_search"], "max_tokens":16384,"delegates":[],
-            "max_model_calls":null, "tool_access":{}}))
+            "max_model_calls":null, "version":"", "tool_access":{}}))
         )
     );
     let run: Run = h

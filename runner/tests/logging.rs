@@ -20,6 +20,7 @@ async fn api_logs_include_auth_rejections_and_templates_without_secrets() {
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,
+            version: String::new(),
             tool_access: Default::default(),
         }],
     );

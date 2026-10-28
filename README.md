@@ -252,6 +252,18 @@ with `turn.finished`, which states how many records the turn wrote. `runs
 audit` warns on stderr when something's missing: a gap in the sequence, or
 no `turn.finished` because the daemon stopped mid-run.
 
+`turn.started` also names the run's agent version: a snapshot of what the
+agent was allowed when the run started, kept after `runner.toml` changes. It
+holds the provider and model, each tool's allowed hosts, header names and the
+hosts they go to (never values), directory, limits and component digest, plus
+host tools, delegates, limits and a hash of the system prompt. Its id is the
+snapshot's SHA-256, so any change to the config or a component's bytes makes a
+new version. `agents list` shows each agent's current one.
+
+```bash
+runner agents version sha256:3f9a…   # what runs of that version were allowed, as JSON
+```
+
 Limits and failures:
 
 - A turn records at most 4096 actions. Past that, the host refuses further

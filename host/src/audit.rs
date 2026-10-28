@@ -105,7 +105,15 @@ impl TurnAudit {
 
 impl AuditCell {
     /// Starts this turn's trail, replacing any earlier turn's.
-    pub(crate) fn begin(&self, agent: &str, session: &str, sink: EventSink) -> TurnGuard {
+    /// `version` is the agent version the turn runs with, recorded in
+    /// `turn.started`.
+    pub(crate) fn begin(
+        &self,
+        agent: &str,
+        session: &str,
+        version: &str,
+        sink: EventSink,
+    ) -> TurnGuard {
         let mut turn = TurnAudit {
             agent: agent.to_string(),
             session: session.to_string(),
@@ -114,7 +122,11 @@ impl AuditCell {
             reserved: 0,
             refused: 0,
         };
-        turn.write("turn.started", None, Map::new());
+        turn.write(
+            "turn.started",
+            None,
+            Map::from_iter([("agent_version".into(), version.into())]),
+        );
         *self.0.lock().unwrap() = Some(turn);
         TurnGuard {
             cell: self.clone(),
@@ -304,7 +316,7 @@ mod tests {
     fn records_are_sequenced_and_bracketed_by_the_turn() {
         let (sink, records) = capture();
         let cell = AuditCell::default();
-        let turn = cell.begin("default", "s1", sink);
+        let turn = cell.begin("default", "s1", "sha256:00", sink);
         let mut ticket = cell.reserve(&tool(), "tool.call").unwrap();
         ticket.field("tool", "weather");
         ticket.finish(Decision::Allowed, "ok");
@@ -335,7 +347,7 @@ mod tests {
     fn a_dropped_turn_finishes_as_interrupted() {
         let (sink, records) = capture();
         let cell = AuditCell::default();
-        drop(cell.begin("default", "s1", sink));
+        drop(cell.begin("default", "s1", "sha256:00", sink));
         assert_eq!(records.lock().unwrap()[1]["outcome"], "interrupted");
         // Outside a turn, actions go ahead unrecorded.
         cell.reserve(&tool(), "tool.call")
@@ -348,7 +360,7 @@ mod tests {
     fn exhausted_turns_refuse_actions_and_say_so_once() {
         let (sink, records) = capture();
         let cell = AuditCell::default();
-        let turn = cell.begin("default", "s1", sink);
+        let turn = cell.begin("default", "s1", "sha256:00", sink);
         for _ in 0..MAX_EVENTS_PER_TURN {
             cell.reserve(&tool(), "http.request")
                 .unwrap()
@@ -373,7 +385,7 @@ mod tests {
     fn guest_influenced_strings_are_bounded_and_escaped() {
         let (sink, records) = capture();
         let cell = AuditCell::default();
-        let _turn = cell.begin("default", "s1", sink);
+        let _turn = cell.begin("default", "s1", "sha256:00", sink);
         let mut ticket = cell.reserve(&tool(), "tool.call").unwrap();
         ticket.field("tool", format!("x\n{{\"forged\":1}}{}", "y".repeat(500)));
         ticket.finish(Decision::Denied, "unknown_tool");

@@ -245,6 +245,7 @@ impl Service {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/agents", get(list_agents))
+            .route("/v1/agent-versions/{id}", get(agent_version))
             .route("/v1/components", get(list_components))
             .route("/v1/sessions", get(list_sessions).post(create_session))
             .route("/v1/sessions/{id}/audit", get(session_audit))
@@ -302,6 +303,19 @@ async fn authenticate(
 
 async fn list_agents(State(s): State<Service>) -> Json<Vec<host::AgentInfo>> {
     Json(s.agents.to_vec())
+}
+
+/// What runs of an agent version were allowed, under the same token as
+/// their audit records.
+async fn agent_version(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<crate::db::AgentVersion>, ApiError> {
+    s.db.blocking(move |db| db.agent_version(&id))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "agent version not found".into()))
 }
 
 async fn list_components(State(s): State<Service>) -> Json<Vec<host::inspect::Capabilities>> {
@@ -538,6 +552,22 @@ impl BufferedEvents {
     fn push(&mut self, value: Value) {
         // Only the host makes events, and only its audit module makes these.
         // A record that can't be saved fails the run like any other event.
+        // So does a version, which its audit records refer to.
+        if value["kind"] == "agent_version" {
+            if self
+                .db
+                .record_agent_version(
+                    &self.id,
+                    value["id"].as_str().unwrap_or_default(),
+                    value["agent"].as_str().unwrap_or_default(),
+                    &value["definition"],
+                )
+                .is_err()
+            {
+                self.failed = true;
+            }
+            return;
+        }
         if value["kind"] == "audit" {
             if self.db.audit_event(&self.id, value).is_err() {
                 self.failed = true;
