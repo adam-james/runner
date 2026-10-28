@@ -136,6 +136,10 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `POST /v1/schedules/{id}/resume` | Resume a paused schedule; 409 if its agents changed |
 | `POST /v1/schedules/{id}/approve` | Pin an active or paused schedule to its agents' current versions and make it active: `{"schedule", "changes": [{"agent", "from", "to", "fields"}]}` |
 | `DELETE /v1/schedules/{id}` | Delete it; cancels its occurrence if queued; returns it |
+| `POST /v1/schedules/{id}/notify` | `{"notify": "all" \| "problems" \| "never"}`: which of its runs notify; returns schedule. Creating a schedule takes `notify` too (default `problems`) |
+| `GET /v1/notifications` | Newest first, at most `limit` (1–1000, default 100); `?unread=true` for unread only: `[{"id", "run_id", "created_at", "read_at", "schedule_id", "agent", "status", "duration_ms", "alerts", "schedule_status"}]` |
+| `POST /v1/notifications/{id}/read` | Mark it read: `{"marked": 1}`, or 0 if it already was; 404 if there's none |
+| `POST /v1/notifications/read` | Mark every unread one read: `{"marked": n}` |
 
 Omitting `session_id` creates a fresh session transactionally with submission.
 A supplied session must already exist. Session IDs use the existing host rules:
@@ -289,9 +293,22 @@ previous run is still queued or running is skipped as
 `previous run unfinished`, so its runs never overlap. A paused schedule that's
 resumed or approved after its next occurrence passed skips it the same way.
 There is no wake from sleep. A schedule's history records `created`,
-`paused`, `resumed`, `approved`, `fired`, `skipped`, `refused` and `deleted`,
-with the reason, runs and versions involved; it's metadata only, like audit
-records.
+`paused`, `resumed`, `approved`, `fired`, `skipped`, `refused`,
+`notify_changed` and `deleted`, with the reason, runs and versions involved;
+it's metadata only, like audit records.
+
+## Notifications
+
+The daemon's notifier looks every second for scheduled runs that have ended
+and whose delegation tree has ended too, so the summary is complete, and
+checks each once. Its schedule's `notify` level decides whether the run gets a
+notification: `all`, `problems` (status `failed` or `interrupted`, or any
+summary alert) or `never`; a `cancelled` run never does. A notification stores
+only host-written fields: the schedule, agent, status, duration, the summary's
+alerts and the schedule's status (e.g. `paused` after a refused run). It never
+holds the model's reply or the run's error, which a prompt injection could
+steer. Notifications stay until read. Runs that ended before notifications
+existed count as checked, so upgrading notifies about nothing old.
 
 ## Host activity logs
 

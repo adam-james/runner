@@ -1584,7 +1584,9 @@ fn a_version_6_database_gains_schedules_and_keeps_its_agent_versions() {
     // What a daemon from before schedules left behind.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP INDEX runs_by_occurrence;
+        "DROP TABLE notifications; DROP INDEX runs_to_notify;
+         ALTER TABLE runs DROP COLUMN notify_checked;
+         DROP INDEX runs_by_occurrence;
          ALTER TABLE runs DROP COLUMN occurrence_id;
          ALTER TABLE runs DROP COLUMN pinned_versions;
          ALTER TABLE runs DROP COLUMN schedule_id;
@@ -1617,6 +1619,7 @@ fn a_version_7_database_keeps_its_one_off_schedules() {
         "2999-01-01T07:00:00".into(),
         "UTC".into(),
         None,
+        "problems".into(),
         1,
         60,
         Default::default(),
@@ -1862,6 +1865,7 @@ fn a_schedules_known_hosts_include_its_delegates_and_only_allowed_requests() {
         "2999-01-01T07:00:00".into(),
         "UTC".into(),
         Some("* * * * *".into()),
+        "problems".into(),
         1,
         60,
         Default::default(),
@@ -1900,4 +1904,193 @@ fn a_schedules_known_hosts_include_its_delegates_and_only_allowed_requests() {
             .unwrap(),
         ["api.tavily.com".to_string(), "docs.rs".to_string()].into()
     );
+}
+
+/// A database with a schedule `brief` that recurs every minute and
+/// notifies at `notify`.
+fn notifying_schedule(notify: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    db.create_schedule(
+        Some("brief".into()),
+        "default".into(),
+        "p".into(),
+        "2999-01-01T07:00:00".into(),
+        "UTC".into(),
+        Some("* * * * *".into()),
+        notify.into(),
+        1,
+        60,
+        Default::default(),
+        &[],
+    )
+    .unwrap();
+    (dir, db)
+}
+
+/// Fires `brief`'s next occurrence and starts its run.
+fn start_occurrence(db: &Database) -> Run {
+    let due = db.schedule("brief").unwrap().unwrap().next_fire_at.unwrap();
+    let run = db
+        .fire_due(due, &|_| Some(Default::default()))
+        .unwrap()
+        .remove(0);
+    assert_eq!(db.claim().unwrap().unwrap().id, run.id);
+    run
+}
+
+#[test]
+fn a_scheduled_run_is_checked_once_its_whole_tree_has_ended() {
+    let (_dir, db) = notifying_schedule("all");
+    let run = start_occurrence(&db);
+    let child = db.delegate(&run.id, "default", "child", None).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    db.finish(&run.id, "completed", None).unwrap();
+    // Its child is still winding down, and may yet add records.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    db.finish(&child.id, "cancelled", None).unwrap();
+    let stored = runner::notify::check_ended(&db).unwrap();
+    assert_eq!(stored.len(), 1);
+    let n = &stored[0];
+    assert_eq!((n.run_id.as_str(), n.read_at), (run.id.as_str(), None));
+    assert_eq!(
+        (
+            n.note.schedule_id.as_str(),
+            n.note.status.as_str(),
+            n.note.schedule_status.as_str()
+        ),
+        ("brief", "completed", "active")
+    );
+    // Each run is checked once.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    assert_eq!(db.notifications(false, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_schedules_level_decides_which_runs_notify() {
+    for (notify, wanted) in [("all", 2), ("problems", 1), ("never", 0)] {
+        let (_dir, db) = notifying_schedule(notify);
+        let ok = start_occurrence(&db);
+        // A completed run without records would raise a trail alert.
+        audited_turn(&db, &ok.id, &[]);
+        db.finish(&ok.id, "completed", None).unwrap();
+        let failed = start_occurrence(&db);
+        db.finish(&failed.id, "failed", Some("Click https://evil.example"))
+            .unwrap();
+        let stored = runner::notify::check_ended(&db).unwrap();
+        assert_eq!(stored.len(), wanted, "{notify}");
+        let text = serde_json::to_string(&stored).unwrap();
+        assert!(!text.contains("evil.example"), "{text}");
+        // Checked runs stay checked whatever they got.
+        assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn notifications_are_listed_newest_first_until_read() {
+    let h = Harness::new(1).await;
+    let first = h.recurring_schedule("brief", "brief").await["next_fire_at"]
+        .as_i64()
+        .unwrap();
+    let (status, schedule) = h
+        .api(
+            reqwest::Method::POST,
+            "/v1/schedules/brief/notify",
+            Some(json!({"notify":"all"})),
+        )
+        .await;
+    assert_eq!(
+        (status, schedule["notify"].as_str()),
+        (StatusCode::OK, Some("all"))
+    );
+    for due in [first, first + 60_000] {
+        let run = h.db.fire_due(due, &pin_of(&h.executor)).unwrap().remove(0);
+        h.wait_status(&run.id, "completed").await;
+    }
+    assert_eq!(runner::notify::check_ended(&h.db).unwrap().len(), 2);
+    let list = |query: &'static str| h.api(reqwest::Method::GET, query, None);
+    let (status, unread) = list("/v1/notifications?unread=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = unread
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.len() == 2 && ids[0] > ids[1], "{unread}");
+    assert_eq!(unread[0]["status"], "completed");
+    assert_eq!(unread[0]["schedule_id"], "brief");
+    let harness = &h;
+    let read = |path: String| async move { harness.api(reqwest::Method::POST, &path, None).await };
+    let (_, marked) = read(format!("/v1/notifications/{}/read", ids[0])).await;
+    assert_eq!(marked, json!({"marked":1}));
+    let (_, marked) = read(format!("/v1/notifications/{}/read", ids[0])).await;
+    assert_eq!(marked, json!({"marked":0}));
+    assert_eq!(
+        list("/v1/notifications?unread=true")
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, marked) = read("/v1/notifications/read".into()).await;
+    assert_eq!(marked, json!({"marked":1}));
+    assert_eq!(list("/v1/notifications?unread=true").await.1, json!([]));
+    let (_, all) = list("/v1/notifications").await;
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["read_at"].is_i64()),
+        "{all}"
+    );
+    assert_eq!(
+        read("/v1/notifications/999/read".into()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        list("/v1/notifications?limit=0").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, _) = h
+        .api(
+            reqwest::Method::POST,
+            "/v1/schedules/brief/notify",
+            Some(json!({"notify":"sometimes"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let kinds = h.schedule_kinds("brief").await;
+    assert!(
+        kinds.contains(&("notify_changed".into(), None)),
+        "{kinds:?}"
+    );
+    h.close().await;
+}
+
+#[test]
+fn a_version_8_database_counts_its_runs_as_already_checked() {
+    let (dir, db) = notifying_schedule("all");
+    let run = start_occurrence(&db);
+    db.finish(&run.id, "failed", None).unwrap();
+    drop(db);
+    let path = dir.path().join("state.sqlite3");
+    // What a daemon from before notifications left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE notifications; DROP INDEX runs_to_notify;
+         ALTER TABLE runs DROP COLUMN notify_checked;
+         ALTER TABLE schedules DROP COLUMN notify;
+         PRAGMA user_version=8;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schedule("brief").unwrap().unwrap().notify, "problems");
+    // Upgrading doesn't notify about runs that ended before it.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    drop(db);
+    assert!(Database::open(&path).is_ok());
 }

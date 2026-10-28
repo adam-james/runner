@@ -228,6 +228,29 @@ struct CreateSchedule {
     tz: String,
     #[serde(default = "default_deadline")]
     deadline_secs: u64,
+    /// When its runs notify: see `crate::notify::LEVELS`.
+    #[serde(default = "crate::notify::default_level")]
+    notify: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetNotify {
+    notify: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationFilter {
+    /// Only unread notifications.
+    #[serde(default)]
+    unread: bool,
+    #[serde(default = "default_notification_limit")]
+    limit: usize,
+}
+
+fn default_notification_limit() -> usize {
+    100
 }
 
 /// An agent whose version changed, as `approve` reports it.
@@ -352,6 +375,10 @@ impl Service {
             .route("/v1/schedules/{id}/pause", post(pause_schedule))
             .route("/v1/schedules/{id}/resume", post(resume_schedule))
             .route("/v1/schedules/{id}/approve", post(approve_schedule))
+            .route("/v1/schedules/{id}/notify", post(set_schedule_notify))
+            .route("/v1/notifications", get(list_notifications))
+            .route("/v1/notifications/read", post(read_all_notifications))
+            .route("/v1/notifications/{id}/read", post(read_notification))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
@@ -559,36 +586,11 @@ async fn summary(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<crate::summary::Summary>, ApiError> {
-    let lookup = id.clone();
-    let (runs, records, known_hosts) =
-        s.db.blocking(move |db| {
-            let Some((runs, records)) = db.tree_audit(&lookup)? else {
-                return Ok(None);
-            };
-            // A scheduled run is compared with its schedule's earlier runs.
-            let schedule = runs
-                .iter()
-                .find(|run| run.id == lookup)
-                .and_then(|run| run.schedule_id.clone());
-            let known_hosts = match schedule {
-                Some(schedule) => db.schedule_hosts_before(&schedule, &lookup)?,
-                None => None,
-            };
-            Ok(Some((runs, records, known_hosts)))
-        })
+    s.db.blocking(move |db| db.summary(&id))
         .await
         .map_err(internal)?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))?;
-    let run = runs
-        .iter()
-        .find(|run| run.id == id)
-        .expect("tree has its root");
-    Ok(Json(crate::summary::summarize(
-        run,
-        &runs,
-        &records,
-        known_hosts.as_ref(),
-    )))
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "run not found".into()))
 }
 
 /// The audit records of every run in a session, under the same token as
@@ -652,6 +654,7 @@ async fn create_schedule(
                 at,
                 input.tz,
                 cron,
+                input.notify,
                 next_fire_at,
                 input.deadline_secs,
                 pin,
@@ -788,6 +791,66 @@ async fn approve_schedule(
         schedule: s.with_changes(schedule),
         changes,
     }))
+}
+
+/// Changes when a schedule's runs notify the user.
+async fn set_schedule_notify(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+    Json(input): Json<SetNotify>,
+) -> Result<Json<Schedule>, ApiError> {
+    find_schedule(&s, &id).await?;
+    let schedule =
+        s.db.blocking(move |db| db.set_schedule_notify(&id, &input.notify))
+            .await
+            .map_err(bad)?;
+    Ok(Json(s.with_changes(schedule)))
+}
+
+/// Notifications, newest first: unread ones only with `?unread=true`, at
+/// most `limit` (1–1000, default 100).
+async fn list_notifications(
+    State(s): State<Service>,
+    Query(filter): Query<NotificationFilter>,
+) -> Result<Json<Vec<crate::db::Notification>>, ApiError> {
+    if !(1..=1000).contains(&filter.limit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    Ok(Json(
+        s.db.blocking(move |db| db.notifications(filter.unread, filter.limit))
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+/// Marks a notification read: `{"marked": 1}`, or 0 if it already was.
+async fn read_notification(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let marked =
+        s.db.blocking(move |db| {
+            if !db.notification_exists(id)? {
+                return Ok(None);
+            }
+            db.mark_read(Some(id)).map(Some)
+        })
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "notification not found".into()))?;
+    Ok(Json(json!({"marked": marked})))
+}
+
+/// Marks every unread notification read: `{"marked": n}`.
+async fn read_all_notifications(State(s): State<Service>) -> Result<Json<Value>, ApiError> {
+    let marked =
+        s.db.blocking(|db| db.mark_read(None))
+            .await
+            .map_err(internal)?;
+    Ok(Json(json!({"marked": marked})))
 }
 
 async fn delete_schedule(
@@ -1199,6 +1262,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         executor.clone(),
         shutdown.clone(),
     ));
+    let notifier = tokio::spawn(crate::notify::notifier(db.clone(), shutdown.clone()));
     let worker = worker(db, executor, concurrency, worker_stop);
     let http =
         axum::serve(listener, service.router()).with_graceful_shutdown(http_stop.cancelled_owned());
@@ -1212,6 +1276,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         result = stop_signal() => { shutdown.cancel(); result?; worker.await?; }
     }
     let _ = scheduler.await;
+    let _ = notifier.await;
     // Dropping the HTTP server also closes any attached event streams.
     drop(instance);
     Ok(())

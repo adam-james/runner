@@ -90,6 +90,12 @@ enum Command {
         #[command(subcommand)]
         command: Schedules,
     },
+    /// What scheduled runs did once they ended, kept by the daemon until
+    /// read; host-written, never the model's reply.
+    Notifications {
+        #[command(subcommand)]
+        command: Notifications,
+    },
     /// What configured tools can reach: network hosts, injected headers
     /// (names only), files and limits.
     Tools {
@@ -171,6 +177,10 @@ enum Schedules {
         id: Option<String>,
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
+        /// When its runs notify: all of them, only problems (failed or
+        /// interrupted, or with alerts), or never.
+        #[arg(long, default_value = "problems", value_parser = runner::notify::LEVELS.to_vec())]
+        notify: String,
     },
     List,
     /// A schedule and its history: what was done to it and what it ran.
@@ -192,6 +202,30 @@ enum Schedules {
     },
     Rm {
         id: String,
+    },
+    /// Change when a schedule's runs notify: all, problems or never.
+    Notify {
+        id: String,
+        #[arg(value_parser = runner::notify::LEVELS.to_vec())]
+        level: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum Notifications {
+    /// Newest first: unread ones, or every one with --all.
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a notification read, or every unread one with --all.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "all"])))]
+    Read {
+        id: Option<i64>,
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -387,6 +421,22 @@ async fn main() -> Result<()> {
             ),
         },
         Command::Schedules { command } => schedules(&client, command).await?,
+        Command::Notifications { command } => match command {
+            Notifications::List { all, json } => {
+                let notifications = client.notifications(!all).await?;
+                if json {
+                    print(&notifications)?
+                } else if notifications.is_empty() {
+                    eprintln!("no {}notifications", if all { "" } else { "unread " });
+                } else {
+                    print!("{}", runner::notify::render(&notifications));
+                }
+            }
+            Notifications::Read { id, .. } => {
+                let marked = client.read_notifications(id).await?;
+                eprintln!("marked {marked} read");
+            }
+        },
         Command::Tools {
             command: Tools::Components(command),
         } => components(&client, host::inspect::ComponentKind::Tool, command).await?,
@@ -419,6 +469,7 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
             agent,
             id,
             deadline_secs,
+            notify,
         } => {
             let tz = match tz {
                 Some(tz) => tz,
@@ -428,7 +479,17 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
             };
             print(
                 &client
-                    .create_schedule(id, agent, prompt, at, delay, cron, tz, deadline_secs)
+                    .create_schedule(
+                        id,
+                        agent,
+                        prompt,
+                        at,
+                        delay,
+                        cron,
+                        tz,
+                        deadline_secs,
+                        notify,
+                    )
                     .await?,
             )?
         }
@@ -456,6 +517,7 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
             print(&approval)?
         }
         Schedules::Rm { id } => print(&client.delete_schedule(&id).await?)?,
+        Schedules::Notify { id, level } => print(&client.set_schedule_notify(&id, &level).await?)?,
     }
     Ok(())
 }

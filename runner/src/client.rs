@@ -7,7 +7,7 @@ use reqwest::{Client as HttpClient, Method, Response};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::db::{Event, Run, Schedule, Session};
+use crate::db::{Event, Notification, Run, Schedule, Session};
 use crate::service::{Approval, ConnectionInfo};
 use crate::ui::Ui;
 
@@ -163,7 +163,8 @@ impl Client {
 
     /// Schedules a prompt to run once, at local time `at` in time zone
     /// `tz` or `in_secs` seconds from now, or on cron expression `cron`
-    /// read in `tz`; give one of the three.
+    /// read in `tz`; give one of the three. `notify` is when its runs
+    /// notify; see `crate::notify::LEVELS`.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_schedule(
         &self,
@@ -175,12 +176,13 @@ impl Client {
         cron: Option<String>,
         tz: String,
         deadline: u64,
+        notify: String,
     ) -> Result<Schedule> {
         self.json(
             Method::POST,
             "/v1/schedules",
             Some(
-                json!({"id":id,"agent":agent,"prompt":prompt,"at":at,"in_secs":in_secs,"cron":cron,"tz":tz,"deadline_secs":deadline}),
+                json!({"id":id,"agent":agent,"prompt":prompt,"at":at,"in_secs":in_secs,"cron":cron,"tz":tz,"deadline_secs":deadline,"notify":notify}),
             ),
         )
         .await
@@ -205,6 +207,37 @@ impl Client {
     pub async fn schedule_action(&self, id: &str, action: &str) -> Result<Schedule> {
         self.json(Method::POST, &format!("/v1/schedules/{id}/{action}"), None)
             .await
+    }
+
+    /// Changes when a schedule's runs notify.
+    pub async fn set_schedule_notify(&self, id: &str, notify: &str) -> Result<Schedule> {
+        self.json(
+            Method::POST,
+            &format!("/v1/schedules/{id}/notify"),
+            Some(json!({"notify":notify})),
+        )
+        .await
+    }
+
+    /// Notifications, newest first; only unread ones if `unread`.
+    pub async fn notifications(&self, unread: bool) -> Result<Vec<Notification>> {
+        self.json(
+            Method::GET,
+            &format!("/v1/notifications?unread={unread}"),
+            None,
+        )
+        .await
+    }
+
+    /// Marks notification `id`, or every unread one, read. Returns how many
+    /// were unread.
+    pub async fn read_notifications(&self, id: Option<i64>) -> Result<u64> {
+        let path = match id {
+            Some(id) => format!("/v1/notifications/{id}/read"),
+            None => "/v1/notifications/read".into(),
+        };
+        let marked: Value = self.json(Method::POST, &path, None).await?;
+        Ok(marked["marked"].as_u64().unwrap_or(0))
     }
 
     /// Re-pins a schedule to its agents' current versions.
