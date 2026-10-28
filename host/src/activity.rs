@@ -70,6 +70,13 @@ pub(crate) mod tests {
             String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
         }
         pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            // Other tests hit the same callsites without a scoped subscriber.
+            // Keep an unfiltered fallback installed so their first use cannot
+            // cache Interest::never and suppress records in a capturing test.
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(|| {
+                tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+            });
             let writer = self.clone();
             tracing_subscriber::fmt()
                 .without_time()

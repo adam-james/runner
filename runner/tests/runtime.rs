@@ -15,14 +15,26 @@ use tokio_util::sync::CancellationToken;
 struct Fixture {
     dir: tempfile::TempDir,
     config: PathBuf,
+    _slot: tokio::sync::SemaphorePermit<'static>,
 }
 
 impl Fixture {
-    fn new() -> Self {
-        Self::with_tool_timeout(1)
+    async fn new() -> Self {
+        Self::with_tool_timeout(1).await
     }
 
-    fn with_tool_timeout(tool_timeout: u64) -> Self {
+    async fn with_tool_timeout(tool_timeout: u64) -> Self {
+        // Each fixture compiles components and may launch a daemon with its own
+        // Wasmtime engine. Unbounded test parallelism can exhaust the CPU budget
+        // for inspection and startup before the behavior under test even begins.
+        // Keep tests parallel on larger machines, and include subprocesses in the
+        // limit by holding the permit for the fixture's entire lifetime.
+        static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let slots = SLOTS.get_or_init(|| {
+            let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+            tokio::sync::Semaphore::new(cpus.min(4))
+        });
+        let slot = slots.acquire().await.unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -87,7 +99,11 @@ read_audit_trails = true
             ),
         )
         .unwrap();
-        Self { dir, config }
+        Self {
+            dir,
+            config,
+            _slot: slot,
+        }
     }
 
     async fn runtime(&self) -> TestRuntime {
@@ -136,7 +152,7 @@ impl TestRuntime {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn real_components_stream_save_resume_and_enforce_capabilities() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
@@ -216,7 +232,7 @@ async fn wait(db: &Database, id: &str, state: &str) -> Run {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn inspect_component_reads_configured_components_without_secrets() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let cli_report = host::wat::print(
         fixture.config.to_str().unwrap(),
@@ -284,7 +300,7 @@ async fn inspect_component_reads_configured_components_without_secrets() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn audit_trail_reads_other_runs_but_never_its_own() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
     let runtime = fixture.runtime().await.host;
@@ -364,7 +380,7 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn agent_versions_record_what_each_run_was_allowed() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await.host;
     let version = runtime.agent_version("default").unwrap();
     // The same config and components always give the same version.
@@ -459,7 +475,7 @@ async fn agent_versions_record_what_each_run_was_allowed() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn agent_definitions_only_get_the_tools_they_name() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let access: std::collections::BTreeMap<_, _> = [(
         "fixture".to_string(),
@@ -572,7 +588,7 @@ async fn agent_definitions_only_get_the_tools_they_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires WASM fixture build"]
 async fn real_provider_and_tools_are_interruptible_and_do_not_block_other_runs() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
@@ -666,7 +682,7 @@ async fn connect(data: &std::path::Path) -> Client {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn daemon_cli_and_crash_recovery_work_end_to_end() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -751,7 +767,7 @@ fn chat(data: &std::path::Path, args: &[&str], input: &str) -> String {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn reconnecting_to_a_chat_replays_its_saved_turns() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     connect(&data).await;
@@ -799,7 +815,7 @@ async fn reconnecting_to_a_chat_replays_its_saved_turns() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn chat_names_its_agent_and_rejects_unknown_ones() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -888,7 +904,7 @@ async fn chat_names_its_agent_and_rejects_unknown_ones() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn capabilities_come_from_imports_and_config_without_secrets() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let capabilities = runtime.host.capabilities();
     let names: Vec<_> = capabilities
@@ -974,7 +990,7 @@ async fn capabilities_come_from_imports_and_config_without_secrets() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn ctrl_c_at_the_prompt_ends_the_chat() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     connect(&data).await;
@@ -1029,7 +1045,7 @@ async fn ctrl_c_at_the_prompt_ends_the_chat() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn agent_limits_cap_reply_tokens_and_model_calls() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     let turn = async |agent: &str, session: &str, prompt: &str| {
         let events = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1072,7 +1088,7 @@ async fn agent_limits_cap_reply_tokens_and_model_calls() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn failed_turns_explain_why_without_leaking_credentials() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
@@ -1108,7 +1124,7 @@ async fn failed_turns_explain_why_without_leaking_credentials() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
-    let fixture = Fixture::with_tool_timeout(60);
+    let fixture = Fixture::with_tool_timeout(60).await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let stop = CancellationToken::new();
     let task = tokio::spawn(worker(
@@ -1131,7 +1147,7 @@ async fn run_deadline_preempts_a_longer_cpu_bound_tool_timeout() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn an_unreadable_transcript_fails_the_turn_without_details() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = events.clone();
     let sink: host::EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
@@ -1162,7 +1178,7 @@ async fn an_unreadable_transcript_fails_the_turn_without_details() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn conversations_are_kept_in_the_service_database() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let db = Database::open(&fixture.dir.path().join("state.sqlite3")).unwrap();
     let session = db
         .create_session(Some("kept".into()), "default".into())
@@ -1222,7 +1238,7 @@ async fn turn_output(runtime: &TestRuntime, session: &str, prompt: &str) -> Stri
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn component_state_survives_turns_and_runtime_clones_but_isolates_sessions() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let config = std::fs::read_to_string(&fixture.config)
         .unwrap()
         .replace("fresh_per_call = true", "fresh_per_call = false");
@@ -1286,7 +1302,7 @@ async fn component_state_survives_turns_and_runtime_clones_but_isolates_sessions
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn fresh_per_call_tools_still_reset_while_the_provider_is_reused() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let runtime = fixture.runtime().await;
     assert_eq!(turn_output(&runtime, "fresh", "tool:counter").await, "1");
     assert_eq!(turn_output(&runtime, "fresh", "tool:counter").await, "1");
@@ -1300,7 +1316,7 @@ async fn fresh_per_call_tools_still_reset_while_the_provider_is_reused() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn interrupted_components_are_recreated_before_reuse() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let config = std::fs::read_to_string(&fixture.config)
         .unwrap()
         .replace("fresh_per_call = true", "fresh_per_call = false");
@@ -1347,7 +1363,7 @@ async fn interrupted_components_are_recreated_before_reuse() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn configured_tool_names_control_model_definitions_dispatch_and_events() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let config = std::fs::read_to_string(&fixture.config).unwrap();
     let tool_block = config
         .split_once("[tools.fixture]")
@@ -1418,7 +1434,7 @@ mod support;
 #[ignore = "requires WASM fixture build"]
 async fn activity_logs_attribute_cached_components_and_concurrent_turns_without_payloads() {
     use tracing::Instrument;
-    let fixture = Fixture::with_tool_timeout(10);
+    let fixture = Fixture::with_tool_timeout(10).await;
     let config = std::fs::read_to_string(&fixture.config)
         .unwrap()
         .replace("fresh_per_call = true", "fresh_per_call = false");
@@ -1581,7 +1597,7 @@ async fn running(client: &Client, id: &str) {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn chat_catches_up_pending_and_new_turns_before_accepting_input() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -1646,7 +1662,7 @@ async fn chat_catches_up_pending_and_new_turns_before_accepting_input() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn ctrl_c_detaches_chat_and_watch_successfully_without_cancelling_work() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -1710,7 +1726,7 @@ async fn ctrl_c_detaches_chat_and_watch_successfully_without_cancelling_work() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn connection_failure_during_catch_up_does_not_offer_an_idle_prompt() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -1736,8 +1752,8 @@ async fn connection_failure_during_catch_up_does_not_offer_an_idle_prompt() {
     );
 }
 
-fn delegation_fixture() -> Fixture {
-    let fixture = Fixture::new();
+async fn delegation_fixture() -> Fixture {
+    let fixture = Fixture::new().await;
     let mut config = std::fs::read_to_string(&fixture.config).unwrap();
     config.push_str(
         r#"
@@ -1759,7 +1775,7 @@ system_prompt = "Leaf specialist instructions."
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn configured_specialists_delegate_in_parallel_and_nested_at_concurrency_one() {
-    let fixture = delegation_fixture();
+    let fixture = delegation_fixture().await;
     let runtime = fixture.runtime().await;
     let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
     let stop = CancellationToken::new();
@@ -1830,7 +1846,7 @@ async fn configured_specialists_delegate_in_parallel_and_nested_at_concurrency_o
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn guest_requested_delegation_cannot_bypass_host_permissions_or_service_context() {
-    let fixture = delegation_fixture();
+    let fixture = delegation_fixture().await;
     let runtime = fixture.runtime().await;
     let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
     let stop = CancellationToken::new();
@@ -1913,7 +1929,7 @@ async fn guest_requested_delegation_cannot_bypass_host_permissions_or_service_co
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
-    let fixture = delegation_fixture();
+    let fixture = delegation_fixture().await;
     let runtime = fixture.runtime().await;
     let db = Database::open(&fixture.dir.path().join("delegation.sqlite3")).unwrap();
     let stop = CancellationToken::new();
@@ -1963,7 +1979,7 @@ async fn real_delegation_supervises_unawaited_and_cancelled_child_runs() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let data = fixture.dir.path().join("service");
     let _daemon = start(&fixture, &data);
     let client = connect(&data).await;
@@ -2114,7 +2130,9 @@ async fn runs_keep_a_metadata_only_audit_trail_shown_by_the_cli() {
 #[tokio::test]
 #[ignore = "requires WASM fixture build"]
 async fn components_without_a_memory_cap_get_the_default_one() {
-    let fixture = Fixture::new();
+    // Allocation can take over a second under load. This test checks memory
+    // limits; tool deadlines are exercised separately.
+    let fixture = Fixture::with_tool_timeout(60).await;
     let runtime = fixture.runtime().await;
     let finished = |session: &'static str, prompt: String| {
         let runtime = runtime.clone();

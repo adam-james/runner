@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
@@ -14,6 +16,7 @@ use runner::{
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 #[derive(Default)]
 struct FakeExecutor {
@@ -57,7 +60,10 @@ impl Executor for FakeExecutor {
             if run.prompt == "wait" {
                 futures_util::future::pending::<()>().await;
             }
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            // Exercise terminal-write retries after execution outlasts the old
+            // 300 ms fault-injection window.
+            let delay = if run.prompt == "slow finish" { 400 } else { 80 };
+            tokio::time::sleep(Duration::from_millis(delay)).await;
             if run.prompt == "fail" {
                 bail!("private provider failure: SECRET");
             }
@@ -81,6 +87,7 @@ struct Harness {
     _dir: tempfile::TempDir,
     db: Database,
     executor: Arc<FakeExecutor>,
+    logs: support::Capture,
     client: Client,
     url: String,
     stop: CancellationToken,
@@ -94,12 +101,11 @@ impl Harness {
         let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
         let executor = Arc::new(FakeExecutor::default());
         let stop = CancellationToken::new();
-        let worker = tokio::spawn(worker(
-            db.clone(),
-            executor.clone(),
-            concurrency,
-            stop.clone(),
-        ));
+        let logs = support::Capture::default();
+        let worker = tokio::spawn(
+            worker(db.clone(), executor.clone(), concurrency, stop.clone())
+                .with_subscriber(logs.subscriber()),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let service = Service::new(
@@ -126,6 +132,7 @@ impl Harness {
             _dir: dir,
             db,
             executor,
+            logs,
             client: Client::builder().no_proxy().build().unwrap(),
             url,
             stop,
@@ -417,10 +424,23 @@ async fn failed_terminal_writes_are_retried_and_release_the_session() {
     let session =
         h.db.create_session(Some("stuck".into()), "default".into())
             .unwrap();
-    let broken = h.submit(Some(&session.id), "hello", 5).await;
+    let broken = h.submit(Some(&session.id), "slow finish", 5).await;
     let later = h.submit(Some(&session.id), "later", 5).await;
     h.wait_status(&broken.id, "running").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Keep the trigger installed until both the terminal write and the
+    // worker's fallback have failed. A fixed delay can expire before execution
+    // finishes on a busy machine, allowing the run to complete successfully.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !h
+            .logs
+            .text()
+            .contains("could not mark run failed; will retry")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker did not reach the failed-write retry path");
     assert_eq!(h.db.run(&broken.id).unwrap().unwrap().status, "running");
     assert_eq!(h.db.run(&later.id).unwrap().unwrap().status, "queued");
     sqlite.execute_batch("DROP TRIGGER fail_finish").unwrap();
