@@ -119,7 +119,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | Method and route | Input / behavior |
 | --- | --- |
 | `GET /v1/agents` | List agent definitions, sorted by name, as `[{"name": "default", "provider": "openai", "model": "gpt-5", "tools": ["get_scores"]}, ...]` |
-| `GET /v1/agent-versions/{id}` | What runs of an agent version were allowed: `{"id", "agent", "first_seen_at", "definition"}`; 404 if no run has used it and no schedule was approved for it |
+| `GET /v1/agent-versions/{id}` | What runs of an agent version were allowed: `{"id", "agent", "first_seen_at", "definition"}`; 404 if no daemon using this data directory has loaded it |
 | `POST /v1/sessions` | `{ "id": "optional-name", "agent": "default" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
@@ -243,8 +243,9 @@ rules. Statuses are `active`, `paused`, `done` (fired) and `deleted`.
 
 A schedule is pinned to agent versions: its agent's and those of every agent
 it can reach by delegating, transitively, since a version names delegates
-only by name (`host::version::pin`). Creating or approving it stores those
-versions' definitions, so what it was approved for can be read back after the
+only by name (`host::version::pin`). The daemon stores every agent's current
+version when it starts, so both what a schedule was approved for and what it
+would run with now can be read with `runner agents version`, even after the
 config changes. Because the config only changes when the daemon restarts, the
 pin is checked:
 

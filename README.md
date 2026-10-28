@@ -238,8 +238,9 @@ them, the schedule pauses instead of running, so an edit made for chat can't
 quietly widen what an unattended run can do. The check happens when the
 daemon starts, when the schedule falls due, and again just before its run
 starts, so a run queued before a restart can't start under the new config.
-`list` and `show` name the changed agents. Look at what changed with
-`runner agents version ID`, then:
+`list` and `show` name the changed agents. `runner agents list` shows each
+agent's current version, and `runner agents version ID` shows what any version
+allows, old or current, so you can compare the two before approving:
 
 ```bash
 runner schedules approve ID   # pin it to the current versions and make it active

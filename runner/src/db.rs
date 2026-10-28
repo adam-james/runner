@@ -94,7 +94,7 @@ pub struct Event {
 pub struct AgentVersion {
     pub id: String,
     pub agent: String,
-    /// When a run first used it or a schedule was approved for it.
+    /// When a daemon first loaded it, or a run first used it.
     pub first_seen_at: i64,
     pub definition: Value,
 }
@@ -706,6 +706,16 @@ impl Database {
         append_event(&tx, id, data)?;
         tx.commit()?;
         self.notify(id);
+        Ok(())
+    }
+
+    /// Stores each of `versions` that isn't stored yet: the daemon's
+    /// current ones at startup, so each can be read before anything uses it.
+    pub fn store_agent_versions(&self, versions: &[host::version::AgentVersion]) -> Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        store_versions(&tx, versions)?;
+        tx.commit()?;
         Ok(())
     }
 

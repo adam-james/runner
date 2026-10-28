@@ -2211,3 +2211,50 @@ async fn a_schedule_pin_covers_delegates_and_a_scheduled_run_executes_when_it_ho
     stop.cancel();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn every_current_agent_version_is_readable_before_any_run_uses_it() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("versions");
+    let daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let agents = client.agents().await.unwrap();
+    assert!(client.runs(None).await.unwrap().is_empty());
+    for agent in &agents {
+        let version = client.agent_version(&agent.version).await.unwrap();
+        assert_eq!(version.agent, agent.name);
+        assert_eq!(version.definition["agent"], agent.name.as_str());
+    }
+    drop(daemon);
+    // After a config edit and a restart, the new version is readable too,
+    // and the old one is kept.
+    let old = agents
+        .iter()
+        .find(|a| a.name == "default")
+        .unwrap()
+        .version
+        .clone();
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replacen("[agents.default]", "[agents.default]\nmax_tokens = 77", 1),
+    )
+    .unwrap();
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let new = client
+        .agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "default")
+        .unwrap()
+        .version;
+    assert_ne!(new, old);
+    assert_eq!(
+        client.agent_version(&new).await.unwrap().definition["max_tokens"],
+        77
+    );
+    assert!(client.agent_version(&old).await.is_ok());
+}

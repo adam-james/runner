@@ -1126,6 +1126,11 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     .await??;
     let runtime = host::Runtime::new(config).await?;
     runtime.check_dirs_exclude(data_dir)?;
+    // Every current version, so each can be read, e.g. to review it before
+    // approving a schedule for it, before any run has used it.
+    let versions: Vec<_> = runtime.agent_versions().into_values().collect();
+    db.blocking(move |db| db.store_agent_versions(&versions))
+        .await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {
