@@ -220,7 +220,7 @@ impl Capabilities {
         lines.push(format!("  {:<10} {}", "limits", self.limits()));
         if self.imports_interface("wasi:sockets") {
             lines.push(format!(
-                "  {:<10} imports wasi:sockets, but the host allows no socket connections",
+                "  {:<10} imports wasi:sockets, which isn't linked: any use is refused and recorded",
                 "sockets"
             ));
         }

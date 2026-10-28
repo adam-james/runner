@@ -2,6 +2,7 @@ mod activity;
 mod audit;
 pub mod delegation;
 pub mod inspect;
+mod linking;
 pub mod trails;
 mod transcript;
 pub mod version;
@@ -620,6 +621,12 @@ impl ResourceLimiter for AuditedLimits {
     }
 }
 
+impl wasmtime_wasi_io::IoView for SandboxState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
 impl WasiView for SandboxState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -639,9 +646,9 @@ impl WasiHttpView for SandboxState {
     }
 }
 
-/// Loads a provider or tool component, with WASI plus `wasi:http` (both the
-/// 0.2 and 0.3 versions) linked in and its outbound requests restricted to
-/// its own allow-list.
+/// Loads a provider or tool component, linking only the WASI its config
+/// grants (see `linking`), with its outbound requests restricted to its own
+/// allow-list.
 fn load_sandboxed(
     runtime: &Runtime,
     config: &ComponentConfig,
@@ -650,10 +657,7 @@ fn load_sandboxed(
     let component = runtime.component(&config.path)?;
 
     let mut linker = Linker::<SandboxState>::new(&runtime.engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
+    linking::link(&runtime.engine, &mut linker, &component, config)?;
 
     Ok((
         component,

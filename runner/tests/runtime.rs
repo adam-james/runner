@@ -194,6 +194,26 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
             .contains("host-only-fixture-key")
     );
     assert!(!fixture.dir.path().join("tools/changed.txt").exists());
+    // Sockets aren't linked: the attempt is refused like before, but now the
+    // trail says so, and the tool carries on.
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "audit" && e["action"] == "capability.denied")
+        .collect();
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(
+        denied[0]["interface"],
+        "wasi:sockets/tcp-create-socket@0.2.12"
+    );
+    assert_eq!(denied[0]["function"], "create-tcp-socket");
+    assert_eq!(
+        (
+            denied[0]["decision"].as_str(),
+            denied[0]["outcome"].as_str()
+        ),
+        (Some("denied"), Some("refused"))
+    );
+    assert_eq!(denied[0]["component"]["name"], "fixture");
 }
 
 async fn wait(db: &Database, id: &str, state: &str) -> Run {
