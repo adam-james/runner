@@ -22,10 +22,10 @@ use crate::summary::{Alert, Summary};
 /// How often ended runs are looked for.
 const TICK: Duration = Duration::from_secs(1);
 
-/// When runs notify: `all` of them, only `problems` (a run that failed or
-/// was interrupted, or raised an alert), or `never`. A cancelled run never
-/// does, since someone cancelled it. A run's own level wins, then its
-/// schedule's, then `problems`.
+/// When runs notify: `all` of them, only `problems` (a run that didn't
+/// complete, i.e. failed, was interrupted or was cancelled, or that raised an
+/// alert), or `never`. A run's own level wins, then its schedule's, then
+/// `problems`.
 pub const LEVELS: &[&str] = &["all", "problems", "never"];
 
 pub fn default_level() -> String {
@@ -45,7 +45,7 @@ pub struct Note {
     /// The run's schedule, if it's a scheduled run.
     pub schedule_id: Option<String>,
     pub agent: String,
-    /// The run's status: `completed`, `failed` or `interrupted`.
+    /// The run's status: `completed`, `failed`, `interrupted` or `cancelled`.
     pub status: String,
     pub duration_ms: Option<u64>,
     pub alerts: Vec<Alert>,
@@ -66,12 +66,11 @@ pub fn note(
         .or(schedule.map(|s| s.notify.as_str()))
         .unwrap_or("problems");
     let problem = run.status != "completed" || !summary.alerts.is_empty();
-    let wanted = run.status != "cancelled"
-        && match level {
-            "all" => true,
-            "never" => false,
-            _ => problem,
-        };
+    let wanted = match level {
+        "all" => true,
+        "never" => false,
+        _ => problem,
+    };
     wanted.then(|| Note {
         schedule_id: schedule.map(|s| s.id.clone()),
         agent: run.agent.clone(),
@@ -221,7 +220,7 @@ mod tests {
             ("completed", &["denied"][..], [true, true, false]),
             ("failed", &[][..], [true, true, false]),
             ("interrupted", &[][..], [true, true, false]),
-            ("cancelled", &["denied"][..], [false, false, false]),
+            ("cancelled", &[][..], [true, true, false]),
         ];
         for (status, alerts, wanted) in cases {
             for (level, wanted) in LEVELS.iter().zip(wanted) {

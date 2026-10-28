@@ -51,7 +51,7 @@ enum Command {
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
         /// When it notifies once it ends: all, problems (the default:
-        /// failed or interrupted, or with alerts) or never.
+        /// failed, interrupted or cancelled, or with alerts) or never.
         #[arg(long, value_parser = runner::notify::LEVELS.to_vec())]
         notify: Option<String>,
     },
@@ -181,8 +181,8 @@ enum Schedules {
         id: Option<String>,
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
-        /// When its runs notify: all of them, only problems (failed or
-        /// interrupted, or with alerts), or never.
+        /// When its runs notify: all of them, only problems (failed,
+        /// interrupted or cancelled, or with alerts), or never.
         #[arg(long, default_value = "problems", value_parser = runner::notify::LEVELS.to_vec())]
         notify: String,
     },

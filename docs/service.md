@@ -304,8 +304,8 @@ and whose delegation tree has ended too, so the summary is complete, and
 checks each once. Every top-level run counts, scheduled or not: the daemon
 assumes nobody is watching, since a client can be attached while nobody looks
 and alerts never show in chat. A level decides whether the run gets a
-notification: `all`, `problems` (status `failed` or `interrupted`, or any
-summary alert) or `never`; a `cancelled` run never does. The run's own level
+notification: `all`, `problems` (any status but `completed`, i.e. `failed`,
+`interrupted` or `cancelled`, or any summary alert) or `never`. The run's own level
 (`notify` on `POST /v1/runs`) wins, then its schedule's, then `problems`.
 Delegated runs aren't checked separately; their root's summary covers them. A
 notification stores only host-written fields: the schedule (if any), agent,

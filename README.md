@@ -278,9 +278,9 @@ runner notifications read 12      # or --all
 ```
 
 Which runs notify is a level: `all`, `problems` (the default: a run that
-failed or was interrupted, or raised an alert) or `never`. So a clean chat turn
-stays quiet, and one with a denied request doesn't. A cancelled run never
-notifies. A schedule sets the level for its runs with `--notify`, changed with
+didn't complete, because it failed, was interrupted or was cancelled, or that
+raised an alert) or `never`. So a clean chat turn stays quiet, and one with a
+denied request doesn't. A schedule sets the level for its runs with `--notify`, changed with
 `runner schedules notify ID LEVEL`, and a single run can set its own with
 `runner run --notify LEVEL`, e.g. `all` for a long detached job:
 

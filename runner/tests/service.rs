@@ -2118,12 +2118,15 @@ fn every_top_level_run_is_checked_whether_scheduled_or_not() {
     };
     let failed = ended("failed", None);
     ended("completed", None);
-    ended("cancelled", Some("all"));
+    let cancelled = ended("cancelled", None);
     let all = ended("completed", Some("all"));
     ended("failed", Some("never"));
     let stored = runner::notify::check_ended(&db).unwrap();
     let notified: Vec<_> = stored.iter().map(|n| n.run_id.as_str()).collect();
-    assert_eq!(notified, [failed.id.as_str(), all.id.as_str()]);
+    assert_eq!(
+        notified,
+        [failed.id.as_str(), cancelled.id.as_str(), all.id.as_str()]
+    );
     let n = &stored[0];
     assert_eq!(
         (&n.note.schedule_id, &n.note.schedule_status),
