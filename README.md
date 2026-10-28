@@ -304,10 +304,24 @@ credential headers held back, and problems with the trail itself. It leaves
 out the run's error text, which for a failed turn is the agent's own message
 and a prompt injection could steer. Hosts and tool names stay JSON-quoted.
 
+A summary leads with its alerts, what needs a person's attention:
+
+- `denied`: the host denied something, such as a request to a host the
+  component isn't allowed or memory past its limit.
+- `trail`: the audit trail is incomplete (see trail problems), so the rest of
+  the summary may be too. Raised once every run in the tree has ended, since
+  one still running always looks unfinished.
+- `new_host`: a scheduled run made an allowed request to a host that none of
+  its schedule's earlier runs, or the runs they delegated to, reached. A
+  schedule's first run sets the baseline, so it raises none.
+
 ```
 run 4c1e… (agent researcher, schedule brief): completed
 2 runs, 3 turns, 41.220s
 actions: http.request 9, provider.chat 4, sandbox.create 3, tool.call 3, turn.finished 3, turn.started 3
+
+alerts (1):
+  denied: the host denied 1 action
 
 hosts:
   provider "anthropic" → "api.anthropic.com": 4 allowed, 0 denied
