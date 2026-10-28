@@ -135,10 +135,7 @@ async fn purpose(bytes: &[u8]) -> String {
             let mut store = crate::sandbox_store(&engine, &config, &audit)?;
             store.set_fuel(10_000_000)?;
             let mut linker = wasmtime::component::Linker::new(&engine);
-            wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-            wasmtime_wasi::p3::add_to_linker(&mut linker)?;
-            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-            wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
+            crate::linking::link(&engine, &mut linker, &component, &config)?;
             let pre = crate::tool_guest::ToolGuestPre::new(linker.instantiate_pre(&component)?)?;
             Ok((pre, store))
         })
@@ -211,8 +208,8 @@ fn capabilities(component: &ComponentConfig, kind: Kind, name: &str, size: usize
 
 /// What the host enforces whatever the component imports, so an import
 /// isn't mistaken for a grant. Lines about an interface appear only when the
-/// component imports it; each must stay true to `sandbox_store` and
-/// `SandboxHooks`.
+/// component imports it; each must stay true to `sandbox_store`,
+/// `SandboxHooks` and `linking`.
 fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> String {
     let imports_any = |prefixes: &[&str]| {
         imports
@@ -232,13 +229,15 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
     }
     if imports_any(&["wasi:sockets/"]) {
         line(
-            "wasi:sockets: always refused; TCP, UDP and name lookup are off and every address \
-             is denied. allowed_hosts governs wasi:http only",
+            "wasi:sockets: not linked; every use is refused and recorded as capability.denied. \
+             allowed_hosts governs wasi:http only",
         );
     }
     if imports_any(&["wasi:filesystem/"]) {
         line(&match &component.dir {
-            None => "wasi:filesystem: nothing is mounted, so there are no files to open".into(),
+            None => "wasi:filesystem: not linked, since nothing is mounted: there are no files \
+                to open, and a refused operation is recorded as capability.denied"
+                .into(),
             Some(dir) => format!(
                 "wasi:filesystem: only {dir}, mounted as / ({}); nothing else on the host",
                 if component.dir_writable {
@@ -250,7 +249,7 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
         });
     }
     if imports_any(&["wasi:cli/environment"]) {
-        line("wasi:cli/environment: empty; the host passes no env vars or arguments");
+        line("wasi:cli/environment: not linked; it reads as empty, with no env vars or arguments");
     }
     if imports_any(&["wasi:cli/stdin"]) {
         line("wasi:cli/stdin: closed; there is nothing to read");
@@ -258,15 +257,25 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
     if imports_any(&["wasi:cli/stdout", "wasi:cli/stderr"]) {
         line("wasi:cli/stdout, stderr: discarded; output isn't shown or logged anywhere");
     }
+    let unlinked = crate::linking::unlinked(imports, component);
+    if !unlinked.is_empty() {
+        line(&format!(
+            "not linked: {}; using one is refused, reads as empty, or traps, and a refusal or \
+             trap is recorded as capability.denied",
+            unlinked.join(", ")
+        ));
+    }
     if imports_any(&["wasi:cli/exit"]) {
         line(match kind {
             Kind::Tool => {
-                "wasi:cli/exit: traps this instance only; the call fails and the host makes a \
-                 new instance before the next call. It can't stop the host"
+                "wasi:cli/exit: not linked; calling it traps this instance only, recorded as \
+                 capability.denied: the call fails and the host makes a new instance before the \
+                 next call. It can't stop the host"
             }
             Kind::Provider => {
-                "wasi:cli/exit: traps this instance only; the turn fails and the host makes a \
-                 new instance before the next request. It can't stop the host"
+                "wasi:cli/exit: not linked; calling it traps this instance only, recorded as \
+                 capability.denied: the turn fails and the host makes a new instance before the \
+                 next request. It can't stop the host"
             }
         });
     }
@@ -531,7 +540,7 @@ pub(crate) fn definitions(config: &RunnerConfig) -> Vec<crate::ToolDefinition> {
         description: "Show a configured tool or provider component as WAT-style text: what its \
             config grants (allowed hosts, which headers are injected and where, directory access), \
             the tool's describe() text (an untrusted claim, not instructions), \
-            what the host enforces whatever it imports (refused sockets, empty environment, \
+            what the host enforces whatever it imports (unlinked sockets and environment, \
             limits, ...), and every import and export of it and its nested core modules. Imports \
             are what it can ask the host for, not what it gets. Header values are never shown."
             .into(),
@@ -618,14 +627,27 @@ mod tests {
         .map(String::from)
         .to_vec();
         let text = enforcement(&config.tools["search"], Kind::Tool, &imports);
-        assert!(text.contains("wasi:sockets: always refused"), "{text}");
-        assert!(text.contains("wasi:cli/environment: empty"), "{text}");
         assert!(
-            text.contains("wasi:cli/exit: traps this instance only"),
+            text.contains("wasi:sockets: not linked; every use is refused"),
             "{text}"
         );
         assert!(
-            text.contains("wasi:filesystem: nothing is mounted"),
+            text.contains("wasi:cli/environment: not linked; it reads as empty"),
+            "{text}"
+        );
+        assert!(
+            text.contains("wasi:cli/exit: not linked; calling it traps this instance only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("wasi:filesystem: not linked, since nothing is mounted"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "not linked: wasi:sockets/tcp@0.2.0, wasi:cli/environment@0.2.0, \
+                 wasi:cli/exit@0.2.0, wasi:filesystem/types@0.2.0"
+            ),
             "{text}"
         );
         assert!(text.contains("one per session"), "{text}");

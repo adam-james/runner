@@ -159,8 +159,8 @@ For more than `runner tools inspect` shows, `runner tools wat NAME` prints a
 configured tool as WAT-style text, headed by
 what its config grants it: allowed hosts, which headers are injected and where
 (never their values) and directory access, then what the host enforces whatever
-the component imports: e.g. sockets are always refused, the environment is
-empty, and every call ends at its run's deadline. It reads the config and
+the component imports: e.g. sockets and the environment aren't linked, and
+every call ends at its run's deadline. It reads the config and
 component directly, so the daemon needn't be running. By default it lists every
 import and export of the component and its nested core modules, without code or
 data; imports are what the component can ask the host for.
@@ -320,9 +320,21 @@ runner runs summary RUN_ID        # what the run and its delegates did, at a gla
 The guests are what it's guarding against, so the host makes every record
 itself, at the points it controls: creating a component's sandbox (and
 mounting its `dir`, the whole of its filesystem access), each tool and model
-call, each outbound request whether allowed or refused, and each memory or
-table growth a limit refuses. Tool calls end `ok`, `error`, `trap`, `timeout`
-or `unknown_tool`. Components are named as the config names them, with the
+call, each outbound request whether allowed or refused, each memory or table
+growth a limit refuses, and each use of a WASI interface the component isn't
+granted (`capability.denied`). Tool calls end `ok`, `error`, `trap`, `timeout`
+or `unknown_tool`.
+
+A component gets only the WASI its config can grant: `wasi:http` (through the
+allow-list), `wasi:io`, `wasi:clocks`, `wasi:random`, an empty stdin and
+discarded stdout and stderr, and `wasi:filesystem` only when it has a `dir`.
+Nothing else is linked, so a component that imports, say, `wasi:sockets` still
+loads, but each use goes to a host stub. A call that can fail is refused the
+way a guest expects (`access-denied`), a query such as reading the environment
+gets an empty answer, and anything else traps. Refusals and traps are recorded
+as `capability.denied` with the interface and function, so they count as
+denials in [summaries](#audit-log) and raise alerts. The environment,
+arguments and working directory always read as empty. Components are named as the config names them, with the
 SHA-256 of the `.wasm` that was loaded.
 
 Records are metadata only. They never include prompts, tool input or
@@ -865,9 +877,10 @@ wasm-tools component wit "${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release/pyth
 ```
 
 The python tool imports no `wasi:http` at all. It does import
-`wasi:sockets`, as every componentize-py component does, but the host
-turns TCP, UDP and name lookups off for every component, so any socket is
-refused. `allowed_hosts` only governs `wasi:http`; no config grants sockets.
+`wasi:sockets`, as every componentize-py component does, but the host doesn't
+link it for any component: each use is refused and recorded as
+`capability.denied`. `allowed_hosts` only governs `wasi:http`; no config grants
+sockets.
 
 The daemon also refuses to start if any component's `dir` contains its data
 directory (`~/.runner/service` by default, with the local API token and
