@@ -147,8 +147,9 @@ enum Agents {
 
 #[derive(Subcommand)]
 enum Schedules {
-    /// Run a prompt once, at a local time or after a delay, in a fresh session.
-    #[command(group(clap::ArgGroup::new("when").required(true).args(["at", "delay"])))]
+    /// Run a prompt once, at a local time or after a delay, or on a cron
+    /// schedule, each time in a fresh session.
+    #[command(group(clap::ArgGroup::new("when").required(true).args(["at", "delay", "cron"])))]
     Add {
         prompt: String,
         /// When, e.g. 2026-10-29T07:00.
@@ -157,6 +158,10 @@ enum Schedules {
         /// How long from now instead, e.g. 2s, 5m or 1h30m.
         #[arg(long = "in", value_name = "DELAY", value_parser = runner::schedule::parse_delay)]
         delay: Option<u64>,
+        /// Recur on a cron expression instead, e.g. "0 7 * * MON-FRI":
+        /// minute, hour, day of month, month, day of week, in --tz.
+        #[arg(long)]
+        cron: Option<String>,
         /// An IANA time zone, e.g. Europe/Warsaw; this system's if omitted.
         #[arg(long)]
         tz: Option<String>,
@@ -394,6 +399,7 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
             prompt,
             at,
             delay,
+            cron,
             tz,
             agent,
             id,
@@ -401,16 +407,13 @@ async fn schedules(client: &Client, command: Schedules) -> Result<()> {
         } => {
             let tz = match tz {
                 Some(tz) => tz,
-                None => jiff::tz::TimeZone::system()
-                    .iana_name()
-                    .map(String::from)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("can't tell this system's time zone; pass --tz")
-                    })?,
+                None => iana_time_zone::get_timezone().map_err(|_| {
+                    anyhow::anyhow!("can't tell this system's time zone; pass --tz")
+                })?,
             };
             print(
                 &client
-                    .create_schedule(id, agent, prompt, at, delay, tz, deadline_secs)
+                    .create_schedule(id, agent, prompt, at, delay, cron, tz, deadline_secs)
                     .await?,
             )?
         }

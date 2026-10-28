@@ -1087,11 +1087,8 @@ impl Harness {
     /// Creates a schedule over the API due an hour from now, then makes it
     /// due already, as if that hour had passed.
     async fn due_schedule(&self, id: &str, prompt: &str) -> Value {
-        let at = jiff::Zoned::now()
-            .with_time_zone(jiff::tz::TimeZone::UTC)
-            .checked_add(jiff::Span::new().hours(1))
-            .unwrap()
-            .datetime()
+        let at = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%S")
             .to_string();
         let (status, schedule) = self
             .api(
@@ -1373,6 +1370,161 @@ async fn pausing_or_deleting_a_schedule_cancels_its_queued_occurrence() {
     h.close().await;
 }
 
+impl Harness {
+    /// Creates a schedule over the API that recurs every minute, in UTC.
+    async fn recurring_schedule(&self, id: &str, prompt: &str) -> Value {
+        let (status, schedule) = self
+            .api(
+                reqwest::Method::POST,
+                "/v1/schedules",
+                Some(json!({"id":id, "agent":"default", "prompt":prompt, "cron":"* * * * *", "tz":"UTC"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{schedule}");
+        schedule
+    }
+
+    /// What `id`'s history records, as `(kind, reason)` pairs.
+    async fn schedule_kinds(&self, id: &str) -> Vec<(String, Option<String>)> {
+        let (_, history) = self
+            .api(
+                reqwest::Method::GET,
+                &format!("/v1/schedules/{id}/history"),
+                None,
+            )
+            .await;
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["data"]["kind"].as_str().unwrap().to_owned(),
+                    e["data"]["reason"].as_str().map(String::from),
+                )
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn a_recurring_schedule_fires_each_occurrence_and_stays_active() {
+    let h = Harness::new(1).await;
+    let schedule = h.recurring_schedule("brief", "minutely brief").await;
+    assert_eq!(schedule["cron"], "* * * * *");
+    let first = schedule["next_fire_at"].as_i64().unwrap();
+    assert!(first > db_now() && first % 60_000 == 0, "{schedule}");
+    assert!(
+        schedule["at"].as_str().unwrap().ends_with(":00"),
+        "{schedule}"
+    );
+    for (n, due) in [first, first + 60_000].into_iter().enumerate() {
+        // Not due a millisecond early.
+        assert!(
+            h.db.fire_due(due - 1, &pin_of(&h.executor))
+                .unwrap()
+                .is_empty()
+        );
+        let run = h.db.fire_due(due, &pin_of(&h.executor)).unwrap().remove(0);
+        assert_eq!(run.prompt, "minutely brief");
+        let schedule = h.db.schedule("brief").unwrap().unwrap();
+        assert_eq!(
+            (schedule.status.as_str(), schedule.next_fire_at),
+            ("active", Some(due + 60_000)),
+            "occurrence {n}"
+        );
+        h.wait_status(&run.id, "completed").await;
+    }
+    // Each occurrence ran in a session of its own.
+    let sessions: std::collections::HashSet<_> =
+        h.db.runs(None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.session_id)
+            .collect();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        h.schedule_kinds("brief").await,
+        [
+            ("created".into(), None),
+            ("fired".into(), None),
+            ("fired".into(), None)
+        ]
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn a_recurring_schedule_skips_missed_occurrences_and_ones_its_last_run_overlaps() {
+    let h = Harness::new(1).await;
+    let blocker = h.submit(None, "wait", 60).await;
+    h.wait_status(&blocker.id, "running").await;
+    let first = h.recurring_schedule("brief", "brief").await["next_fire_at"]
+        .as_i64()
+        .unwrap();
+    // A few seconds late is still on time.
+    let run =
+        h.db.fire_due(first + 5_000, &pin_of(&h.executor))
+            .unwrap()
+            .remove(0);
+    // Its run is still queued behind the blocker when the next one is due.
+    assert!(
+        h.db.fire_due(first + 60_000, &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    h.db.cancel(&blocker.id).unwrap();
+    h.wait_status(&run.id, "completed").await;
+    // The daemon was stopped for ten minutes: nothing is made up, and the
+    // schedule picks up at the next occurrence after it starts.
+    let restarted = first + 60_000 * 11 + 30_000;
+    assert!(
+        h.db.fire_due(restarted, &pin_of(&h.executor))
+            .unwrap()
+            .is_empty()
+    );
+    let schedule = h.db.schedule("brief").unwrap().unwrap();
+    assert_eq!(schedule.next_fire_at, Some(first + 60_000 * 12));
+    assert_eq!(schedule.status, "active");
+    assert_eq!(
+        h.schedule_kinds("brief").await,
+        [
+            ("created".into(), None),
+            ("fired".into(), None),
+            ("skipped".into(), Some("previous run unfinished".into())),
+            ("skipped".into(), Some("missed".into())),
+        ]
+    );
+    assert_eq!(h.db.runs(None).unwrap().len(), 2);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn a_refused_recurring_run_moves_its_schedule_to_the_next_occurrence() {
+    let h = Harness::new(1).await;
+    let first = h.recurring_schedule("brief", "brief").await["next_fire_at"]
+        .as_i64()
+        .unwrap();
+    let blocker = h.submit(None, "wait", 60).await;
+    h.wait_status(&blocker.id, "running").await;
+    let run =
+        h.db.fire_due(first, &pin_of(&h.executor))
+            .unwrap()
+            .remove(0);
+    // A restart under an edited config, between enqueueing and starting.
+    h.executor
+        .versions
+        .lock()
+        .unwrap()
+        .insert("default".into(), "sha256:new".into());
+    h.db.cancel(&blocker.id).unwrap();
+    h.wait_status(&run.id, "failed").await;
+    let schedule = h.db.schedule("brief").unwrap().unwrap();
+    assert_eq!(schedule.status, "paused");
+    assert_eq!(schedule.next_fire_at, Some(first + 60_000));
+    h.close().await;
+}
+
 #[tokio::test]
 async fn schedules_need_a_known_agent_an_explicit_zone_and_a_future_time() {
     let h = Harness::new(1).await;
@@ -1391,6 +1543,15 @@ async fn schedules_need_a_known_agent_an_explicit_zone_and_a_future_time() {
         (with("at", json!("soon")), "invalid time"),
         (with("prompt", json!(" ")), "prompt"),
         (with("id", json!("../x")), "invalid schedule id"),
+        (with("cron", json!("0 7 * * *")), "give one of"),
+        (
+            json!({"agent":"default", "prompt":"p", "cron":"0 0 7 * * *", "tz":"UTC"}),
+            "invalid cron expression",
+        ),
+        (
+            json!({"agent":"default", "prompt":"p", "cron":"0 0 30 2 *", "tz":"UTC"}),
+            "never fires",
+        ),
     ] {
         let (status, error) = create(body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
@@ -1440,6 +1601,37 @@ fn a_version_6_database_gains_schedules_and_keeps_its_agent_versions() {
     );
     assert_eq!(db.run(&run.id).unwrap().unwrap().schedule_id, None);
     assert!(db.schedules().unwrap().is_empty());
+    drop(db);
+    assert!(Database::open(&path).is_ok());
+}
+
+#[test]
+fn a_version_7_database_keeps_its_one_off_schedules() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let db = Database::open(&path).unwrap();
+    db.create_schedule(
+        Some("brief".into()),
+        "default".into(),
+        "p".into(),
+        "2999-01-01T07:00:00".into(),
+        "UTC".into(),
+        None,
+        1,
+        60,
+        Default::default(),
+        &[],
+    )
+    .unwrap();
+    drop(db);
+    // What a daemon from before recurring schedules left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE schedules DROP COLUMN cron; PRAGMA user_version=7;")
+        .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    let schedule = db.schedule("brief").unwrap().unwrap();
+    assert_eq!((schedule.cron, schedule.next_fire_at), (None, Some(1)));
     drop(db);
     assert!(Database::open(&path).is_ok());
 }
