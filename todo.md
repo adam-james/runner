@@ -18,7 +18,7 @@ system; for narrower access, define a narrower agent.
   - done: include each tool's `describe()` text as a bounded, quoted, untrusted claim; execute it in a separate sandbox without network, credentials or files
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID` and `runner sessions audit SESSION_ID`
   - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
-  - next: retention beyond the run, a separate audit-read token, recording per-file access if the host ever mediates it (alerts are done; see section 2, step 3)
+  - next: retention beyond the run, a separate audit-read token (alerts are done, and capability linking replaces recording per-file access; see section 2, step 3)
   - threat model: malicious guest components; trust the runner and host to enforce policy and record activity
   - add structured, versioned events with event IDs, sequence numbers, actor/run/session identity, component version, action, policy decision, and outcome
   - record activity at host-controlled boundaries so guests cannot forge, suppress, or bypass records; bound and escape guest-controlled metadata
@@ -49,9 +49,16 @@ In order; each step ships something usable on its own.
      - next: store each background run's summary when it finishes, for notifications and for when audit retention prunes its records
    - ~~alerts on denials, trail gaps, and a host the schedule has never reached before~~ done: a summary's `alerts`, computed with it; a schedule's first run sets its host baseline, and trail alerts wait until the whole tree has ended
      - next: keep a table of each schedule's known hosts if comparing against every earlier run's audit records gets slow
+   - next: link only the WASI a component needs, so ungranted capabilities can't fail silently. Today every component gets all of WASI p2 and p3 (`add_to_linker_async`, host/src/lib.rs), with policy as wasmtime config; only `wasi:http` and limits are recorded, so a refused socket or a file outside `dir` shows up as a plain tool error with no denial or alert
+     - link explicitly: `wasi:http` (p2 and p3, through the existing allow-list hook), `wasi:io`, `wasi:clocks`, `wasi:random`, and `wasi:filesystem` only when `dir` is set
+     - unlink `wasi:cli` and `wasi:sockets` (sockets aren't needed for HTTP: the host makes the connection), and p3 sockets, filesystem, cli and random, which nothing imports; satisfy any import a component still has with a host stub (`Linker::define_unknown_imports_as_traps`, or our own) that records `capability.denied` with the interface and function, then traps or refuses
+     - check first: every component imports all of `wasi:cli` (from Rust std and CPython), and Python and the test fixture import `wasi:sockets`; find which are called in normal operation (CPython likely reads its environment and arguments at startup) and keep those inert rather than trapping
+     - wrap only what stays granted: record refused filesystem operations under a granted `dir` (escapes, writes to a read-only dir) as denials, and OS errors as errors; classify by wasi's error code at the host boundary, never from a guest's error text
+     - show each component's grants in every run's summary, from its agent version: sandboxes are reused across a session's turns, so only the first run's trail has `sandbox.create`, and with no `dir` a file attempt never reaches the host at all
+     - test that a component's environment is empty: "keys never enter the sandbox" rests on it
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
      - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks each scheduled run once its tree has ended; `--notify all|problems|never`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
-     - next: delivered as desktop notifications (macOS Notification Center, freedesktop on Linux) and listed in the TUI; opening one shows the run
+     - after capability linking: delivered as desktop notifications (macOS Notification Center, freedesktop on Linux) and listed in the TUI; opening one shows the run
      - approval requests (step 4) use the same channel
    - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule
    - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later
