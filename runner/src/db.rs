@@ -79,6 +79,17 @@ pub struct Event {
     pub data: Value,
 }
 
+/// An agent definition's version: what runs of it were allowed. See
+/// `host::version`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentVersion {
+    pub id: String,
+    pub agent: String,
+    /// When a run first used it.
+    pub first_used_at: i64,
+    pub definition: Value,
+}
+
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -211,7 +222,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 5 {
+        if version > 6 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -293,6 +304,29 @@ impl Database {
                     json!({"kind":"status","status":"failed","error":error}),
                 )?;
             }
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = conn.unchecked_transaction()?;
+            // What each run was allowed, kept apart from the config, which
+            // can change after the run. A version is stored once however many
+            // runs use it, and never changes: its id is its snapshot's hash.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_versions (id TEXT PRIMARY KEY,
+                     agent TEXT NOT NULL, first_used_at INTEGER NOT NULL,
+                     definition TEXT NOT NULL);",
+            )?;
+            let linked: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name='agent_version')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !linked {
+                tx.execute_batch(
+                    "ALTER TABLE runs ADD COLUMN agent_version TEXT REFERENCES agent_versions(id);",
+                )?;
+            }
+            tx.execute_batch("PRAGMA user_version=6;")?;
             tx.commit()?;
         }
         Ok(Self(
@@ -501,6 +535,70 @@ impl Database {
         tx.commit()?;
         self.notify(id);
         Ok(())
+    }
+
+    /// Stores agent version `version` (if it's new) and links run `id` to it.
+    pub fn record_agent_version(
+        &self,
+        id: &str,
+        version: &str,
+        agent: &str,
+        definition: &Value,
+    ) -> Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_versions (id, agent, first_used_at, definition)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![version, agent, now(), definition.to_string()],
+        )?;
+        tx.execute(
+            "UPDATE runs SET agent_version=?2 WHERE id=?1",
+            params![id, version],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn agent_version(&self, id: &str) -> Result<Option<AgentVersion>> {
+        let conn = self.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT agent, first_used_at, definition FROM agent_versions WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(agent, first_used_at, definition)| {
+            Ok(AgentVersion {
+                id: id.to_string(),
+                agent,
+                first_used_at,
+                definition: serde_json::from_str(&definition)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// The agent version run `id` ran with, once it has started.
+    pub fn run_agent_version(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT agent_version FROM runs WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn audit_event(&self, id: &str, data: Value) -> Result<()> {

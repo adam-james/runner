@@ -640,6 +640,7 @@ mod tests {
             delegates: vec![],
             max_tokens: host::DEFAULT_MAX_TOKENS,
             max_model_calls: None,
+            version: String::new(),
             tool_access: [(
                 "get_weather".to_string(),
                 "can reach api.open-meteo.com; no filesystem access".to_string(),
