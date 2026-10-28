@@ -559,7 +559,7 @@ fn a_version_1_database_gains_transcripts_and_keeps_its_runs() {
         "ALTER TABLE sessions DROP COLUMN agent;
         DROP TABLE transcripts;
         DROP TABLE run_results;
-        DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
+        DROP INDEX runs_by_parent; DROP INDEX runs_by_root; DROP INDEX runs_to_notify;
         ALTER TABLE runs DROP COLUMN parent_run_id;
         ALTER TABLE runs DROP COLUMN root_run_id;
         ALTER TABLE runs DROP COLUMN depth;
@@ -1584,7 +1584,9 @@ fn a_version_6_database_gains_schedules_and_keeps_its_agent_versions() {
     // What a daemon from before schedules left behind.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP INDEX runs_by_occurrence;
+        "DROP TABLE notifications; DROP INDEX runs_to_notify;
+         ALTER TABLE runs DROP COLUMN notify_checked;
+         DROP INDEX runs_by_occurrence;
          ALTER TABLE runs DROP COLUMN occurrence_id;
          ALTER TABLE runs DROP COLUMN pinned_versions;
          ALTER TABLE runs DROP COLUMN schedule_id;
@@ -1617,6 +1619,7 @@ fn a_version_7_database_keeps_its_one_off_schedules() {
         "2999-01-01T07:00:00".into(),
         "UTC".into(),
         None,
+        "problems".into(),
         1,
         60,
         Default::default(),
@@ -1862,6 +1865,7 @@ fn a_schedules_known_hosts_include_its_delegates_and_only_allowed_requests() {
         "2999-01-01T07:00:00".into(),
         "UTC".into(),
         Some("* * * * *".into()),
+        "problems".into(),
         1,
         60,
         Default::default(),
@@ -1900,4 +1904,313 @@ fn a_schedules_known_hosts_include_its_delegates_and_only_allowed_requests() {
             .unwrap(),
         ["api.tavily.com".to_string(), "docs.rs".to_string()].into()
     );
+}
+
+/// A database with a schedule `brief` that recurs every minute and
+/// notifies at `notify`.
+fn notifying_schedule(notify: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    db.create_schedule(
+        Some("brief".into()),
+        "default".into(),
+        "p".into(),
+        "2999-01-01T07:00:00".into(),
+        "UTC".into(),
+        Some("* * * * *".into()),
+        notify.into(),
+        1,
+        60,
+        Default::default(),
+        &[],
+    )
+    .unwrap();
+    (dir, db)
+}
+
+/// Fires `brief`'s next occurrence and starts its run.
+fn start_occurrence(db: &Database) -> Run {
+    let due = db.schedule("brief").unwrap().unwrap().next_fire_at.unwrap();
+    let run = db
+        .fire_due(due, &|_| Some(Default::default()))
+        .unwrap()
+        .remove(0);
+    assert_eq!(db.claim().unwrap().unwrap().id, run.id);
+    run
+}
+
+#[test]
+fn a_scheduled_run_is_checked_once_its_whole_tree_has_ended() {
+    let (_dir, db) = notifying_schedule("all");
+    let run = start_occurrence(&db);
+    let child = db.delegate(&run.id, "default", "child", None).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    db.finish(&run.id, "completed", None).unwrap();
+    // Its child is still winding down, and may yet add records.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    db.finish(&child.id, "cancelled", None).unwrap();
+    let stored = runner::notify::check_ended(&db).unwrap();
+    assert_eq!(stored.len(), 1);
+    let n = &stored[0];
+    assert_eq!((n.run_id.as_str(), n.read_at), (run.id.as_str(), None));
+    assert_eq!(
+        (
+            n.note.schedule_id.as_deref(),
+            n.note.status.as_str(),
+            n.note.schedule_status.as_deref()
+        ),
+        (Some("brief"), "completed", Some("active"))
+    );
+    // Each run is checked once.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    assert_eq!(db.notifications(false, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_schedules_level_decides_which_runs_notify() {
+    for (notify, wanted) in [("all", 2), ("problems", 1), ("never", 0)] {
+        let (_dir, db) = notifying_schedule(notify);
+        let ok = start_occurrence(&db);
+        // A completed run without records would raise a trail alert.
+        audited_turn(&db, &ok.id, &[]);
+        db.finish(&ok.id, "completed", None).unwrap();
+        let failed = start_occurrence(&db);
+        db.finish(&failed.id, "failed", Some("Click https://evil.example"))
+            .unwrap();
+        let stored = runner::notify::check_ended(&db).unwrap();
+        assert_eq!(stored.len(), wanted, "{notify}");
+        let text = serde_json::to_string(&stored).unwrap();
+        assert!(!text.contains("evil.example"), "{text}");
+        // Checked runs stay checked whatever they got.
+        assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn notifications_are_listed_newest_first_until_read() {
+    let h = Harness::new(1).await;
+    let first = h.recurring_schedule("brief", "brief").await["next_fire_at"]
+        .as_i64()
+        .unwrap();
+    let (status, schedule) = h
+        .api(
+            reqwest::Method::POST,
+            "/v1/schedules/brief/notify",
+            Some(json!({"notify":"all"})),
+        )
+        .await;
+    assert_eq!(
+        (status, schedule["notify"].as_str()),
+        (StatusCode::OK, Some("all"))
+    );
+    for due in [first, first + 60_000] {
+        let run = h.db.fire_due(due, &pin_of(&h.executor)).unwrap().remove(0);
+        h.wait_status(&run.id, "completed").await;
+    }
+    assert_eq!(runner::notify::check_ended(&h.db).unwrap().len(), 2);
+    let list = |query: &'static str| h.api(reqwest::Method::GET, query, None);
+    let (status, unread) = list("/v1/notifications?unread=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = unread
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.len() == 2 && ids[0] > ids[1], "{unread}");
+    assert_eq!(unread[0]["status"], "completed");
+    assert_eq!(unread[0]["schedule_id"], "brief");
+    let harness = &h;
+    let read = |path: String| async move { harness.api(reqwest::Method::POST, &path, None).await };
+    let (_, marked) = read(format!("/v1/notifications/{}/read", ids[0])).await;
+    assert_eq!(marked, json!({"marked":1}));
+    let (_, marked) = read(format!("/v1/notifications/{}/read", ids[0])).await;
+    assert_eq!(marked, json!({"marked":0}));
+    assert_eq!(
+        list("/v1/notifications?unread=true")
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, marked) = read("/v1/notifications/read".into()).await;
+    assert_eq!(marked, json!({"marked":1}));
+    assert_eq!(list("/v1/notifications?unread=true").await.1, json!([]));
+    let (_, all) = list("/v1/notifications").await;
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["read_at"].is_i64()),
+        "{all}"
+    );
+    assert_eq!(
+        read("/v1/notifications/999/read".into()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        list("/v1/notifications?limit=0").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, _) = h
+        .api(
+            reqwest::Method::POST,
+            "/v1/schedules/brief/notify",
+            Some(json!({"notify":"sometimes"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let kinds = h.schedule_kinds("brief").await;
+    assert!(
+        kinds.contains(&("notify_changed".into(), None)),
+        "{kinds:?}"
+    );
+    h.close().await;
+}
+
+#[test]
+fn a_version_8_database_counts_its_runs_as_already_checked() {
+    let (dir, db) = notifying_schedule("all");
+    let run = start_occurrence(&db);
+    db.finish(&run.id, "failed", None).unwrap();
+    drop(db);
+    let path = dir.path().join("state.sqlite3");
+    // What a daemon from before notifications left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE notifications; DROP INDEX runs_to_notify;
+         ALTER TABLE runs DROP COLUMN notify_checked;
+         ALTER TABLE schedules DROP COLUMN notify;
+         PRAGMA user_version=8;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schedule("brief").unwrap().unwrap().notify, "problems");
+    // Upgrading doesn't notify about runs that ended before it.
+    assert!(runner::notify::check_ended(&db).unwrap().is_empty());
+    drop(db);
+    assert!(Database::open(&path).is_ok());
+}
+
+#[test]
+fn every_top_level_run_is_checked_whether_scheduled_or_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    // Ends a fresh run with `status`, a complete trail and, optionally, a
+    // level of its own.
+    let ended = |status: &str, notify: Option<&str>| {
+        db.submit_notifying(
+            None,
+            "default".into(),
+            "p".into(),
+            60,
+            notify.map(String::from),
+        )
+        .unwrap();
+        let run = db.claim().unwrap().unwrap();
+        audited_turn(&db, &run.id, &[]);
+        db.finish(&run.id, status, Some("Click https://evil.example"))
+            .unwrap();
+        run
+    };
+    let failed = ended("failed", None);
+    ended("completed", None);
+    let cancelled = ended("cancelled", None);
+    let all = ended("completed", Some("all"));
+    ended("failed", Some("never"));
+    let stored = runner::notify::check_ended(&db).unwrap();
+    let notified: Vec<_> = stored.iter().map(|n| n.run_id.as_str()).collect();
+    assert_eq!(
+        notified,
+        [failed.id.as_str(), cancelled.id.as_str(), all.id.as_str()]
+    );
+    let n = &stored[0];
+    assert_eq!(
+        (&n.note.schedule_id, &n.note.schedule_status),
+        (&None, &None)
+    );
+    assert_eq!(
+        runner::notify::title(&n.note),
+        "run (agent default): failed"
+    );
+    assert!(
+        !serde_json::to_string(&stored)
+            .unwrap()
+            .contains("evil.example")
+    );
+    // A delegated child is covered by its parent's notification.
+    db.submit(None, "default".into(), "parent".into(), 60)
+        .unwrap();
+    let parent = db.claim().unwrap().unwrap();
+    let child = db.delegate(&parent.id, "default", "child", None).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    db.finish(&child.id, "failed", None).unwrap();
+    db.finish(&parent.id, "failed", None).unwrap();
+    let stored = runner::notify::check_ended(&db).unwrap();
+    let notified: Vec<_> = stored.iter().map(|n| n.run_id.as_str()).collect();
+    assert_eq!(notified, [parent.id.as_str()]);
+    assert!(
+        db.submit_notifying(None, "default".into(), "p".into(), 60, Some("loud".into()))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_submitted_run_takes_its_own_level() {
+    let h = Harness::new(1).await;
+    let submit = |notify: Value| {
+        h.api(
+            reqwest::Method::POST,
+            "/v1/runs",
+            Some(json!({"prompt":"hello", "notify":notify})),
+        )
+    };
+    let (status, run) = submit(json!("all")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let run = h
+        .wait_status(run["id"].as_str().unwrap(), "completed")
+        .await;
+    audited_turn(&h.db, &run.id, &[]);
+    let stored = runner::notify::check_ended(&h.db).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].run_id, run.id);
+    let (status, error) = submit(json!("loud")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    h.close().await;
+}
+
+#[test]
+fn a_delegated_run_that_fails_under_a_completed_parent_notifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    db.submit(None, "default".into(), "parent".into(), 60)
+        .unwrap();
+    let parent = db.claim().unwrap().unwrap();
+    let child = db.delegate(&parent.id, "default", "child", None).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    audited_turn(&db, &parent.id, &[]);
+    audited_turn(&db, &child.id, &[]);
+    db.finish(&child.id, "failed", None).unwrap();
+    db.finish(&parent.id, "completed", None).unwrap();
+    let stored = runner::notify::check_ended(&db).unwrap();
+    assert_eq!(stored.len(), 1);
+    let n = &stored[0];
+    assert_eq!(n.run_id, parent.id);
+    assert_eq!(n.note.status, "completed");
+    assert_eq!(
+        n.note.delegated_not_completed,
+        [runner::summary::RunEnd {
+            run_id: child.id.clone(),
+            status: "failed".into()
+        }]
+    );
+    assert_eq!(
+        runner::notify::title(&n.note),
+        "run (agent default): completed, 1 delegated run didn't complete"
+    );
+    let summary = db.summary(&parent.id).unwrap().unwrap();
+    assert_eq!(summary.not_completed.len(), 1);
 }

@@ -2186,6 +2186,7 @@ async fn a_schedule_pin_covers_delegates_and_a_scheduled_run_executes_when_it_ho
         "2999-01-01T00:00:00".into(),
         "UTC".into(),
         None,
+        "problems".into(),
         1,
         10,
         edited.pin("coordinator").unwrap(),

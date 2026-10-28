@@ -122,6 +122,9 @@ pub struct Schedule {
     /// `active`, `paused`, `done` (a one-off that fired, or a recurring
     /// schedule with no occurrences left) or `deleted`.
     pub status: String,
+    /// When its runs notify the user; see `crate::notify::LEVELS`.
+    #[serde(default = "crate::notify::default_level")]
+    pub notify: String,
     /// What its runs may use; see `host::version::pin`.
     pub pinned_versions: Pin,
     pub paused_reason: Option<String>,
@@ -130,6 +133,17 @@ pub struct Schedule {
     /// by the service against its current config, not stored.
     #[serde(default)]
     pub changed_agents: Vec<String>,
+}
+
+/// A note for the user about a top-level run that ended, kept until read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: i64,
+    pub run_id: String,
+    pub created_at: i64,
+    pub read_at: Option<i64>,
+    #[serde(flatten)]
+    pub note: crate::notify::Note,
 }
 
 /// Why a scheduled occurrence was refused or its schedule paused, shown to
@@ -205,11 +219,12 @@ fn read_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         paused_reason: row.get(9)?,
         created_at: row.get(10)?,
         cron: row.get(11)?,
+        notify: row.get(12)?,
         changed_agents: Vec::new(),
     })
 }
 
-const SCHEDULE_COLUMNS: &str = "id, agent, prompt, at, tz, next_fire_at, deadline_secs, status, pinned_versions, paused_reason, created_at, cron";
+const SCHEDULE_COLUMNS: &str = "id, agent, prompt, at, tz, next_fire_at, deadline_secs, status, pinned_versions, paused_reason, created_at, cron, notify";
 
 /// Appends to a schedule's history: what was done to it and what it did.
 fn schedule_event(tx: &Connection, id: &str, data: Value) -> Result<()> {
@@ -358,7 +373,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 8 {
+        if version > 9 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -517,6 +532,40 @@ impl Database {
             tx.execute_batch("PRAGMA user_version=8;")?;
             tx.commit()?;
         }
+        if version < 9 {
+            let tx = conn.unchecked_transaction()?;
+            // Notifications: what each top-level run did, for the user, kept
+            // until read. A run is checked for one once, after its tree has
+            // ended; runs from before this step count as checked, so
+            // upgrading doesn't notify about old runs. A run may override
+            // its level (`runs.notify`); otherwise its schedule's applies,
+            // or `problems`.
+            if !has_column(&tx, "schedules", "notify")? {
+                tx.execute_batch(
+                    "ALTER TABLE schedules ADD COLUMN notify TEXT NOT NULL DEFAULT 'problems';",
+                )?;
+            }
+            if !has_column(&tx, "runs", "notify_checked")? {
+                tx.execute_batch(
+                    "ALTER TABLE runs ADD COLUMN notify_checked INTEGER NOT NULL DEFAULT 0;
+                     UPDATE runs SET notify_checked=1;",
+                )?;
+            }
+            if !has_column(&tx, "runs", "notify")? {
+                tx.execute_batch("ALTER TABLE runs ADD COLUMN notify TEXT;")?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS runs_to_notify ON runs(id)
+                     WHERE notify_checked=0 AND parent_run_id IS NULL;
+                 CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+                     created_at INTEGER NOT NULL, read_at INTEGER, data TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS unread_notifications ON notifications(id)
+                     WHERE read_at IS NULL;
+                 PRAGMA user_version=9;",
+            )?;
+            tx.commit()?;
+        }
         Ok(Self(
             Arc::new(Mutex::new(conn)),
             Arc::new(Signals {
@@ -587,6 +636,22 @@ impl Database {
         prompt: String,
         deadline_secs: u64,
     ) -> Result<Run> {
+        self.submit_notifying(session_id, agent, prompt, deadline_secs, None)
+    }
+
+    /// Like `submit`, with the run's own notification level, if it has one;
+    /// see `crate::notify::LEVELS`.
+    pub fn submit_notifying(
+        &self,
+        session_id: Option<String>,
+        agent: String,
+        prompt: String,
+        deadline_secs: u64,
+        notify: Option<String>,
+    ) -> Result<Run> {
+        if let Some(level) = &notify {
+            crate::notify::check_level(level)?;
+        }
         if prompt.trim().is_empty() || prompt.len() > 256 * 1024 {
             bail!("prompt must contain 1–262144 bytes");
         }
@@ -646,8 +711,8 @@ impl Database {
             cancel_requested: false,
             error: None,
         };
-        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs, root_run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?1)",
-            params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs])?;
+        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs, root_run_id, notify) VALUES (?1,?2,?3,?4,?5,?6,?7,?1,?8)",
+            params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs, notify])?;
         append_event(&tx, &run.id, json!({"kind":"status", "status":"queued"}))?;
         tx.commit()?;
         self.notify(&run.id);
@@ -901,6 +966,29 @@ impl Database {
             stmt.query_map(params![schedule, id], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<_>>()?,
         ))
+    }
+
+    /// Run `id`'s summary, from its tree's audit records and, for a
+    /// scheduled run, the hosts its schedule's earlier runs reached. `None`
+    /// if there's no such run.
+    pub fn summary(&self, id: &str) -> Result<Option<crate::summary::Summary>> {
+        let Some((runs, records)) = self.tree_audit(id)? else {
+            return Ok(None);
+        };
+        let run = runs
+            .iter()
+            .find(|run| run.id == id)
+            .expect("tree has its root");
+        let known_hosts = match &run.schedule_id {
+            Some(schedule) => self.schedule_hosts_before(schedule, id)?,
+            None => None,
+        };
+        Ok(Some(crate::summary::summarize(
+            run,
+            &runs,
+            &records,
+            known_hosts.as_ref(),
+        )))
     }
 
     /// Whether any run in `session_id` belongs to the delegation tree rooted
@@ -1239,6 +1327,7 @@ impl Database {
         at: String,
         tz: String,
         cron: Option<String>,
+        notify: String,
         next_fire_at: i64,
         deadline_secs: u64,
         pin: Pin,
@@ -1250,6 +1339,7 @@ impl Database {
         if !(1..=86400).contains(&deadline_secs) {
             bail!("deadline_secs must be between 1 and 86400");
         }
+        crate::notify::check_level(&notify)?;
         let id = id.unwrap_or_else(new_id);
         host::check_schedule_id(&id)?;
         let schedule = Schedule {
@@ -1259,6 +1349,7 @@ impl Database {
             at,
             tz,
             cron,
+            notify,
             next_fire_at: Some(next_fire_at),
             deadline_secs,
             status: "active".into(),
@@ -1278,7 +1369,7 @@ impl Database {
         }
         store_versions(&tx, versions)?;
         tx.execute(
-            &format!("INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+            &format!("INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
             params![
                 schedule.id,
                 schedule.agent,
@@ -1292,12 +1383,13 @@ impl Database {
                 schedule.paused_reason,
                 schedule.created_at,
                 schedule.cron,
+                schedule.notify,
             ],
         )?;
         schedule_event(
             &tx,
             &schedule.id,
-            json!({"kind":"created", "cron":schedule.cron, "next_fire_at":next_fire_at, "versions":schedule.pinned_versions}),
+            json!({"kind":"created", "cron":schedule.cron, "notify":schedule.notify, "next_fire_at":next_fire_at, "versions":schedule.pinned_versions}),
         )?;
         tx.commit()?;
         Ok(schedule)
@@ -1402,6 +1494,133 @@ impl Database {
         self.signal_cancelled(cancelled);
         drop(conn);
         Ok(self.schedule(id)?.expect("schedule exists"))
+    }
+
+    /// Changes when a schedule's runs notify the user, recording it in its
+    /// history.
+    pub fn set_schedule_notify(&self, id: &str, notify: &str) -> Result<Schedule> {
+        crate::notify::check_level(notify)?;
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let from: String = tx
+            .query_row("SELECT notify FROM schedules WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .context("schedule not found")?;
+        tx.execute(
+            "UPDATE schedules SET notify=?2 WHERE id=?1",
+            params![id, notify],
+        )?;
+        schedule_event(
+            &tx,
+            id,
+            json!({"kind":"notify_changed", "from":from, "to":notify}),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        Ok(self.schedule(id)?.expect("schedule exists"))
+    }
+
+    /// Top-level runs not yet checked for a notification whose whole tree
+    /// has ended, oldest first, each with its own notification level if it
+    /// has one.
+    pub fn runs_to_notify(&self) -> Result<Vec<(Run, Option<String>)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS}, notify FROM runs r
+             WHERE notify_checked=0 AND parent_run_id IS NULL
+               AND status IN ('completed','failed','cancelled','interrupted')
+               AND NOT EXISTS (SELECT 1 FROM runs c WHERE c.root_run_id=r.id
+                   AND c.status IN ('queued','running'))
+             ORDER BY rowid"
+        ))?;
+        let columns = RUN_COLUMNS.split(',').count();
+        Ok(stmt
+            .query_map([], |row| Ok((read_run(row)?, row.get(columns)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Marks run `id` checked for a notification, storing `notification` if
+    /// it gets one. Returns the stored notification.
+    pub fn record_notification(
+        &self,
+        id: &str,
+        note: Option<crate::notify::Note>,
+    ) -> Result<Option<Notification>> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let checked = tx.execute(
+            "UPDATE runs SET notify_checked=1 WHERE id=?1 AND notify_checked=0",
+            [id],
+        )? == 1;
+        let stored = match note {
+            Some(note) if checked => {
+                let created_at = now();
+                tx.execute(
+                    "INSERT INTO notifications (run_id, created_at, data) VALUES (?1, ?2, ?3)",
+                    params![id, created_at, serde_json::to_string(&note)?],
+                )?;
+                Some(Notification {
+                    id: tx.last_insert_rowid(),
+                    run_id: id.into(),
+                    created_at,
+                    read_at: None,
+                    note,
+                })
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// Notifications, newest first, at most `limit`; only unread ones if
+    /// `unread`.
+    pub fn notifications(&self, unread: bool, limit: usize) -> Result<Vec<Notification>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, created_at, read_at, data FROM notifications
+             WHERE ?1=0 OR read_at IS NULL ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![unread, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, run_id, created_at, read_at, data) = row?;
+            Ok(Notification {
+                id,
+                run_id,
+                created_at,
+                read_at,
+                note: serde_json::from_str(&data)?,
+            })
+        })
+        .collect()
+    }
+
+    /// Marks notification `id`, or every unread one if `None`, read.
+    /// Returns how many were unread.
+    pub fn mark_read(&self, id: Option<i64>) -> Result<usize> {
+        Ok(self.0.lock().unwrap().execute(
+            "UPDATE notifications SET read_at=?1 WHERE read_at IS NULL AND (?2 IS NULL OR id=?2)",
+            params![now(), id],
+        )?)
+    }
+
+    /// Whether notification `id` exists.
+    pub fn notification_exists(&self, id: i64) -> Result<bool> {
+        Ok(self.0.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM notifications WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Pauses an active schedule, e.g. because its agent changed.
