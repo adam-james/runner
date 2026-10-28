@@ -214,6 +214,29 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         (Some("denied"), Some("refused"))
     );
     assert_eq!(denied[0]["component"]["name"], "fixture");
+    // The dir is mounted read-only: the probe's `..` escape, its symlink
+    // escape and its write are refused by wasmtime and recorded, without
+    // their paths. Reading /etc/passwd stays inside the dir and just finds
+    // nothing, an ordinary error.
+    let refused: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "audit" && e["action"] == "filesystem.denied")
+        .collect();
+    assert_eq!(refused.len(), 3, "{refused:?}");
+    for record in &refused {
+        assert_eq!(
+            (
+                record["operation"].as_str(),
+                record["decision"].as_str(),
+                record["outcome"].as_str()
+            ),
+            (Some("open-at"), Some("denied"), Some("not_permitted"))
+        );
+    }
+    let text = serde_json::to_string(&refused).unwrap();
+    for path in ["passwd", "escape", "changed.txt"] {
+        assert!(!text.contains(path), "{text}");
+    }
 }
 
 async fn wait(db: &Database, id: &str, state: &str) -> Run {

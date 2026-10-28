@@ -1,6 +1,7 @@
 mod activity;
 mod audit;
 pub mod delegation;
+mod filesystem;
 pub mod inspect;
 mod linking;
 pub mod trails;
