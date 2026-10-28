@@ -218,6 +218,13 @@ enum Runs {
         #[arg(long)]
         json: bool,
     },
+    /// What the run and every run it delegated to did, from their audit
+    /// records: hosts reached, denials, errors and trail problems.
+    Summary {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -359,6 +366,14 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&client.cancel(&id).await?)?
             ),
             Runs::Audit { id, json } => print_audit(&client.audit(&id).await?, json)?,
+            Runs::Summary { id, json } => {
+                let summary = client.summary(&id).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print!("{}", runner::summary::render(&summary));
+                }
+            }
             Runs::Watch { id, after, json } => {
                 header(&client, &client.run(&id).await?).await?;
                 let _ = attach(&client, &id, after, json, &mut interrupt).await?;

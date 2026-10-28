@@ -44,7 +44,9 @@ In order; each step ships something usable on its own.
    - later: `approve` could show the changed fields before re-pinning and ask to confirm, rather than reporting them after
    - read-only background agents (e.g. a morning brief) are safe and useful at this step
 3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
-   - host-made summary of every background run from its audit records, no model involved: hosts reached, denials, errors, trail gaps, pending approvals
+   - ~~host-made summary of every background run from its audit records, no model involved~~ done: `runner runs summary` / `GET /v1/runs/{id}/summary`, over the run's whole delegation tree: hosts reached, denials, errors, withheld credentials, trail problems; leaves out the run's error text
+     - next: pending approvals, once step 4 exists
+     - next: store each background run's summary when it finishes, for notifications and for when audit retention prunes its records
    - alerts on denials, trail gaps, and a host the schedule has never reached before
    - `run_auditor` only when the summary flags something
    - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later

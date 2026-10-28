@@ -127,6 +127,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |
+| `GET /v1/runs/{id}/summary` | What the run and every run it delegated to did, made by the host from their audit records: `{"run_id", "agent", "schedule_id", "status", "runs", "unfinished_runs", "turns", "duration_ms", "actions", "hosts": [{"kind", "component", "host", "allowed", "denied"}], "credentials_withheld", "denials": {"total", "records"}, "errors": {"total", "records"}, "trail_problems"}`; at most 50 records listed each |
 | `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) or `"cron": "0 7 * * MON-FRI"` (recurring) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
 | `GET /v1/schedules` | List schedules that haven't been deleted |
 | `GET /v1/schedules/{id}` | Inspect a schedule, deleted ones included |
@@ -198,7 +199,8 @@ separate grant system. Each milestone ships something usable on its own;
    approved again.
 3. **Run summaries, alerts, and notifications:** the host summarizes every background run
    from its audit records, without a model: hosts reached, denials, errors,
-   trail gaps, and pending approvals. Denials, gaps, and hosts a schedule has
+   trail gaps, and pending approvals. Summaries are done, served on demand
+   (`GET /v1/runs/{id}/summary`); pending approvals join them with step 4. Denials, gaps, and hosts a schedule has
    never reached before raise alerts, and only flagged runs go to the
    `run_auditor` agent. Audit records, and the agent versions they reference,
    are kept longer than their runs, since background runs are reviewed later.

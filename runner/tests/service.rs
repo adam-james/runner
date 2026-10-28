@@ -1708,3 +1708,81 @@ async fn a_schedule_can_fire_a_delay_from_now_instead_of_at_a_time() {
     }
     h.close().await;
 }
+
+#[test]
+fn a_runs_tree_holds_it_and_every_run_it_delegated_to_but_not_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    db.submit(None, "default".into(), "root".into(), 60)
+        .unwrap();
+    let root = db.claim().unwrap().unwrap();
+    let child = db.delegate(&root.id, "default", "child", None).unwrap();
+    // Only a running run can delegate.
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    let grandchild = db
+        .delegate(&child.id, "default", "grandchild", None)
+        .unwrap();
+    let unrelated = db
+        .submit(None, "default".into(), "other".into(), 60)
+        .unwrap();
+    for (run, seq) in [
+        (&child.id, 1),
+        (&root.id, 1),
+        (&grandchild.id, 1),
+        (&unrelated.id, 1),
+        (&root.id, 2),
+    ] {
+        db.audit_event(run, json!({"seq":seq, "action":"turn.started"}))
+            .unwrap();
+    }
+    let (runs, records) = db.tree_audit(&root.id).unwrap().unwrap();
+    let ids: Vec<_> = runs.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, [&root.id, &child.id, &grandchild.id]);
+    // A run at a time, ordered by each one's first record.
+    let order: Vec<_> = records.iter().map(|r| r.run_id.as_str()).collect();
+    assert_eq!(order, [&child.id, &root.id, &root.id, &grandchild.id]);
+    let (runs, records) = db.tree_audit(&child.id).unwrap().unwrap();
+    assert_eq!((runs.len(), records.len()), (2, 2));
+    assert!(db.tree_audit("nope").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_runs_summary_is_served_from_its_audit_records() {
+    let h = Harness::new(1).await;
+    let run = h.submit(None, "hello", 60).await;
+    let run = h.wait_status(&run.id, "completed").await;
+    for data in [
+        json!({"seq":1, "ts_ms":100, "action":"turn.started"}),
+        json!({"seq":2, "ts_ms":150, "action":"http.request",
+            "component":{"kind":"provider","name":"test"}, "decision":"denied",
+            "outcome":"not_allowed_host", "host":"evil.example"}),
+        json!({"seq":3, "ts_ms":400, "action":"turn.finished", "outcome":"completed",
+            "records":3, "refused":0}),
+    ] {
+        h.db.audit_event(&run.id, data).unwrap();
+    }
+    let (status, summary) = h
+        .api(
+            reqwest::Method::GET,
+            &format!("/v1/runs/{}/summary", run.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["status"], "completed");
+    assert_eq!(summary["duration_ms"], 300);
+    assert_eq!(
+        summary["hosts"],
+        json!([{"kind":"provider", "component":"test", "host":"evil.example",
+            "allowed":0, "denied":1}])
+    );
+    assert_eq!(summary["denials"]["total"], 1);
+    assert_eq!(summary["trail_problems"], json!([]));
+    assert_eq!(
+        h.api(reqwest::Method::GET, "/v1/runs/nope/summary", None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    h.close().await;
+}

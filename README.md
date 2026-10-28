@@ -269,6 +269,7 @@ what the host allowed or denied. Read it with:
 runner runs audit RUN_ID          # a table, one line per record
 runner runs audit RUN_ID --json   # one JSON record per line
 runner sessions audit SESSION_ID  # every run in the session, a run at a time
+runner runs summary RUN_ID        # what the run and its delegates did, at a glance
 ```
 
 ```
@@ -293,6 +294,35 @@ SHA-256 of the `.wasm` that was loaded.
 Records are metadata only. They never include prompts, tool input or
 output, request paths or bodies, header values, or error text; credentials
 appear only as counts of headers added or held back.
+
+`runs summary` is the quick check for a run nobody watched, such as a
+schedule's. The host works it out from the audit records of the run and every
+run it delegated to, with no model involved: each host a component asked for
+with how many requests were allowed and denied, the records the host denied,
+actions that didn't end normally (a trap, a timeout, an interrupted turn),
+credential headers held back, and problems with the trail itself. It leaves
+out the run's error text, which for a failed turn is the agent's own message
+and a prompt injection could steer. Hosts and tool names stay JSON-quoted.
+
+```
+run 4c1e… (agent researcher, schedule brief): completed
+2 runs, 3 turns, 41.220s
+actions: http.request 9, provider.chat 4, sandbox.create 3, tool.call 3, turn.finished 3, turn.started 3
+
+hosts:
+  provider "anthropic" → "api.anthropic.com": 4 allowed, 0 denied
+  tool "web_search" → "api.tavily.com": 4 allowed, 0 denied
+  tool "web_search" → "evil.example": 0 allowed, 1 denied
+
+denials (1):
+  {"run":"4c1e…","seq":6,"ts_ms":…,"action":"http.request","component":{…},"decision":"denied","outcome":"not_allowed_host","host":"evil.example",…}
+
+errors (0):
+  none
+
+trail problems:
+  none
+```
 
 Each record carries a schema version (`v`), a sequence number that's
 contiguous within the turn, a timestamp, the agent and session, and the
