@@ -50,6 +50,10 @@ enum Command {
         detach: bool,
         #[arg(long, default_value_t = service::default_deadline())]
         deadline_secs: u64,
+        /// When it notifies once it ends: all, problems (the default:
+        /// failed or interrupted, or with alerts) or never.
+        #[arg(long, value_parser = runner::notify::LEVELS.to_vec())]
+        notify: Option<String>,
     },
     /// Start or continue an interactive conversation.
     Chat {
@@ -338,8 +342,11 @@ async fn main() -> Result<()> {
             agent,
             detach,
             deadline_secs,
+            notify,
         } => {
-            let run = client.submit(session, agent, prompt, deadline_secs).await?;
+            let run = client
+                .submit_notifying(session, agent, prompt, deadline_secs, notify)
+                .await?;
             header(&client, &run).await?;
             if detach {
                 println!("{}", run.id);

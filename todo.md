@@ -57,7 +57,7 @@ In order; each step ships something usable on its own.
      - show each component's grants in every run's summary, from its agent version: sandboxes are reused across a session's turns, so only the first run's trail has `sandbox.create`, and with no `dir` a file attempt never reaches the host at all
      - test that a component's environment is empty: "keys never enter the sandbox" rests on it
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
-     - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks each scheduled run once its tree has ended; `--notify all|problems|never`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
+     - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks every top-level run once its tree has ended, scheduled or not, assuming nobody watched; level `all|problems|never`, per schedule (`schedules add --notify`) or per run (`runner run --notify`), default `problems`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
      - after capability linking: delivered as desktop notifications (macOS Notification Center, freedesktop on Linux) and listed in the TUI; opening one shows the run
      - approval requests (step 4) use the same channel
    - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule

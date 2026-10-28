@@ -114,11 +114,25 @@ impl Client {
         prompt: String,
         deadline: u64,
     ) -> Result<Run> {
+        self.submit_notifying(session, agent, prompt, deadline, None)
+            .await
+    }
+
+    /// Like `submit`, with the run's own notification level, if it has one;
+    /// see `crate::notify::LEVELS`.
+    pub async fn submit_notifying(
+        &self,
+        session: Option<String>,
+        agent: Option<String>,
+        prompt: String,
+        deadline: u64,
+        notify: Option<String>,
+    ) -> Result<Run> {
         self.json(
             Method::POST,
             "/v1/runs",
             Some(
-                json!({"session_id":session,"agent":agent,"prompt":prompt,"deadline_secs":deadline}),
+                json!({"session_id":session,"agent":agent,"prompt":prompt,"deadline_secs":deadline,"notify":notify}),
             ),
         )
         .await

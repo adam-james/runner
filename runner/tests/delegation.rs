@@ -223,7 +223,7 @@ fn version_two_database_keeps_existing_transcripts_during_delegation_upgrade() {
     conn.execute_batch(
         "ALTER TABLE sessions DROP COLUMN agent;
         DROP TABLE run_results;
-        DROP INDEX runs_by_parent; DROP INDEX runs_by_root;
+        DROP INDEX runs_by_parent; DROP INDEX runs_by_root; DROP INDEX runs_to_notify;
         ALTER TABLE runs DROP COLUMN parent_run_id;
         ALTER TABLE runs DROP COLUMN root_run_id;
         ALTER TABLE runs DROP COLUMN depth;

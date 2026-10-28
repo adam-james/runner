@@ -262,8 +262,10 @@ schedule's time: once approved, it runs.
 
 ### Notifications
 
-When a schedule's run ends, the daemon keeps a notification for you until
-you've read it, so none are lost while no client is connected:
+When a run ends, the daemon keeps a notification for you until you've read
+it, so none are lost while no client is connected. Every top-level run counts:
+scheduled, detached or in a chat. Runner assumes nobody was watching, and a
+run's [alerts](#audit-log) never show in chat anyway:
 
 ```bash
 runner notifications list         # unread ones, newest first; --all for read ones too
@@ -275,16 +277,22 @@ runner notifications read 12      # or --all
     denied: the host denied 1 action
 ```
 
-A schedule's `--notify` decides which runs notify: `all`, `problems` (the
-default: a run that failed or was interrupted, or raised an
-[alert](#audit-log)) or `never`. A cancelled run never does. Change it with
-`runner schedules notify ID LEVEL`.
+Which runs notify is a level: `all`, `problems` (the default: a run that
+failed or was interrupted, or raised an alert) or `never`. So a clean chat turn
+stays quiet, and one with a denied request doesn't. A cancelled run never
+notifies. A schedule sets the level for its runs with `--notify`, changed with
+`runner schedules notify ID LEVEL`, and a single run can set its own with
+`runner run --notify LEVEL`, e.g. `all` for a long detached job:
+
+```bash
+runner run --detach --notify all "Summarize this week's issues"
+```
 
 The host writes every notification itself, from the run's status, duration
 and alerts and its schedule's status, and never includes the model's reply or
 the run's error, so a prompt injection can't put a convincing fake message in
 what looks like a system notice. A run is checked once its whole delegation
-tree has ended. Desktop notifications and a list in the TUI come next.
+tree has ended; delegated runs are covered by their parent's notification. Desktop notifications and a list in the TUI come next.
 
 ### Audit log
 

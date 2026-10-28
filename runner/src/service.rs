@@ -197,6 +197,10 @@ pub struct Submit {
     pub agent: Option<String>,
     #[serde(default = "default_deadline")]
     pub deadline_secs: u64,
+    /// When this run notifies, overriding the default (`problems`); see
+    /// `crate::notify::LEVELS`.
+    #[serde(default)]
+    pub notify: Option<String>,
 }
 
 pub fn default_deadline() -> u64 {
@@ -511,9 +515,16 @@ async fn submit(
             format!("unknown agent '{agent}'"),
         ));
     }
-    let run = s
-        .db
-        .blocking(move |db| db.submit(input.session_id, agent, input.prompt, input.deadline_secs))
+    let run =
+        s.db.blocking(move |db| {
+            db.submit_notifying(
+                input.session_id,
+                agent,
+                input.prompt,
+                input.deadline_secs,
+                input.notify,
+            )
+        })
         .await
         .map_err(bad)?;
     Ok((StatusCode::ACCEPTED, Json(run)))

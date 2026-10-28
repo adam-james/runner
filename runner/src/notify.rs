@@ -1,7 +1,9 @@
-//! Notifications: telling the user what a schedule's run did once it has
-//! ended, so a background run's alerts reach someone without them going to
-//! look. The daemon keeps each one until it's read, so none are lost while
-//! no client is connected.
+//! Notifications: telling the user what a run did once it has ended, so its
+//! alerts reach someone without them going to look. Every top-level run is
+//! assumed unwatched, whether scheduled, detached or in a chat: alerts never
+//! show in chat, and a client can be attached while nobody's looking. The
+//! daemon keeps each notification until it's read, so none are lost while no
+//! client is connected.
 //!
 //! A notification is written by the host alone, from the run's status, its
 //! summary's alerts and its schedule, never from the model's reply or the
@@ -20,9 +22,10 @@ use crate::summary::{Alert, Summary};
 /// How often ended runs are looked for.
 const TICK: Duration = Duration::from_secs(1);
 
-/// When a schedule's runs notify: `all` of them, only `problems` (a run
-/// that failed or was interrupted, or raised an alert), or `never`. A
-/// cancelled run never does, since someone cancelled it.
+/// When runs notify: `all` of them, only `problems` (a run that failed or
+/// was interrupted, or raised an alert), or `never`. A cancelled run never
+/// does, since someone cancelled it. A run's own level wins, then its
+/// schedule's, then `problems`.
 pub const LEVELS: &[&str] = &["all", "problems", "never"];
 
 pub fn default_level() -> String {
@@ -39,46 +42,59 @@ pub fn check_level(level: &str) -> Result<()> {
 /// What a notification says, all of it host-written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
-    pub schedule_id: String,
+    /// The run's schedule, if it's a scheduled run.
+    pub schedule_id: Option<String>,
     pub agent: String,
     /// The run's status: `completed`, `failed` or `interrupted`.
     pub status: String,
     pub duration_ms: Option<u64>,
     pub alerts: Vec<Alert>,
-    /// The schedule's status when the run was checked, e.g. `paused` after
-    /// a run refused because its agent changed.
-    pub schedule_status: String,
+    /// For a scheduled run, its schedule's status when the run was checked,
+    /// e.g. `paused` after a run refused because its agent changed.
+    pub schedule_status: Option<String>,
 }
 
-/// The note `run`'s end gets under `schedule`'s setting, if any.
-pub fn note(run: &Run, summary: &Summary, schedule: &Schedule) -> Option<Note> {
+/// The note `run`'s end gets, if any, under its own level `own`, else its
+/// `schedule`'s, else `problems`.
+pub fn note(
+    run: &Run,
+    own: Option<&str>,
+    summary: &Summary,
+    schedule: Option<&Schedule>,
+) -> Option<Note> {
+    let level = own
+        .or(schedule.map(|s| s.notify.as_str()))
+        .unwrap_or("problems");
     let problem = run.status != "completed" || !summary.alerts.is_empty();
     let wanted = run.status != "cancelled"
-        && match schedule.notify.as_str() {
+        && match level {
             "all" => true,
             "never" => false,
             _ => problem,
         };
     wanted.then(|| Note {
-        schedule_id: schedule.id.clone(),
+        schedule_id: schedule.map(|s| s.id.clone()),
         agent: run.agent.clone(),
         status: run.status.clone(),
         duration_ms: summary.duration_ms,
         alerts: summary.alerts.clone(),
-        schedule_status: schedule.status.clone(),
+        schedule_status: schedule.map(|s| s.status.clone()),
     })
 }
 
 /// A notification's one-line headline, e.g. `schedule brief: completed,
-/// 1 alert`.
+/// 1 alert` or `run (agent reader): failed`.
 pub fn title(note: &Note) -> String {
-    let mut title = format!("schedule {}: {}", note.schedule_id, note.status);
+    let mut title = match &note.schedule_id {
+        Some(schedule) => format!("schedule {schedule}: {}", note.status),
+        None => format!("run (agent {}): {}", note.agent, note.status),
+    };
     match note.alerts.len() {
         0 => {}
         1 => title.push_str(", 1 alert"),
         n => title.push_str(&format!(", {n} alerts")),
     }
-    if note.schedule_status == "paused" {
+    if note.schedule_status.as_deref() == Some("paused") {
         title.push_str("; schedule paused");
     }
     title
@@ -114,8 +130,8 @@ pub fn render(notifications: &[Notification]) -> String {
     out
 }
 
-/// Checks each scheduled run once its tree has ended and stores the
-/// notification its schedule wants, until `shutdown`. Runs that ended while
+/// Checks each top-level run once its tree has ended and stores the
+/// notification its level wants, until `shutdown`. Runs that ended while
 /// the daemon was stopped are checked when it starts.
 pub async fn notifier(db: Database, shutdown: CancellationToken) {
     let mut tick = tokio::time::interval(TICK);
@@ -141,15 +157,14 @@ pub async fn notifier(db: Database, shutdown: CancellationToken) {
 /// One pass of `notifier`. Returns the notifications stored.
 pub fn check_ended(db: &Database) -> Result<Vec<Notification>> {
     let mut stored = Vec::new();
-    for run in db.runs_to_notify()? {
-        let schedule = run
-            .schedule_id
-            .as_deref()
-            .and_then(|id| db.schedule(id).ok().flatten());
-        let note = match (schedule, db.summary(&run.id)?) {
-            (Some(schedule), Some(summary)) => note(&run, &summary, &schedule),
-            _ => None,
+    for (run, own) in db.runs_to_notify()? {
+        let schedule = match &run.schedule_id {
+            Some(id) => db.schedule(id)?,
+            None => None,
         };
+        let note = db
+            .summary(&run.id)?
+            .and_then(|summary| note(&run, own.as_deref(), &summary, schedule.as_ref()));
         stored.extend(db.record_notification(&run.id, note)?);
     }
     Ok(stored)
@@ -181,6 +196,10 @@ mod tests {
         .unwrap()
     }
 
+    fn schedule_with(notify: &str) -> Schedule {
+        schedule(notify, "active")
+    }
+
     fn summary(alerts: &[&str]) -> Summary {
         let root = run("completed");
         let mut summary = crate::summary::summarize(&root, std::slice::from_ref(&root), &[], None);
@@ -206,9 +225,26 @@ mod tests {
         ];
         for (status, alerts, wanted) in cases {
             for (level, wanted) in LEVELS.iter().zip(wanted) {
-                let note = note(&run(status), &summary(alerts), &schedule(level, "active"));
-                assert_eq!(note.is_some(), wanted, "{status} {alerts:?} {level}");
+                let schedule = schedule(level, "active");
+                let scheduled = note(&run(status), None, &summary(alerts), Some(&schedule));
+                assert_eq!(scheduled.is_some(), wanted, "{status} {alerts:?} {level}");
+                // A run's own level means the same, and wins over its schedule's.
+                let own = note(
+                    &run(status),
+                    Some(level),
+                    &summary(alerts),
+                    Some(&schedule_with("never")),
+                );
+                assert_eq!(own.is_some(), wanted, "own {status} {alerts:?} {level}");
             }
+            // A run outside any schedule, with no level of its own, notifies
+            // about problems.
+            let problems = wanted[1];
+            assert_eq!(
+                note(&run(status), None, &summary(alerts), None).is_some(),
+                problems,
+                "unscheduled {status} {alerts:?}"
+            );
         }
         assert!(check_level("sometimes").is_err());
         assert_eq!(default_level(), "problems");
@@ -218,8 +254,9 @@ mod tests {
     fn a_note_is_host_written_and_never_carries_the_runs_error() {
         let note = note(
             &run("failed"),
+            None,
             &summary(&["denied"]),
-            &schedule("problems", "paused"),
+            Some(&schedule("problems", "paused")),
         )
         .unwrap();
         assert_eq!(
@@ -242,10 +279,16 @@ mod tests {
         assert!(text.ends_with("\n    denied: denied happened\n"), "{text}");
         let quiet = Note {
             alerts: Vec::new(),
-            schedule_status: "active".into(),
+            schedule_status: Some("active".into()),
             status: "completed".into(),
-            ..n.note
+            ..n.note.clone()
         };
         assert_eq!(title(&quiet), "schedule brief: completed");
+        let unscheduled = super::note(&run("interrupted"), None, &summary(&[]), None).unwrap();
+        assert_eq!(
+            (&unscheduled.schedule_id, &unscheduled.schedule_status),
+            (&None, &None)
+        );
+        assert_eq!(title(&unscheduled), "run (agent researcher): interrupted");
     }
 }

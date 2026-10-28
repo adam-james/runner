@@ -135,7 +135,7 @@ pub struct Schedule {
     pub changed_agents: Vec<String>,
 }
 
-/// A note for the user about a scheduled run that ended, kept until read.
+/// A note for the user about a top-level run that ended, kept until read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub id: i64,
@@ -534,10 +534,12 @@ impl Database {
         }
         if version < 9 {
             let tx = conn.unchecked_transaction()?;
-            // Notifications: what each schedule's runs did, for the user,
-            // kept until read. A run is checked for one once, after its
-            // tree has ended; runs from before this step count as checked,
-            // so upgrading doesn't notify about old runs.
+            // Notifications: what each top-level run did, for the user, kept
+            // until read. A run is checked for one once, after its tree has
+            // ended; runs from before this step count as checked, so
+            // upgrading doesn't notify about old runs. A run may override
+            // its level (`runs.notify`); otherwise its schedule's applies,
+            // or `problems`.
             if !has_column(&tx, "schedules", "notify")? {
                 tx.execute_batch(
                     "ALTER TABLE schedules ADD COLUMN notify TEXT NOT NULL DEFAULT 'problems';",
@@ -549,9 +551,12 @@ impl Database {
                      UPDATE runs SET notify_checked=1;",
                 )?;
             }
+            if !has_column(&tx, "runs", "notify")? {
+                tx.execute_batch("ALTER TABLE runs ADD COLUMN notify TEXT;")?;
+            }
             tx.execute_batch(
                 "CREATE INDEX IF NOT EXISTS runs_to_notify ON runs(id)
-                     WHERE notify_checked=0 AND schedule_id IS NOT NULL;
+                     WHERE notify_checked=0 AND parent_run_id IS NULL;
                  CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,
                      run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
                      created_at INTEGER NOT NULL, read_at INTEGER, data TEXT NOT NULL);
@@ -631,6 +636,22 @@ impl Database {
         prompt: String,
         deadline_secs: u64,
     ) -> Result<Run> {
+        self.submit_notifying(session_id, agent, prompt, deadline_secs, None)
+    }
+
+    /// Like `submit`, with the run's own notification level, if it has one;
+    /// see `crate::notify::LEVELS`.
+    pub fn submit_notifying(
+        &self,
+        session_id: Option<String>,
+        agent: String,
+        prompt: String,
+        deadline_secs: u64,
+        notify: Option<String>,
+    ) -> Result<Run> {
+        if let Some(level) = &notify {
+            crate::notify::check_level(level)?;
+        }
         if prompt.trim().is_empty() || prompt.len() > 256 * 1024 {
             bail!("prompt must contain 1–262144 bytes");
         }
@@ -690,8 +711,8 @@ impl Database {
             cancel_requested: false,
             error: None,
         };
-        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs, root_run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?1)",
-            params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs])?;
+        tx.execute("INSERT INTO runs (id, session_id, agent, prompt, status, created_at, deadline_secs, root_run_id, notify) VALUES (?1,?2,?3,?4,?5,?6,?7,?1,?8)",
+            params![run.id, run.session_id, run.agent, run.prompt, run.status, run.created_at, run.deadline_secs, notify])?;
         append_event(&tx, &run.id, json!({"kind":"status", "status":"queued"}))?;
         tx.commit()?;
         self.notify(&run.id);
@@ -1501,20 +1522,22 @@ impl Database {
         Ok(self.schedule(id)?.expect("schedule exists"))
     }
 
-    /// Scheduled runs not yet checked for a notification whose whole tree
-    /// has ended, oldest first.
-    pub fn runs_to_notify(&self) -> Result<Vec<Run>> {
+    /// Top-level runs not yet checked for a notification whose whole tree
+    /// has ended, oldest first, each with its own notification level if it
+    /// has one.
+    pub fn runs_to_notify(&self) -> Result<Vec<(Run, Option<String>)>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {RUN_COLUMNS} FROM runs r
-             WHERE notify_checked=0 AND schedule_id IS NOT NULL
+            "SELECT {RUN_COLUMNS}, notify FROM runs r
+             WHERE notify_checked=0 AND parent_run_id IS NULL
                AND status IN ('completed','failed','cancelled','interrupted')
                AND NOT EXISTS (SELECT 1 FROM runs c WHERE c.root_run_id=r.id
                    AND c.status IN ('queued','running'))
              ORDER BY rowid"
         ))?;
+        let columns = RUN_COLUMNS.split(',').count();
         Ok(stmt
-            .query_map([], read_run)?
+            .query_map([], |row| Ok((read_run(row)?, row.get(columns)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
