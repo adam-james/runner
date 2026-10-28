@@ -38,8 +38,9 @@ In order; each step ships something usable on its own.
 1. ~~agent versions~~ done: each run's resolved agent definition is snapshotted (never header values; system prompt as a hash), stored once per version in `agent_versions`, linked from the run and named in `turn.started`; `runner agents version ID`, and `run_auditor` reviews runs against their versions
    - next: `runs audit` could show where a run went beyond its version (it can't today, since the host enforces the version, but it would catch a host bug)
 2. schedules pinned to an agent version - one-off and cron schedules (see docs/service.md); each occurrence is an ordinary run in a fresh session
-   - a schedule names an agent and pins the version it was created with; if the version changes (config edit or swapped binary), the schedule pauses until re-approved, so an edit made for chat can't quietly widen what an unattended agent can do
-   - delegates are in a version by name only; a schedule's pin must cover the versions of the agents it can delegate to as well
+   - done: one-off schedules (`runner schedules`, `/v1/schedules`), pinned to the versions of their agent and every agent it can delegate to; checked at startup, when due, and when the run starts; a changed agent pauses the schedule until `approve`, which reports what changed
+   - next: recurring cron schedules with time zones: DST rules (skip a time that doesn't happen, fire once for one that happens twice), skip missed occurrences, and skip an occurrence while the previous one is still running
+   - later: `approve` could show the changed fields before re-pinning and ask to confirm, rather than reporting them after
    - read-only background agents (e.g. a morning brief) are safe and useful at this step
 3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
    - host-made summary of every background run from its audit records, no model involved: hosts reached, denials, errors, trail gaps, pending approvals

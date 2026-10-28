@@ -2142,3 +2142,119 @@ async fn components_without_a_memory_cap_get_the_default_one() {
         false
     );
 }
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn a_schedule_pin_covers_delegates_and_a_scheduled_run_executes_when_it_holds() {
+    let fixture = delegation_fixture();
+    let runtime = fixture.runtime().await.host;
+    let pin = runtime.pin("coordinator").unwrap();
+    assert_eq!(
+        pin.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["coordinator", "lead", "leaf"]
+    );
+    for (agent, version) in &pin {
+        assert_eq!(&runtime.agent_version(agent).unwrap().id, version);
+    }
+    // Editing only a delegate leaves the coordinator's own version alone,
+    // since a snapshot names delegates, but not its pin.
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replace(
+            "Leaf specialist instructions.",
+            "Leaf, now with more reach.",
+        ),
+    )
+    .unwrap();
+    let edited = fixture.runtime().await.host;
+    assert_eq!(
+        edited.agent_version("coordinator").unwrap().id,
+        pin["coordinator"]
+    );
+    assert_eq!(
+        host::version::changed(&pin, edited.pin("coordinator").as_ref()),
+        ["leaf"]
+    );
+
+    // A scheduled run whose pin holds executes like any other.
+    let db = Database::open(&fixture.dir.path().join("schedules.sqlite3")).unwrap();
+    db.create_schedule(
+        Some("brief".into()),
+        "coordinator".into(),
+        "delegate:leaf:hello".into(),
+        "2999-01-01T00:00:00".into(),
+        "UTC".into(),
+        1,
+        10,
+        edited.pin("coordinator").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let pins = edited.clone();
+    let run = db
+        .fire_due(i64::MAX, &|agent| pins.pin(agent))
+        .unwrap()
+        .remove(0);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(worker(
+        db.clone(),
+        Arc::new(WasmExecutor(edited)),
+        2,
+        stop.clone(),
+    ));
+    let run = wait(&db, &run.id, "completed").await;
+    assert_eq!(
+        db.run_agent_version(&run.id).unwrap(),
+        Some(pin["coordinator"].clone())
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn every_current_agent_version_is_readable_before_any_run_uses_it() {
+    let fixture = Fixture::new();
+    let data = fixture.dir.path().join("versions");
+    let daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let agents = client.agents().await.unwrap();
+    assert!(client.runs(None).await.unwrap().is_empty());
+    for agent in &agents {
+        let version = client.agent_version(&agent.version).await.unwrap();
+        assert_eq!(version.agent, agent.name);
+        assert_eq!(version.definition["agent"], agent.name.as_str());
+    }
+    drop(daemon);
+    // After a config edit and a restart, the new version is readable too,
+    // and the old one is kept.
+    let old = agents
+        .iter()
+        .find(|a| a.name == "default")
+        .unwrap()
+        .version
+        .clone();
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replacen("[agents.default]", "[agents.default]\nmax_tokens = 77", 1),
+    )
+    .unwrap();
+    let _daemon = start(&fixture, &data);
+    let client = connect(&data).await;
+    let new = client
+        .agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "default")
+        .unwrap()
+        .version;
+    assert_ne!(new, old);
+    assert_eq!(
+        client.agent_version(&new).await.unwrap().definition["max_tokens"],
+        77
+    );
+    assert!(client.agent_version(&old).await.is_ok());
+}

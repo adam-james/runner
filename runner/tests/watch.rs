@@ -42,6 +42,8 @@ async fn watcher_reconnects_from_its_cursor_and_ignores_duplicate_events() {
                         root_run_id: "fixture".into(),
                         depth: 0,
                         deadline_at: None,
+                        schedule_id: None,
+                        pinned_versions: None,
                     })
                 }
             }),

@@ -119,7 +119,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | Method and route | Input / behavior |
 | --- | --- |
 | `GET /v1/agents` | List agent definitions, sorted by name, as `[{"name": "default", "provider": "openai", "model": "gpt-5", "tools": ["get_scores"]}, ...]` |
-| `GET /v1/agent-versions/{id}` | What runs of an agent version were allowed: `{"id", "agent", "first_used_at", "definition"}`; 404 if no run has used it |
+| `GET /v1/agent-versions/{id}` | What runs of an agent version were allowed: `{"id", "agent", "first_seen_at", "definition"}`; 404 if no daemon using this data directory has loaded it |
 | `POST /v1/sessions` | `{ "id": "optional-name", "agent": "default" }`; omitted/null ID generates one; returns session, HTTP 201 |
 | `GET /v1/sessions` | List known sessions |
 | `POST /v1/runs` | `{ "prompt": "...", "session_id": null, "agent": "default", "deadline_secs": 600 }`; returns queued run, HTTP 202 |
@@ -127,6 +127,14 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |
+| `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
+| `GET /v1/schedules` | List schedules that haven't been deleted |
+| `GET /v1/schedules/{id}` | Inspect a schedule, deleted ones included |
+| `GET /v1/schedules/{id}/history` | What was done to it and what it did, oldest first |
+| `POST /v1/schedules/{id}/pause` | Pause an active schedule; cancels its occurrence if queued; 409 otherwise |
+| `POST /v1/schedules/{id}/resume` | Resume a paused schedule; 409 if its agents changed |
+| `POST /v1/schedules/{id}/approve` | Pin an active or paused schedule to its agents' current versions and make it active: `{"schedule", "changes": [{"agent", "from", "to", "fields"}]}` |
+| `DELETE /v1/schedules/{id}` | Delete it; cancels its occurrence if queued; returns it |
 
 Omitting `session_id` creates a fresh session transactionally with submission.
 A supplied session must already exist. Session IDs use the existing host rules:
@@ -137,7 +145,8 @@ unknown definition is rejected. Unknown submission fields are rejected.
 
 Run records contain `id`, `session_id`, `agent`, `prompt`, `status`,
 `created_at` (Unix milliseconds), `deadline_secs`, `cancel_requested`, and
-nullable `error`. Session records contain `id`, `created_at`, and `agent` (required and fixed at creation). Runs with a different agent are rejected; an omitted agent resumes the owner or uses `default` for a new session.
+nullable `error`, plus nullable `schedule_id` and `pinned_versions` for a
+schedule's run. Session records contain `id`, `created_at`, and `agent` (required and fixed at creation). Runs with a different agent are rejected; an omitted agent resumes the owner or uses `default` for a new session.
 
 Each SSE frame has event name `run`, a durable integer `id`, and JSON data:
 
@@ -177,8 +186,10 @@ separate grant system. Each milestone ships something usable on its own;
    a run can be checked against what it was allowed after `runner.toml` has
    changed. Sessions stay locked to the agent name; each run records its
    version.
-2. **Schedules pinned to an agent version:** add durable one-off and cron
-   schedules with explicit time zones and API/CLI management. Each occurrence
+2. **Schedules pinned to an agent version:** one-off schedules are done (see
+   [Schedules](#schedules)); recurring cron schedules come next. Durable
+   one-off and cron schedules with explicit time zones and API/CLI
+   management. Each occurrence
    creates an ordinary run in a fresh session. Unique occurrence IDs prevent
    duplicate enqueueing. Skip missed recurring occurrences and enqueue overdue
    one-off tasks once when the daemon returns. No wake-from-sleep or remote
@@ -219,6 +230,50 @@ milestones above, since it's how a prompt injection would persist.
 
 Remote serving, multi-user authorization, automatic retries, durable stack
 checkpoints, and distributed workers are outside these milestones.
+
+## Schedules
+
+A **schedule** runs a prompt once, at a local time in an explicit IANA time
+zone, as an ordinary run in a fresh session locked to its agent, or a delay
+from now (`in_secs`, e.g. for testing), whose local time is then stored to the
+second. The time is
+stored as given, with the zone, and as the instant it names; a local time that
+a clock change skips or repeats is refused. Schedule ids follow session ids'
+rules. Statuses are `active`, `paused`, `done` (fired) and `deleted`.
+
+A schedule is pinned to agent versions: its agent's and those of every agent
+it can reach by delegating, transitively, since a version names delegates
+only by name (`host::version::pin`). The daemon stores every agent's current
+version when it starts, so both what a schedule was approved for and what it
+would run with now can be read with `runner agents version`, even after the
+config changes. Because the config only changes when the daemon restarts, the
+pin is checked:
+
+- **at startup**, which pauses every active schedule whose pin no longer
+  matches, so `schedules list` shows it before it's due;
+- **when it falls due**, which pauses it instead of enqueuing a run;
+- **when its run starts**, since a run queued before a restart would
+  otherwise start under the new config. The run fails with the agents that
+  changed, its schedule pauses, and the occurrence is given back: a refused
+  run never executed, so approving the schedule makes it fire again.
+
+Delegated child runs aren't checked separately: their root was checked when
+it started, and no version can change while it runs.
+
+A paused schedule resumes only if its pin still matches; otherwise it has to
+be approved, which re-pins it and reports which agents and which snapshot
+fields changed. Pausing or deleting a schedule cancels its occurrence if it's
+queued, not if it's running.
+
+The scheduler looks for due schedules every second. Each fires in one
+transaction that creates the session and run, records `fired` in the
+schedule's history and marks it `done`. Occurrence ids
+(`<schedule id>@<scheduled Unix ms>`) are unique, so an occurrence is never
+enqueued twice. A one-off that fell due while the daemon was stopped fires
+once when it starts. There is no wake from sleep. A schedule's history
+records `created`, `paused`, `resumed`, `approved`, `fired`, `refused` and
+`deleted`, with the reason, runs and versions involved; it's metadata only,
+like audit records.
 
 ## Host activity logs
 

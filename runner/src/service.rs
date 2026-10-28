@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::{Database, Event, Run};
+use crate::db::{Database, Event, Run, Schedule};
 use crate::delegation::ExecutionContext;
 use tokio::sync::Semaphore;
 
@@ -47,6 +47,14 @@ pub trait Executor: Send + Sync + 'static {
         _context: Arc<ExecutionContext>,
     ) -> BoxFuture<'static, Result<String>> {
         self.execute(run, transcript, events, cancel)
+    }
+
+    /// The agent versions a run of `agent` would use, the agent's own and
+    /// its delegates'; see `host::version::pin`. A scheduled run starts only
+    /// if they're what its schedule was approved for, so `None` refuses
+    /// every one.
+    fn pin(&self, _agent: &str) -> Option<host::version::Pin> {
+        None
     }
 }
 
@@ -102,6 +110,10 @@ impl Executor for WasmExecutor {
             }
         })
     }
+
+    fn pin(&self, agent: &str) -> Option<host::version::Pin> {
+        self.0.pin(agent)
+    }
 }
 
 #[derive(Clone)]
@@ -112,6 +124,9 @@ pub struct Service {
     agents: Arc<Vec<host::AgentInfo>>,
     /// What each configured provider and tool can do; also fixed.
     components: Arc<Vec<host::inspect::Capabilities>>,
+    /// Each agent definition's current version, by agent name; stored when
+    /// a schedule is approved for it.
+    versions: Arc<std::collections::BTreeMap<String, host::version::AgentVersion>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +210,40 @@ struct CreateSession {
     agent: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSchedule {
+    id: Option<String>,
+    agent: String,
+    prompt: String,
+    /// A local time in `tz`, e.g. `2026-10-29T07:00`; or `in_secs`.
+    at: Option<String>,
+    /// Seconds from now, e.g. for testing; or `at`.
+    in_secs: Option<u64>,
+    /// An IANA time zone name, e.g. `Europe/Warsaw`; required, so a
+    /// schedule never depends on the daemon's own zone.
+    tz: String,
+    #[serde(default = "default_deadline")]
+    deadline_secs: u64,
+}
+
+/// An agent whose version changed, as `approve` reports it.
+#[derive(Serialize, Deserialize)]
+pub struct VersionChange {
+    pub agent: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// The snapshot's top-level fields that differ, e.g. `tools` or
+    /// `model`; `None` if either definition isn't stored.
+    pub fields: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Approval {
+    pub schedule: Schedule,
+    pub changes: Vec<VersionChange>,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunFilter {
@@ -226,6 +275,10 @@ fn bad(error: anyhow::Error) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, error.to_string())
 }
 
+fn conflict(error: anyhow::Error) -> ApiError {
+    ApiError(StatusCode::CONFLICT, error.to_string())
+}
+
 impl Service {
     pub fn new(db: Database, token: String, agents: Vec<host::AgentInfo>) -> Self {
         Self {
@@ -233,6 +286,7 @@ impl Service {
             token: Arc::new(token),
             agents: Arc::new(agents),
             components: Arc::default(),
+            versions: Arc::default(),
         }
     }
 
@@ -240,6 +294,37 @@ impl Service {
     pub fn with_components(mut self, components: Vec<host::inspect::Capabilities>) -> Self {
         self.components = Arc::new(components);
         self
+    }
+
+    /// The definitions behind `agents`' versions, to store when a schedule
+    /// is approved.
+    pub fn with_versions(
+        mut self,
+        versions: std::collections::BTreeMap<String, host::version::AgentVersion>,
+    ) -> Self {
+        self.versions = Arc::new(versions);
+        self
+    }
+
+    fn pin(&self, agent: &str) -> Option<host::version::Pin> {
+        host::version::pin(&self.agents, agent)
+    }
+
+    /// The definitions of `pin`'s versions that this daemon has.
+    fn definitions(&self, pin: &host::version::Pin) -> Vec<host::version::AgentVersion> {
+        pin.iter()
+            .filter_map(|(agent, id)| self.versions.get(agent).filter(|v| &v.id == id))
+            .cloned()
+            .collect()
+    }
+
+    /// `schedule` with the agents that changed since it was approved.
+    fn with_changes(&self, mut schedule: Schedule) -> Schedule {
+        schedule.changed_agents = host::version::changed(
+            &schedule.pinned_versions,
+            self.pin(&schedule.agent).as_ref(),
+        );
+        schedule
     }
 
     pub fn router(&self) -> Router {
@@ -254,6 +339,15 @@ impl Service {
             .route("/v1/runs/{id}/cancel", post(cancel))
             .route("/v1/runs/{id}/events", get(events))
             .route("/v1/runs/{id}/audit", get(audit))
+            .route("/v1/schedules", get(list_schedules).post(create_schedule))
+            .route(
+                "/v1/schedules/{id}",
+                get(inspect_schedule).delete(delete_schedule),
+            )
+            .route("/v1/schedules/{id}/history", get(schedule_history))
+            .route("/v1/schedules/{id}/pause", post(pause_schedule))
+            .route("/v1/schedules/{id}/resume", post(resume_schedule))
+            .route("/v1/schedules/{id}/approve", post(approve_schedule))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
@@ -468,6 +562,197 @@ async fn session_audit(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "session not found".into()))
 }
 
+async fn list_schedules(State(s): State<Service>) -> Result<Json<Vec<Schedule>>, ApiError> {
+    let schedules = s.db.blocking(|db| db.schedules()).await.map_err(internal)?;
+    Ok(Json(
+        schedules
+            .into_iter()
+            .map(|schedule| s.with_changes(schedule))
+            .collect(),
+    ))
+}
+
+async fn create_schedule(
+    State(s): State<Service>,
+    Json(input): Json<CreateSchedule>,
+) -> Result<impl IntoResponse, ApiError> {
+    let pin = s.pin(&input.agent).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent '{}'", input.agent),
+        )
+    })?;
+    let (at, next_fire_at) = match (&input.at, input.in_secs) {
+        (Some(at), None) => crate::schedule::fire_time(at, &input.tz),
+        (None, Some(secs)) => crate::schedule::fire_after(secs, &input.tz),
+        _ => Err(anyhow::anyhow!("give one of `at` and `in_secs`")),
+    }
+    .map_err(bad)?;
+    if next_fire_at < crate::db::now() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("{at} in {} has already passed", input.tz),
+        ));
+    }
+    let versions = s.definitions(&pin);
+    let schedule =
+        s.db.blocking(move |db| {
+            db.create_schedule(
+                input.id,
+                input.agent,
+                input.prompt,
+                at,
+                input.tz,
+                next_fire_at,
+                input.deadline_secs,
+                pin,
+                &versions,
+            )
+        })
+        .await
+        .map_err(bad)?;
+    Ok((StatusCode::CREATED, Json(s.with_changes(schedule))))
+}
+
+/// The schedule, or 404.
+async fn find_schedule(s: &Service, id: &str) -> Result<Schedule, ApiError> {
+    let id = id.to_string();
+    s.db.blocking(move |db| db.schedule(&id))
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "schedule not found".into()))
+}
+
+async fn inspect_schedule(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Schedule>, ApiError> {
+    Ok(Json(s.with_changes(find_schedule(&s, &id).await?)))
+}
+
+async fn schedule_history(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Vec<Event>>, ApiError> {
+    find_schedule(&s, &id).await?;
+    Ok(Json(
+        s.db.blocking(move |db| db.schedule_history(&id))
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+async fn pause_schedule(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Schedule>, ApiError> {
+    find_schedule(&s, &id).await?;
+    let schedule =
+        s.db.blocking(move |db| db.pause_schedule(&id, "paused by a client"))
+            .await
+            .map_err(conflict)?;
+    Ok(Json(s.with_changes(schedule)))
+}
+
+/// Resumes a paused schedule whose agents haven't changed; one whose
+/// agents have changed has to be approved again instead.
+async fn resume_schedule(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Schedule>, ApiError> {
+    let changed = s.with_changes(find_schedule(&s, &id).await?).changed_agents;
+    if !changed.is_empty() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "{}; review and approve it instead",
+                crate::db::version_change_reason(&changed)
+            ),
+        ));
+    }
+    let schedule =
+        s.db.blocking(move |db| db.resume_schedule(&id))
+            .await
+            .map_err(conflict)?;
+    Ok(Json(s.with_changes(schedule)))
+}
+
+/// Re-pins a schedule to its agents' current versions and makes it active,
+/// reporting what changed since it was last approved.
+async fn approve_schedule(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Approval>, ApiError> {
+    let schedule = find_schedule(&s, &id).await?;
+    let pin = s.pin(&schedule.agent).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "agent '{}' or one of its delegates is no longer configured",
+                schedule.agent
+            ),
+        )
+    })?;
+    let versions = s.definitions(&pin);
+    let (schedule, previous) =
+        s.db.blocking(move |db| db.approve_schedule(&id, pin, &versions))
+            .await
+            .map_err(conflict)?;
+    let mut changes = Vec::new();
+    for agent in host::version::changed(&previous, Some(&schedule.pinned_versions)) {
+        let from = previous.get(&agent).cloned();
+        let to = schedule.pinned_versions.get(&agent).cloned();
+        let ids = [from.clone(), to.clone()];
+        let definitions =
+            s.db.blocking(move |db| {
+                ids.iter()
+                    .map(|id| match id {
+                        Some(id) => Ok(db.agent_version(id)?.map(|v| v.definition)),
+                        None => Ok(None),
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+            .map_err(internal)?;
+        let fields = match (&definitions[0], &definitions[1]) {
+            (Some(Value::Object(old)), Some(Value::Object(new))) => {
+                let mut fields: Vec<String> = old
+                    .keys()
+                    .chain(new.keys())
+                    .filter(|key| old.get(*key) != new.get(*key))
+                    .cloned()
+                    .collect();
+                fields.sort();
+                fields.dedup();
+                Some(fields)
+            }
+            _ => None,
+        };
+        changes.push(VersionChange {
+            agent,
+            from,
+            to,
+            fields,
+        });
+    }
+    Ok(Json(Approval {
+        schedule: s.with_changes(schedule),
+        changes,
+    }))
+}
+
+async fn delete_schedule(
+    State(s): State<Service>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Json<Schedule>, ApiError> {
+    find_schedule(&s, &id).await?;
+    let schedule =
+        s.db.blocking(move |db| db.delete_schedule(&id))
+            .await
+            .map_err(conflict)?;
+    Ok(Json(s.with_changes(schedule)))
+}
+
 async fn events(
     State(s): State<Service>,
     ApiPath(id): ApiPath<String>,
@@ -596,6 +881,18 @@ async fn execute(
     shutdown: CancellationToken,
     context: Arc<ExecutionContext>,
 ) -> Result<()> {
+    // A scheduled run starts only as its schedule was approved: one queued
+    // before a restart may otherwise start under a different config.
+    if let Some(pinned) = &run.pinned_versions {
+        let changed = host::version::changed(pinned, executor.pin(&run.agent).as_ref());
+        if !changed.is_empty() {
+            let reason = crate::db::version_change_reason(&changed);
+            tracing::warn!(schedule = ?run.schedule_id, "scheduled run refused: its agent changed");
+            db.blocking(move |db| db.refuse_scheduled_run(&run.id, &reason))
+                .await?;
+            return Ok(());
+        }
+    }
     let transcript = db
         .blocking({
             let session = run.session_id.clone();
@@ -829,6 +1126,11 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     .await??;
     let runtime = host::Runtime::new(config).await?;
     runtime.check_dirs_exclude(data_dir)?;
+    // Every current version, so each can be read, e.g. to review it before
+    // approving a schedule for it, before any run has used it.
+    let versions: Vec<_> = runtime.agent_versions().into_values().collect();
+    db.blocking(move |db| db.store_agent_versions(&versions))
+        .await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let token = format!("{}{}", crate::db::new_id(), crate::db::new_id());
     let info = ConnectionInfo {
@@ -836,17 +1138,19 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         token: token.clone(),
     };
     instance.publish(&info)?;
-    let service =
-        Service::new(db.clone(), token, runtime.agents()).with_components(runtime.capabilities());
+    let service = Service::new(db.clone(), token, runtime.agents())
+        .with_components(runtime.capabilities())
+        .with_versions(runtime.agent_versions());
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
-    let worker = worker(
-        db,
-        Arc::new(WasmExecutor(runtime)),
-        concurrency,
-        worker_stop,
-    );
+    let executor: Arc<dyn Executor> = Arc::new(WasmExecutor(runtime));
+    let scheduler = tokio::spawn(crate::schedule::scheduler(
+        db.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    let worker = worker(db, executor, concurrency, worker_stop);
     let http =
         axum::serve(listener, service.router()).with_graceful_shutdown(http_stop.cancelled_owned());
     tracing::info!(port = info.port, "runner listening on loopback");
@@ -858,6 +1162,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         result = &mut http => { shutdown.cancel(); result?; worker.await?; }
         result = stop_signal() => { shutdown.cancel(); result?; worker.await?; }
     }
+    let _ = scheduler.await;
     // Dropping the HTTP server also closes any attached event streams.
     drop(instance);
     Ok(())
