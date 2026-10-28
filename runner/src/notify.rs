@@ -17,14 +17,14 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Database, Notification, Run, Schedule};
-use crate::summary::{Alert, Summary};
+use crate::summary::{Alert, RunEnd, Summary};
 
 /// How often ended runs are looked for.
 const TICK: Duration = Duration::from_secs(1);
 
 /// When runs notify: `all` of them, only `problems` (a run that didn't
-/// complete, i.e. failed, was interrupted or was cancelled, or that raised an
-/// alert), or `never`. A run's own level wins, then its schedule's, then
+/// complete, i.e. failed, was interrupted or was cancelled, or one it
+/// delegated to that didn't, or that raised an alert), or `never`. A run's own level wins, then its schedule's, then
 /// `problems`.
 pub const LEVELS: &[&str] = &["all", "problems", "never"];
 
@@ -49,6 +49,9 @@ pub struct Note {
     pub status: String,
     pub duration_ms: Option<u64>,
     pub alerts: Vec<Alert>,
+    /// Runs it delegated to, transitively, that ended without completing.
+    #[serde(default)]
+    pub delegated_not_completed: Vec<RunEnd>,
     /// For a scheduled run, its schedule's status when the run was checked,
     /// e.g. `paused` after a run refused because its agent changed.
     pub schedule_status: Option<String>,
@@ -65,7 +68,13 @@ pub fn note(
     let level = own
         .or(schedule.map(|s| s.notify.as_str()))
         .unwrap_or("problems");
-    let problem = run.status != "completed" || !summary.alerts.is_empty();
+    let delegated: Vec<_> = summary
+        .not_completed
+        .iter()
+        .filter(|end| end.run_id != run.id)
+        .cloned()
+        .collect();
+    let problem = run.status != "completed" || !delegated.is_empty() || !summary.alerts.is_empty();
     let wanted = match level {
         "all" => true,
         "never" => false,
@@ -77,6 +86,7 @@ pub fn note(
         status: run.status.clone(),
         duration_ms: summary.duration_ms,
         alerts: summary.alerts.clone(),
+        delegated_not_completed: delegated,
         schedule_status: schedule.map(|s| s.status.clone()),
     })
 }
@@ -92,6 +102,11 @@ pub fn title(note: &Note) -> String {
         0 => {}
         1 => title.push_str(", 1 alert"),
         n => title.push_str(&format!(", {n} alerts")),
+    }
+    match note.delegated_not_completed.len() {
+        0 => {}
+        1 => title.push_str(", 1 delegated run didn't complete"),
+        n => title.push_str(&format!(", {n} delegated runs didn't complete")),
     }
     if note.schedule_status.as_deref() == Some("paused") {
         title.push_str("; schedule paused");
@@ -124,6 +139,12 @@ pub fn render(notifications: &[Notification]) -> String {
         ));
         for alert in &n.note.alerts {
             out.push_str(&format!("    {}: {}\n", alert.kind, alert.message));
+        }
+        for end in &n.note.delegated_not_completed {
+            out.push_str(&format!(
+                "    delegated run {} {}\n",
+                end.run_id, end.status
+            ));
         }
     }
     out
@@ -289,5 +310,25 @@ mod tests {
             (&None, &None)
         );
         assert_eq!(title(&unscheduled), "run (agent researcher): interrupted");
+        // A run that completed, with a delegate that didn't, is a problem.
+        let mut tree = summary(&[]);
+        tree.not_completed = vec![RunEnd {
+            run_id: "c".into(),
+            status: "failed".into(),
+        }];
+        let delegated = super::note(&run("completed"), None, &tree, None).unwrap();
+        assert_eq!(
+            title(&delegated),
+            "run (agent researcher): completed, 1 delegated run didn't complete"
+        );
+        let n = Notification {
+            note: delegated,
+            ..n
+        };
+        assert!(render(&[n]).ends_with("\n    delegated run c failed\n"));
+        // The root's own end isn't counted as a delegate's.
+        tree.not_completed[0].run_id = "r".into();
+        let own = super::note(&run("failed"), None, &tree, None).unwrap();
+        assert!(own.delegated_not_completed.is_empty());
     }
 }

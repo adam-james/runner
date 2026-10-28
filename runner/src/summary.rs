@@ -35,6 +35,10 @@ pub struct Summary {
     /// Of those, the ones still queued or running, whose records may be
     /// incomplete.
     pub unfinished_runs: usize,
+    /// Of those, the ones that ended without completing (`failed`,
+    /// `interrupted` or `cancelled`), the root included, in order.
+    #[serde(default)]
+    pub not_completed: Vec<RunEnd>,
     pub turns: u64,
     /// From the tree's first audit record to its last; `None` without any.
     pub duration_ms: Option<u64>,
@@ -62,6 +66,13 @@ pub struct Alert {
     /// What happened, written by the host. A guest-influenced string in it,
     /// such as a host, is JSON-quoted.
     pub message: String,
+}
+
+/// A run in a tree that ended without completing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunEnd {
+    pub run_id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +133,14 @@ pub fn summarize(
         alerts: Vec::new(),
         runs: tree.len(),
         unfinished_runs: tree.iter().filter(|r| !r.terminal()).count(),
+        not_completed: tree
+            .iter()
+            .filter(|r| r.terminal() && r.status != "completed")
+            .map(|r| RunEnd {
+                run_id: r.id.clone(),
+                status: r.status.clone(),
+            })
+            .collect(),
         turns: 0,
         duration_ms: None,
         actions: BTreeMap::new(),
@@ -269,6 +288,18 @@ pub fn render(summary: &Summary) -> String {
         ));
     }
     out.push('\n');
+    let delegates: Vec<_> = summary
+        .not_completed
+        .iter()
+        .filter(|end| end.run_id != summary.run_id)
+        .map(|end| format!("{} {}", end.run_id, end.status))
+        .collect();
+    if !delegates.is_empty() {
+        out.push_str(&format!(
+            "delegated runs not completed: {}\n",
+            delegates.join(", ")
+        ));
+    }
     if !summary.actions.is_empty() {
         let actions: Vec<_> = summary
             .actions
@@ -413,7 +444,22 @@ mod tests {
         let mut trail = records("r", &turn());
         // The child is still running: no turn.finished yet.
         trail.extend(records("c", &turn()[..2]));
-        let summary = summarize(&root, &[root.clone(), child], &trail, None);
+        let summary = summarize(&root, &[root.clone(), child.clone()], &trail, None);
+        assert!(summary.not_completed.is_empty());
+        // A child that ended badly under a parent that completed.
+        let failed = Run {
+            status: "failed".into(),
+            ..child
+        };
+        let ended = summarize(&root, &[root.clone(), failed], &trail, None);
+        assert_eq!(
+            ended.not_completed,
+            [RunEnd {
+                run_id: "c".into(),
+                status: "failed".into()
+            }]
+        );
+        assert!(render(&ended).contains("\ndelegated runs not completed: c failed\n"));
         assert_eq!(
             (summary.runs, summary.unfinished_runs, summary.turns),
             (2, 1, 2)

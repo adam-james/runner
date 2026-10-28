@@ -2181,3 +2181,36 @@ async fn a_submitted_run_takes_its_own_level() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
     h.close().await;
 }
+
+#[test]
+fn a_delegated_run_that_fails_under_a_completed_parent_notifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+    db.submit(None, "default".into(), "parent".into(), 60)
+        .unwrap();
+    let parent = db.claim().unwrap().unwrap();
+    let child = db.delegate(&parent.id, "default", "child", None).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().id, child.id);
+    audited_turn(&db, &parent.id, &[]);
+    audited_turn(&db, &child.id, &[]);
+    db.finish(&child.id, "failed", None).unwrap();
+    db.finish(&parent.id, "completed", None).unwrap();
+    let stored = runner::notify::check_ended(&db).unwrap();
+    assert_eq!(stored.len(), 1);
+    let n = &stored[0];
+    assert_eq!(n.run_id, parent.id);
+    assert_eq!(n.note.status, "completed");
+    assert_eq!(
+        n.note.delegated_not_completed,
+        [runner::summary::RunEnd {
+            run_id: child.id.clone(),
+            status: "failed".into()
+        }]
+    );
+    assert_eq!(
+        runner::notify::title(&n.note),
+        "run (agent default): completed, 1 delegated run didn't complete"
+    );
+    let summary = db.summary(&parent.id).unwrap().unwrap();
+    assert_eq!(summary.not_completed.len(), 1);
+}

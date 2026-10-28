@@ -127,7 +127,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `GET /v1/runs/{id}` | Inspect status, prompt, session, deadline, cancellation request, and error |
 | `POST /v1/runs/{id}/cancel` | Request cancellation; safe to repeat; returns current run |
 | `GET /v1/runs/{id}/events` | SSE replay followed by live persisted events; optional `after` cursor or `Last-Event-ID` |
-| `GET /v1/runs/{id}/summary` | What the run and every run it delegated to did, made by the host from their audit records: `{"run_id", "agent", "schedule_id", "status", "alerts": [{"kind", "message"}], "runs", "unfinished_runs", "turns", "duration_ms", "actions", "hosts": [{"kind", "component", "host", "allowed", "denied"}], "credentials_withheld", "denials": {"total", "records"}, "errors": {"total", "records"}, "trail_problems"}`; at most 50 records listed each |
+| `GET /v1/runs/{id}/summary` | What the run and every run it delegated to did, made by the host from their audit records: `{"run_id", "agent", "schedule_id", "status", "alerts": [{"kind", "message"}], "runs", "unfinished_runs", "not_completed": [{"run_id", "status"}], "turns", "duration_ms", "actions", "hosts": [{"kind", "component", "host", "allowed", "denied"}], "credentials_withheld", "denials": {"total", "records"}, "errors": {"total", "records"}, "trail_problems"}`; at most 50 records listed each |
 | `POST /v1/schedules` | `{ "id": "optional-name", "agent": "default", "prompt": "...", "at": "2026-10-29T07:00", "tz": "Europe/Warsaw", "deadline_secs": 600 }`, or `"in_secs": 2` (1 second to a year from now) or `"cron": "0 7 * * MON-FRI"` (recurring) instead of `at`; pins the agent's versions; returns schedule, HTTP 201 |
 | `GET /v1/schedules` | List schedules that haven't been deleted |
 | `GET /v1/schedules/{id}` | Inspect a schedule, deleted ones included |
@@ -305,7 +305,8 @@ checks each once. Every top-level run counts, scheduled or not: the daemon
 assumes nobody is watching, since a client can be attached while nobody looks
 and alerts never show in chat. A level decides whether the run gets a
 notification: `all`, `problems` (any status but `completed`, i.e. `failed`,
-`interrupted` or `cancelled`, or any summary alert) or `never`. The run's own level
+`interrupted` or `cancelled`, for the run or any run it delegated to, or any
+summary alert) or `never`. The run's own level
 (`notify` on `POST /v1/runs`) wins, then its schedule's, then `problems`.
 Delegated runs aren't checked separately; their root's summary covers them. A
 notification stores only host-written fields: the schedule (if any), agent,
