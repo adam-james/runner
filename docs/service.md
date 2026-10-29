@@ -323,13 +323,9 @@ stays stored either way, and a desktop that can't show notifications would
 only fail again. More than three waiting at once are posted as one. A failed
 post is logged once until posting works again. Notifications from before
 desktop posting existed count as posted. Posting is macOS only for now, to
-Notification Center, in-process through the `notify-rust` crate ; no command is run.
-It posts as `[notifications] app`, else the app the daemon was started
-from (`__CFBundleIdentifier`, which macOS gives an app's processes, then
-`TERM_PROGRAM` for Ghostty, iTerm2 and WezTerm), else Terminal, logged at
-startup. The app is always set, since the crate would otherwise look one up
-with AppleScript. A click brings that app forward. `sound` is `default`
-(the default), a sound's name, or `""` for none. The crate doesn't report a failed post, so
+Notification Center, in-process through the `notify-rust` crate (posting as
+Terminal, set explicitly so the crate doesn't look an app up with
+AppleScript); no command is run. The crate doesn't report a failed post, so
 nothing is logged then. On other OSes nothing is posted or marked posted.
 
 The TUI lists `GET /v1/notifications` with its other polling, once a second,

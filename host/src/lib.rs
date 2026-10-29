@@ -74,33 +74,20 @@ struct RunnerConfig {
 #[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotificationsConfig {
-    /// Post each notification to macOS Notification Center.
+    /// Post each notification to the desktop: macOS Notification Center,
+    /// or a freedesktop notification server on Linux.
     #[serde(default = "desktop_default")]
     desktop: bool,
-    /// The bundle ID of the app notifications post as, which a click brings
-    /// forward; by default the terminal the daemon was started from.
-    #[serde(default)]
-    app: Option<String>,
-    /// The sound they play: `default`, a sound's name (e.g. `Glass`), or
-    /// `""` for none.
-    #[serde(default = "sound_default")]
-    sound: String,
 }
 
 fn desktop_default() -> bool {
     true
 }
 
-fn sound_default() -> String {
-    "default".into()
-}
-
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             desktop: desktop_default(),
-            app: None,
-            sound: sound_default(),
         }
     }
 }
@@ -1546,16 +1533,6 @@ impl Runtime {
         self.config.notifications.desktop
     }
 
-    /// The configured bundle ID desktop notifications post as, if any.
-    pub fn notification_app(&self) -> Option<&str> {
-        self.config.notifications.app.as_deref()
-    }
-
-    /// The sound desktop notifications play, or `None` for silence.
-    pub fn notification_sound(&self) -> Option<&str> {
-        Some(self.config.notifications.sound.as_str()).filter(|sound| !sound.is_empty())
-    }
-
     fn component(&self, path: &str) -> Result<Component> {
         self.components
             .get(path)
@@ -2559,16 +2536,9 @@ mod tests {
                 .notifications
                 .desktop
         );
-        let defaults = config("").unwrap().notifications;
-        assert_eq!((defaults.app, defaults.sound.as_str()), (None, "default"));
-        let set = config("[notifications]\napp = \"com.mitchellh.ghostty\"\nsound = \"\"")
-            .unwrap()
-            .notifications;
-        assert_eq!(set.app.as_deref(), Some("com.mitchellh.ghostty"));
-        assert_eq!(set.sound, "");
-        let error = config("[notifications]\nbadge = true").err().unwrap();
+        let error = config("[notifications]\nsound = true").err().unwrap();
         assert!(
-            error.to_string().contains("unknown field `badge`"),
+            error.to_string().contains("unknown field `sound`"),
             "{error}"
         );
     }
