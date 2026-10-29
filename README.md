@@ -295,9 +295,20 @@ the run's error, so a prompt injection can't put a convincing fake message in
 what looks like a system notice. A run is checked once its whole delegation
 tree has ended; delegated runs are covered by their parent's notification.
 
+On macOS the daemon also posts each notification to Notification Center once,
+posting as Terminal. It posts in-process through the `notify-rust` crate and
+never runs a command to do it. When more than three are waiting at once, such
+as after the daemon was stopped a while, they're posted as one. Either way the
+notification is still there to read. Other OSes don't post yet. To turn it off:
+
+```toml
+[notifications]
+desktop = false
+```
+
 `runner tui` shows how many are unread in its status bar, says when a new one
 arrives, and lists the newest 100 with Ctrl-G. Enter on one opens its run's
-session, scrolled to that run, and marks it read. Desktop notifications come next.
+session, scrolled to that run, and marks it read.
 
 ### Audit log
 

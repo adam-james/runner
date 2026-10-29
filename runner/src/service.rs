@@ -1235,6 +1235,21 @@ async fn contain(
     None
 }
 
+/// Where the notifier posts, if `wanted`: nowhere but macOS for now.
+fn desktop(wanted: bool) -> Option<Arc<dyn crate::notify::Desktop>> {
+    #[cfg(target_os = "macos")]
+    {
+        wanted.then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if wanted {
+            tracing::info!("desktop notifications are macOS only; see `runner notifications`");
+        }
+        None
+    }
+}
+
 pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<()> {
     if concurrency == 0 {
         bail!("concurrency must be positive");
@@ -1267,13 +1282,18 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
+    let desktop = desktop(runtime.desktop_notifications());
     let executor: Arc<dyn Executor> = Arc::new(WasmExecutor(runtime));
     let scheduler = tokio::spawn(crate::schedule::scheduler(
         db.clone(),
         executor.clone(),
         shutdown.clone(),
     ));
-    let notifier = tokio::spawn(crate::notify::notifier(db.clone(), shutdown.clone()));
+    let notifier = tokio::spawn(crate::notify::notifier(
+        db.clone(),
+        desktop,
+        shutdown.clone(),
+    ));
     let worker = worker(db, executor, concurrency, worker_stop);
     let http =
         axum::serve(listener, service.router()).with_graceful_shutdown(http_stop.cancelled_owned());

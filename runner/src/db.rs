@@ -191,6 +191,37 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
 
 const RUN_COLUMNS: &str = "id, session_id, agent, prompt, status, created_at, deadline_secs, cancel_requested, error, parent_run_id, root_run_id, depth, deadline_at, schedule_id, pinned_versions";
 
+/// The notifications matching `filter`, an SQL `WHERE` clause and order.
+fn query_notifications(
+    conn: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<Notification>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, run_id, created_at, read_at, data FROM notifications {filter}"
+    ))?;
+    let rows = stmt.query_map(params, |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, run_id, created_at, read_at, data) = row?;
+        Ok(Notification {
+            id,
+            run_id,
+            created_at,
+            read_at,
+            note: serde_json::from_str(&data)?,
+        })
+    })
+    .collect()
+}
+
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
@@ -373,7 +404,7 @@ impl Database {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if version > 9 {
+        if version > 10 {
             bail!("service database was created by a newer runner version");
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -563,6 +594,24 @@ impl Database {
                  CREATE INDEX IF NOT EXISTS unread_notifications ON notifications(id)
                      WHERE read_at IS NULL;
                  PRAGMA user_version=9;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 10 {
+            let tx = conn.unchecked_transaction()?;
+            // When each notification was posted to the desktop. Ones from
+            // before this step count as posted, so upgrading doesn't post
+            // every old notification at once.
+            if !has_column(&tx, "notifications", "delivered_at")? {
+                tx.execute_batch(
+                    "ALTER TABLE notifications ADD COLUMN delivered_at INTEGER;
+                     UPDATE notifications SET delivered_at=created_at;",
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS undelivered_notifications ON notifications(id)
+                     WHERE delivered_at IS NULL;
+                 PRAGMA user_version=10;",
             )?;
             tx.commit()?;
         }
@@ -1584,31 +1633,11 @@ impl Database {
     /// Notifications, newest first, at most `limit`; only unread ones if
     /// `unread`.
     pub fn notifications(&self, unread: bool, limit: usize) -> Result<Vec<Notification>> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, created_at, read_at, data FROM notifications
-             WHERE ?1=0 OR read_at IS NULL ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![unread, limit as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, run_id, created_at, read_at, data) = row?;
-            Ok(Notification {
-                id,
-                run_id,
-                created_at,
-                read_at,
-                note: serde_json::from_str(&data)?,
-            })
-        })
-        .collect()
+        query_notifications(
+            &self.0.lock().unwrap(),
+            "WHERE ?1=0 OR read_at IS NULL ORDER BY id DESC LIMIT ?2",
+            params![unread, limit as i64],
+        )
     }
 
     /// Marks notification `id`, or every unread one if `None`, read.
@@ -1618,6 +1647,30 @@ impl Database {
             "UPDATE notifications SET read_at=?1 WHERE read_at IS NULL AND (?2 IS NULL OR id=?2)",
             params![now(), id],
         )?)
+    }
+
+    /// Notifications not yet posted to the desktop, oldest first, read or
+    /// not.
+    pub fn undelivered(&self) -> Result<Vec<Notification>> {
+        query_notifications(
+            &self.0.lock().unwrap(),
+            "WHERE delivered_at IS NULL ORDER BY id",
+            [],
+        )
+    }
+
+    /// Marks notifications `ids` posted to the desktop.
+    pub fn mark_delivered(&self, ids: &[i64]) -> Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE notifications SET delivered_at=?1 WHERE id=?2 AND delivered_at IS NULL",
+                params![now(), id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Whether notification `id` exists.

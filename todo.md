@@ -55,7 +55,14 @@ In order; each step ships something usable on its own.
      - ~~test that a component's environment is empty~~ done: `wasi:cli/environment` isn't linked, and the fixture probe checks it reads no env vars
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
      - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks every top-level run once its tree has ended, scheduled or not, assuming nobody watched; level `all|problems|never` (problems: the run or a delegated run didn't complete, or an alert), per schedule (`schedules add --notify`) or per run (`runner run --notify`), default `problems`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
-     - next: delivered as desktop notifications (macOS Notification Center, freedesktop on Linux)
+     - delivered as desktop notifications: the notifier posts each once (macOS only, to Notification Center, in-process through `notify-rust`, posting as Terminal; no subprocess), more than three waiting as one, a failure logged once and not retried; `[notifications] desktop = false` turns it off
+       - next (2026-10-29): no banner shows on macOS even though the daemon says it's posting and the notification is stored; the crate discards macOS's error, so nothing is logged. Test `notify-rust` outside the daemon, posting from the main thread and from a worker thread like the daemon (a throwaway `runner/examples/notify_test.rs`), as Ghostty and as Terminal. Suspects:
+         - the daemon's main thread runs tokio, not macOS's main run loop, and `mac-notification-sys` expects delivery callbacks on the main run loop
+         - posting as another app's bundle ID through Apple's deprecated `NSUserNotification` API, which recent macOS may quietly drop
+         - System Settings → Notifications for the app, or Focus
+       - then: play a sound and post as the terminal the daemon was started from (`__CFBundleIdentifier`, then `TERM_PROGRAM`), so a click brings it forward, with `[notifications] app` and `sound` settings (reverted in 7314fc4; restore with `git revert 7314fc4`)
+       - if the crate can't be made to work: the TUI posting through its terminal (below) may be the main route, and the daemon's posting goes
+     - next: the TUI posts through its terminal too, with OSC 9 (`ESC ] 9 ; text BEL`), so a click goes to that exact window and tab (Ghostty, iTerm2, kitty, WezTerm; any OS); strip control characters from the text first so it can't end the sequence; check on a Mac that clicking one in Ghostty focuses the tab; skip the daemon's post while a TUI is posting, so one notification isn't two banners
      - ~~listed in the TUI, with an unread count~~ done: the status bar counts unread ones and says when one arrives; Ctrl-G lists the newest 100; Enter opens the run's session scrolled to that run and marks it read; r / R mark one or all read
      - approval requests (step 4) use the same channel
    - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule
@@ -96,6 +103,7 @@ In order; each step ships something usable on its own.
   - check each component's `dir` when the daemon starts and refuse to start with the reason, like a missing env var
   - log why a component failed to load on the daemon's stderr (host-made errors: paths, not guest output)
   - record the reason in the trail, e.g. `sandbox.create` with `outcome: "dir_missing"`, instead of `interrupted`
+- desktop notifications on Linux: enable `notify-rust` there too (pure-Rust zbus to the freedesktop D-Bus interface, no subprocess); escape `&`, `<`, `>` in the body, since servers may render markup; test it on a real desktop session; notifications stored meanwhile were never marked posted, so mark them posted when it ships rather than posting them all as one
 - OAuth/login
 - encrypted store for API keys - nice to have, not a differentiator
 - prune bundled demo tools (sports, weather) in favor of a few genuinely useful ones (files, web, python, git, http fetch)

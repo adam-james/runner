@@ -231,3 +231,8 @@ Check for:
 - Anything unusual in volume or timing, e.g. bursts of requests.
 Report findings ranked by severity, citing each record's run and seq, with a
 likely explanation and a concrete fix. Say plainly when a trail looks clean."""
+
+# On macOS the daemon posts each notification to Notification Center.
+# Uncomment to turn that off.
+# [notifications]
+# desktop = false

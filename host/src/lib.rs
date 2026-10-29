@@ -66,6 +66,30 @@ struct RunnerConfig {
     /// Must include `default`.
     #[serde(default)]
     agents: BTreeMap<String, AgentConfig>,
+    #[serde(default)]
+    notifications: NotificationsConfig,
+}
+
+/// The `[notifications]` table: how the daemon tells the user a run ended.
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationsConfig {
+    /// Post each notification to the desktop: macOS Notification Center,
+    /// or a freedesktop notification server on Linux.
+    #[serde(default = "desktop_default")]
+    desktop: bool,
+}
+
+fn desktop_default() -> bool {
+    true
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            desktop: desktop_default(),
+        }
+    }
 }
 
 /// One `[agents.<name>]` table.
@@ -1503,6 +1527,12 @@ impl Runtime {
         dirs_exclude(&self.config, protected)
     }
 
+    /// Whether notifications are posted to the desktop (`[notifications]
+    /// desktop`, on by default).
+    pub fn desktop_notifications(&self) -> bool {
+        self.config.notifications.desktop
+    }
+
     fn component(&self, path: &str) -> Result<Component> {
         self.components
             .get(path)
@@ -2492,6 +2522,24 @@ mod tests {
         assert_eq!(
             redact(&config, "bad key other-secret-key"),
             "bad key [redacted]"
+        );
+    }
+
+    #[test]
+    fn desktop_notifications_are_on_unless_turned_off() {
+        let config = |toml: &str| toml::from_str::<RunnerConfig>(toml);
+        assert!(config("").unwrap().notifications.desktop);
+        assert!(config("[notifications]").unwrap().notifications.desktop);
+        assert!(
+            !config("[notifications]\ndesktop = false")
+                .unwrap()
+                .notifications
+                .desktop
+        );
+        let error = config("[notifications]\nsound = true").err().unwrap();
+        assert!(
+            error.to_string().contains("unknown field `sound`"),
+            "{error}"
         );
     }
 
