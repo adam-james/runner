@@ -18,6 +18,12 @@ headers = { x-api-key = { value = "${ANTHROPIC_API_KEY}", hosts = [
     "api.anthropic.com",
 ] } }
 
+# Local Ollama needs no API key. Start `ollama serve` and pull the model first.
+[providers.ollama]
+path = "target/wasm32-wasip2/release/ollama.wasm"
+model = "qwen3:8b"
+allowed_hosts = ["localhost"]
+
 # A hung API shouldn't hold a run until its deadline; a timed-out tool gets a
 # new instance before its next call.
 [tools.get_weather]
@@ -236,3 +242,8 @@ likely explanation and a concrete fix. Say plainly when a trail looks clean."""
 # Uncomment to turn that off.
 # [notifications]
 # desktop = false
+
+# Local model with tool support. Try: runner chat --agent local
+[agents.local]
+provider = "ollama"
+tools = ["get_weather", "get_scores"]

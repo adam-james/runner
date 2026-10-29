@@ -7,6 +7,7 @@ members = [
     "tests/components/tool",
     "providers/anthropic",
     "providers/openai",
+    "providers/ollama",
     "tools/weather",
     "tools/sports",
     "tools/search",
