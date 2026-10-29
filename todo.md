@@ -16,14 +16,11 @@ practice; approval checkpoints (section 2, step 4) wait until one needs them.
 
 ## Daily use
 
-- job search: a scheduled agent that looks for new listings, appends them to a file to read, and notifies only when it found some
+- job search: an agent to chat with that finds listings
   - ~~a `job_boards` tool~~ done: Greenhouse, Lever and Ashby boards by name, and the latest HN "Who is hiring?" thread's top-level posts (via `hn.algolia.com`); filters by words and `posted_within_days`, newest first, bounded output; four exact `allowed_hosts`, no key
     - checked against the live APIs; Lever is slow (or a 502) on a large board it hasn't cached, so a 502-504 is retried once
-  - a host `notify` tool, so a run can notify when it found something: short, control characters dropped, marked as the agent's words; the schedule stays at `problems`, so a failed run still notifies
-  - a `job_search` agent in a personal config outside the repo (it holds the profile): profile in the system prompt, `job_boards`, and `read_file`/`edit_file` on `~/.runner/jobs`, where it appends new listings to `listings.md`, skipping URLs already there
-    - job posts are untrusted text that later runs read back from `listings.md`; acceptable, since the agent reaches only the job boards and its own dir
-    - later: `system_prompt_file`, if a long profile is awkward inline in TOML (still hashed into the version)
-  - a schedule for it (daily, or every few hours)
+  - ~~a `job_search` agent~~ done: `runner chat --agent job_search`, with `job_boards` only (no files, no schedule)
+  - later, if chatting isn't enough: a schedule that saves new listings to a file and notifies only when it found some (needs a host `notify` tool)
 - later: email triage (needs OAuth refresh in the host and a Gmail or JMAP read tool; read-only, no fetch, since email is the main injection route)
 - later: a daily brief with weather (and maybe news); a daily schedule needs to run a missed occurrence when the daemon wakes, since one more than a minute late is skipped
 
