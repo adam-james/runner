@@ -29,7 +29,8 @@ const HELP: &[(&str, &str)] = &[
     ("Home / End", "top of the conversation / follow new output"),
     ("Tab / Shift-Tab", "move between panes"),
     ("Esc", "leave the prompt box, for one-letter keys:"),
-    ("  n a q", "new session · agent · quit"),
+    ("  n a q", "notifications · agent · quit"),
+    ("Ctrl-U", "notifications (↑/↓, Enter opens, a reads all)"),
     ("  c", "cancel the highlighted run (Runs pane)"),
     ("Ctrl-C", "quit; runs keep going in the daemon"),
 ];
@@ -80,7 +81,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
         ));
     }
 
-    let bar = match &app.status {
+    let mut bar = match &app.status {
         Some((true, message)) => Line::from(message.as_str().red()),
         Some((false, message)) => Line::from(message.as_str()),
         None => {
@@ -95,6 +96,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
             ])
         }
     };
+    bar.spans.insert(
+        0,
+        format!(
+            "{} unread · ^U / n notifications  |  ",
+            app.notifications.len()
+        )
+        .cyan(),
+    );
     frame.render_widget(Paragraph::new(bar), status);
 
     if let Some(popup) = &app.popup {
@@ -205,9 +214,17 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect, now: i64) {
 
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     let mut lines = Vec::new();
+    let mut jump_line = None;
     for (index, turn) in app.turns.iter().enumerate() {
         if index > 0 {
             lines.push(Line::default());
+        }
+        if app.jump_run.as_ref() == Some(&turn.run.id) {
+            jump_line = Some(
+                Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(area.width.saturating_sub(2)),
+            );
         }
         turn_lines(turn, now, &mut lines);
     }
@@ -229,6 +246,10 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     let (width, last_height, last_max) = app.layout;
     if app.scroll > 0 && (width, last_height) == (area.width, area.height) {
         app.scroll = app.scroll.saturating_add(max.saturating_sub(last_max));
+    }
+    if let Some(line) = jump_line {
+        app.scroll = max.saturating_sub(line.min(u16::MAX as usize) as u16);
+        app.jump_run = None;
     }
     app.layout = (area.width, area.height, max);
     // Clamped here, where the height is known, so scrolling back down never
@@ -370,7 +391,45 @@ fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize,
 }
 
 fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup) {
+    if matches!(popup, Popup::Notifications) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(100);
+        let height = area.height.saturating_sub(4).max(1);
+        let rect = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let items: Vec<_> = app
+            .notifications
+            .iter()
+            .map(|note| {
+                ListItem::new(
+                    crate::notify::render(std::slice::from_ref(note))
+                        .lines()
+                        .map(|l| Line::from(l.to_owned()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        frame.render_widget(Clear, rect);
+        let title = if items.is_empty() {
+            " Notifications · no unread notifications · Esc closes "
+        } else {
+            " Notifications · ↑/↓ select · Enter opens run · a reads all · Esc closes "
+        };
+        let list = List::new(items)
+            .block(pane(title.into(), true))
+            .highlight_symbol("▸")
+            .highlight_style(Style::new().reversed());
+        let mut state = ListState::default()
+            .with_selected((!app.notifications.is_empty()).then_some(app.notification_cursor));
+        frame.render_stateful_widget(list, rect, &mut state);
+        return;
+    }
     let (title, lines): (&str, Vec<Line>) = match popup {
+        Popup::Notifications => unreachable!(),
         Popup::Help => (
             " Keys ",
             HELP.iter()
@@ -469,6 +528,22 @@ mod tests {
             schedule_id: None,
             pinned_versions: None,
         }
+    }
+
+    #[test]
+    fn notification_jump_scrolls_to_the_selected_run() {
+        let mut app = App::new(vec![], "default".into(), Some("trip".into()));
+        let runs = (0..40)
+            .map(|i| run(&format!("r{i}"), &format!("prompt {i}"), "completed"))
+            .collect();
+        app.update(Msg::Runs("trip".into(), runs));
+        app.jump_run = Some("r4".into());
+        let rendered = screen(&mut app, 0);
+        assert!(rendered.contains("> prompt 4 "), "{rendered}");
+        assert!(rendered.contains("0 unread"));
+        assert!(app.jump_run.is_none());
+        app.popup = Some(Popup::Notifications);
+        assert!(screen(&mut app, 0).contains("no unread notifications"));
     }
 
     #[test]

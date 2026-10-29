@@ -137,7 +137,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `POST /v1/schedules/{id}/approve` | Pin an active or paused schedule to its agents' current versions and make it active: `{"schedule", "changes": [{"agent", "from", "to", "fields"}]}` |
 | `DELETE /v1/schedules/{id}` | Delete it; cancels its occurrence if queued; returns it |
 | `POST /v1/schedules/{id}/notify` | `{"notify": "all" \| "problems" \| "never"}`: which of its runs notify; returns schedule. Creating a schedule takes `notify` too (default `problems`) |
-| `GET /v1/notifications` | Newest first, at most `limit` (1–1000, default 100); `?unread=true` for unread only: `[{"id", "run_id", "created_at", "read_at", "schedule_id", "agent", "status", "duration_ms", "alerts", "schedule_status"}]`, with `schedule_id` and `schedule_status` null for a run outside a schedule |
+| `GET /v1/notifications` | Newest first, at most `limit` (1–1000, default 100); `?unread=true` for unread only, `before=<id>` to page through older entries: `[{"id", "run_id", "created_at", "read_at", "schedule_id", "agent", "status", "duration_ms", "alerts", "schedule_status"}]`, with `schedule_id` and `schedule_status` null for a run outside a schedule |
 | `POST /v1/notifications/{id}/read` | Mark it read: `{"marked": 1}`, or 0 if it already was; 404 if there's none |
 | `POST /v1/notifications/read` | Mark every unread one read: `{"marked": n}` |
 

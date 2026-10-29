@@ -85,6 +85,38 @@ async fn event_loop(
             let send = send.clone();
             match action {
                 Action::Quit => quit = true,
+                Action::OpenNotification {
+                    id,
+                    run_id,
+                    generation,
+                } => {
+                    tokio::spawn(async move {
+                        match client.run(&run_id).await {
+                            Ok(run) => {
+                                send.send(Msg::NotificationRun { generation, run }).ok();
+                                if let Err(error) = client.read_notifications(Some(id)).await {
+                                    send.send(Msg::Error(format!("{error:#}"))).ok();
+                                }
+                            }
+                            Err(error) => {
+                                send.send(Msg::Error(format!("{error:#}"))).ok();
+                            }
+                        }
+                    });
+                }
+                Action::ReadNotifications => {
+                    tokio::spawn(async move {
+                        match client.read_notifications(None).await {
+                            Ok(_) => {
+                                send.send(Msg::Notice("all notifications marked read".into()))
+                                    .ok();
+                            }
+                            Err(error) => {
+                                send.send(Msg::Error(format!("{error:#}"))).ok();
+                            }
+                        }
+                    });
+                }
                 Action::Submit {
                     session,
                     agent,
@@ -224,6 +256,10 @@ async fn poll(
             Ok(sessions) => vec![Msg::Sessions(sessions)],
             Err(error) => vec![Msg::Error(format!("{error:#}"))],
         };
+        msgs.push(match client.unread_notifications().await {
+            Ok(notes) => Msg::Notifications(notes),
+            Err(error) => Msg::Error(format!("{error:#}")),
+        });
         if let Some(session) = session {
             msgs.push(match client.runs(Some(&session)).await {
                 Ok(runs) => Msg::Runs(session, runs),

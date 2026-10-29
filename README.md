@@ -126,6 +126,7 @@ shows failed and cancelled turns, marked as not saved to the conversation.
 | Key | Does |
 | --- | --- |
 | Enter | send the prompt; open the highlighted session |
+| Ctrl-U / Esc, n | unread notifications; ↑/↓ select, Enter opens the run and marks read, a marks all read |
 | Ctrl-N | new session, to run something alongside the others |
 | Ctrl-O | pick a past session (↑/↓, then Enter) |
 | Ctrl-A | start a new session with another agent |

@@ -1584,12 +1584,21 @@ impl Database {
     /// Notifications, newest first, at most `limit`; only unread ones if
     /// `unread`.
     pub fn notifications(&self, unread: bool, limit: usize) -> Result<Vec<Notification>> {
+        self.notifications_before(unread, limit, None)
+    }
+
+    pub fn notifications_before(
+        &self,
+        unread: bool,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Vec<Notification>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, run_id, created_at, read_at, data FROM notifications
-             WHERE ?1=0 OR read_at IS NULL ORDER BY id DESC LIMIT ?2",
+             WHERE (?1=0 OR read_at IS NULL) AND (?3 IS NULL OR id < ?3) ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![unread, limit as i64], |r| {
+        let rows = stmt.query_map(params![unread, limit as i64, before], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,

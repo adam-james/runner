@@ -243,6 +243,29 @@ impl Client {
         .await
     }
 
+    /// All unread notifications, paging past the API's per-request limit.
+    pub async fn unread_notifications(&self) -> Result<Vec<Notification>> {
+        let mut notes = Vec::new();
+        let mut before = String::new();
+        loop {
+            let page: Vec<Notification> = self
+                .json(
+                    Method::GET,
+                    &format!("/v1/notifications?unread=true&limit=1000{before}"),
+                    None,
+                )
+                .await?;
+            let done = page.len() < 1000;
+            if let Some(last) = page.last() {
+                before = format!("&before={}", last.id);
+            }
+            notes.extend(page);
+            if done {
+                return Ok(notes);
+            }
+        }
+    }
+
     /// Marks notification `id`, or every unread one, read. Returns how many
     /// were unread.
     pub async fn read_notifications(&self, id: Option<i64>) -> Result<u64> {

@@ -246,6 +246,7 @@ struct SetNotify {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotificationFilter {
+    before: Option<i64>,
     /// Only unread notifications.
     #[serde(default)]
     unread: bool,
@@ -831,9 +832,11 @@ async fn list_notifications(
         ));
     }
     Ok(Json(
-        s.db.blocking(move |db| db.notifications(filter.unread, filter.limit))
-            .await
-            .map_err(internal)?,
+        s.db.blocking(move |db| {
+            db.notifications_before(filter.unread, filter.limit, filter.before)
+        })
+        .await
+        .map_err(internal)?,
     ))
 }
 

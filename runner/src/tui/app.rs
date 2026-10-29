@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
-use crate::db::{Event, Run, Session};
+use crate::db::{Event, Notification, Run, Session};
 use crate::ui::{ARGS_LIMIT, delegation_label, name, token_usage_line, tool_call, truncate};
 
 /// How far PgUp/PgDn scroll the conversation.
@@ -17,6 +17,11 @@ pub enum Msg {
     /// Redraws the elapsed-time indicators.
     Tick,
     Sessions(Vec<Session>),
+    Notifications(Vec<Notification>),
+    NotificationRun {
+        generation: u64,
+        run: Run,
+    },
     /// A session's runs, in submission order.
     Runs(String, Vec<Run>),
     /// Every event of a run that had already finished when it was listed.
@@ -61,6 +66,12 @@ pub enum Action {
         generation: u64,
     },
     Cancel(String),
+    OpenNotification {
+        id: i64,
+        run_id: String,
+        generation: u64,
+    },
+    ReadNotifications,
     /// Stop following the old session's runs and poll this one's, if any.
     SelectSession {
         session: Option<String>,
@@ -97,6 +108,7 @@ const FOCUS_ORDER: [Focus; 4] = [
 #[derive(Debug, PartialEq, Eq)]
 pub enum Popup {
     Help,
+    Notifications,
     /// The agent picker, with the highlighted agent's index.
     Agents(usize),
     ConfirmCancel(String),
@@ -206,6 +218,9 @@ pub struct App {
     /// The shown session's runs, in submission order.
     pub turns: Vec<Turn>,
     pub run_cursor: usize,
+    pub notifications: Vec<Notification>,
+    pub notification_cursor: usize,
+    pub jump_run: Option<String>,
     pub focus: Focus,
     pub input: String,
     /// The input cursor, in chars.
@@ -235,6 +250,9 @@ impl App {
             sessions: Vec::new(),
             turns: Vec::new(),
             run_cursor: 0,
+            notifications: Vec::new(),
+            notification_cursor: 0,
+            jump_run: None,
             focus: Focus::Input,
             input: String::new(),
             cursor: 0,
@@ -257,6 +275,25 @@ impl App {
                 }
             }
             Msg::Tick => {}
+            Msg::Notifications(mut notes) => {
+                let selected = self
+                    .notifications
+                    .get(self.notification_cursor)
+                    .map(|n| n.id);
+                notes.sort_by_key(|n| std::cmp::Reverse(n.id));
+                self.notification_cursor = selected
+                    .and_then(|id| notes.iter().position(|n| n.id == id))
+                    .unwrap_or(self.notification_cursor.min(notes.len().saturating_sub(1)));
+                self.notifications = notes;
+            }
+            Msg::NotificationRun { generation, run } => {
+                if generation == self.generation {
+                    let action = self.select(Some(run.session_id.clone()));
+                    self.jump_run = Some(run.id);
+                    self.focus = Focus::Runs;
+                    return vec![action];
+                }
+            }
             Msg::Sessions(sessions) => self.sessions(sessions),
             Msg::Runs(session, runs) => return self.runs(session, runs),
             Msg::History {
@@ -381,6 +418,11 @@ impl App {
                 .position(|run| run.id == turn.run.id)
                 .unwrap_or(usize::MAX)
         });
+        if let Some(id) = &self.jump_run {
+            if let Some(index) = self.turns.iter().position(|t| &t.run.id == id) {
+                self.run_cursor = index;
+            }
+        }
         self.run_cursor = self.run_cursor.min(self.turns.len().saturating_sub(1));
         actions
     }
@@ -397,6 +439,7 @@ impl App {
         }
         self.session_cursor = session.clone();
         self.session = session.clone();
+        self.jump_run = None;
         self.turns.clear();
         self.run_cursor = 0;
         self.scroll = 0;
@@ -421,6 +464,7 @@ impl App {
         match key.code {
             KeyCode::Char('n') if ctrl => return vec![self.select(None)],
             KeyCode::Char('a') if ctrl => self.open_agents(),
+            KeyCode::Char('u') if ctrl => self.popup = Some(Popup::Notifications),
             KeyCode::Char('o') if ctrl => self.focus_sessions(),
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(FOCUS_ORDER.len() - 1),
@@ -539,7 +583,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return vec![Action::Quit],
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
-            KeyCode::Char('n') => return vec![self.select(None)],
+            KeyCode::Char('n') => self.popup = Some(Popup::Notifications),
             KeyCode::Char('a') => self.open_agents(),
             KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Input,
             KeyCode::End => self.scroll = 0,
@@ -580,6 +624,31 @@ impl App {
 
     fn popup_key(&mut self, popup: Popup, key: KeyEvent) -> Vec<Action> {
         match popup {
+            Popup::Notifications => {
+                self.popup = Some(Popup::Notifications);
+                match key.code {
+                    KeyCode::Esc => self.popup = None,
+                    KeyCode::Up => {
+                        self.notification_cursor = self.notification_cursor.saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        self.notification_cursor = (self.notification_cursor + 1)
+                            .min(self.notifications.len().saturating_sub(1))
+                    }
+                    KeyCode::Char('a') => return vec![Action::ReadNotifications],
+                    KeyCode::Enter => {
+                        if let Some(note) = self.notifications.get(self.notification_cursor) {
+                            self.popup = None;
+                            return vec![Action::OpenNotification {
+                                id: note.id,
+                                run_id: note.run_id.clone(),
+                                generation: self.generation,
+                            }];
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Popup::Help => {}
             Popup::Agents(index) => match key.code {
                 KeyCode::Up => self.popup = Some(Popup::Agents(index.saturating_sub(1))),
@@ -678,6 +747,88 @@ mod tests {
         for c in text.chars() {
             app.update(press(KeyCode::Char(c)));
         }
+    }
+
+    fn notification(id: i64) -> Notification {
+        Notification {
+            id,
+            run_id: format!("r{id}"),
+            created_at: id,
+            read_at: None,
+            note: crate::notify::Note {
+                schedule_id: None,
+                agent: "default".into(),
+                status: "completed".into(),
+                duration_ms: None,
+                alerts: vec![],
+                delegated_not_completed: vec![],
+                schedule_status: None,
+            },
+        }
+    }
+
+    #[test]
+    fn notifications_sort_preserve_selection_and_open_the_run() {
+        let mut app = app(Some("other"));
+        app.update(Msg::Notifications(vec![notification(1), notification(2)]));
+        app.focus = Focus::Runs;
+        app.update(press(KeyCode::Char('n')));
+        assert_eq!(app.popup, Some(Popup::Notifications));
+        assert_eq!(app.notifications[0].id, 2);
+        app.update(press(KeyCode::Down));
+        app.update(Msg::Notifications(vec![
+            notification(3),
+            notification(2),
+            notification(1),
+        ]));
+        assert_eq!(app.notification_cursor, 2);
+        assert_eq!(
+            app.update(press(KeyCode::Enter)),
+            vec![Action::OpenNotification {
+                id: 1,
+                run_id: "r1".into(),
+                generation: 0,
+            }]
+        );
+        let actions = app.update(Msg::NotificationRun {
+            generation: 0,
+            run: run("r1", "completed"),
+        });
+        assert_eq!(
+            actions,
+            vec![Action::SelectSession {
+                session: Some("s".into()),
+                generation: 1
+            }]
+        );
+        app.update(Msg::Runs(
+            "s".into(),
+            vec![run("r0", "completed"), run("r1", "completed")],
+        ));
+        assert_eq!(app.run_cursor, 1);
+        assert_eq!(app.jump_run.as_deref(), Some("r1"));
+        assert_eq!(app.focus, Focus::Runs);
+        // A late response must not switch away from the user's newer selection.
+        app.select(Some("newer".into()));
+        app.update(Msg::NotificationRun {
+            generation: 1,
+            run: run("r1", "completed"),
+        });
+        assert_eq!(app.session.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn notifications_read_all_and_empty_navigation() {
+        let mut app = app(None);
+        app.update(ctrl('u'));
+        app.update(press(KeyCode::Down));
+        assert!(app.update(press(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            app.update(press(KeyCode::Char('a'))),
+            vec![Action::ReadNotifications]
+        );
+        app.update(press(KeyCode::Esc));
+        assert!(app.popup.is_none());
     }
 
     #[test]

@@ -2018,6 +2018,19 @@ async fn notifications_are_listed_newest_first_until_read() {
         .map(|n| n["id"].as_i64().unwrap())
         .collect();
     assert!(ids.len() == 2 && ids[0] > ids[1], "{unread}");
+    let (_, page) = list("/v1/notifications?unread=true&limit=1").await;
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["id"], ids[0]);
+    let (status, page) = h
+        .api(
+            reqwest::Method::GET,
+            &format!("/v1/notifications?unread=true&limit=1&before={}", ids[0]),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["id"], ids[1]);
     assert_eq!(unread[0]["status"], "completed");
     assert_eq!(unread[0]["schedule_id"], "brief");
     let harness = &h;
