@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::db::{Event, Run};
+use crate::db::{AgentVersion, Event, Run};
 
 /// Denials and errors past this many are counted, not listed.
 pub const MAX_LISTED: usize = 50;
@@ -56,6 +56,100 @@ pub struct Summary {
     pub errors: Listed,
     /// Why the records might not be the whole story; see `audit::check`.
     pub trail_problems: Vec<String>,
+    /// What each component in the tree was allowed, from the agent versions
+    /// its runs used; empty if they predate agent versions.
+    #[serde(default)]
+    pub grants: Vec<Grant>,
+}
+
+/// What one component an agent ran with was allowed, written by the host
+/// from its config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Grant {
+    pub agent: String,
+    /// `provider`, `tool`, or `host` for a tool the host provides itself.
+    pub kind: String,
+    pub component: String,
+    /// In plain words, e.g. `can reach api.tavily.com; gets an
+    /// authorization header there; no filesystem access`.
+    pub access: String,
+}
+
+impl Grant {
+    /// One line, e.g. `agent reader: tool "read_file": no network access;
+    /// reads /notes`.
+    pub fn line(&self) -> String {
+        format!(
+            "agent {}: {} {}: {}",
+            self.agent,
+            self.kind,
+            json!(self.component),
+            self.access
+        )
+    }
+}
+
+/// What each component of each agent version in `versions` was allowed.
+/// These come from the config each run used, not its trail, so they hold
+/// when its sandboxes were made in an earlier run of the session (and its
+/// trail has no `sandbox.create`), or when an attempt never reached the
+/// host (a file operation with no `dir`).
+pub fn grants(versions: &[AgentVersion]) -> Vec<Grant> {
+    let mut grants = Vec::new();
+    for version in versions {
+        let definition = &version.definition;
+        let grant = |kind: &str, component: &str, access: String| Grant {
+            agent: version.agent.clone(),
+            kind: kind.into(),
+            component: component.into(),
+            access,
+        };
+        let components = std::iter::once(&definition["provider"])
+            .chain(definition["tools"].as_array().into_iter().flatten());
+        for component in components {
+            grants.push(
+                match serde_json::from_value::<host::inspect::Capabilities>(component.clone()) {
+                    Ok(c) => grant(&c.kind.to_string(), &c.name, c.summary()),
+                    Err(_) => grant(
+                        "component",
+                        component["name"].as_str().unwrap_or("?"),
+                        "unreadable in this version".into(),
+                    ),
+                },
+            );
+        }
+        let delegates: Vec<_> = definition["delegates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for tool in definition["host_tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let access = match tool {
+                "delegate" => format!("starts runs of {}", delegates.join(", ")),
+                "wait" => "waits for the runs it delegated".into(),
+                "audit_trail" => "reads other runs' audit trails".into(),
+                "inspect_component" => "reads every configured component's capabilities".into(),
+                _ => "provided by the host".into(),
+            };
+            grants.push(grant("host", tool, access));
+        }
+    }
+    // A tree can run the same agent version more than once.
+    let mut seen = Vec::new();
+    grants.retain(|grant| {
+        let new = !seen.contains(grant);
+        if new {
+            seen.push(grant.clone());
+        }
+        new
+    });
+    grants
 }
 
 /// Something in a summary that needs a person's attention.
@@ -155,6 +249,7 @@ pub fn summarize(
         } else {
             crate::audit::check(records)
         },
+        grants: Vec::new(),
     };
     let mut hosts: BTreeMap<(String, String, String), (u64, u64)> = BTreeMap::new();
     let times = records.iter().filter_map(|r| r.data["ts_ms"].as_u64());
@@ -323,6 +418,14 @@ pub fn render(summary: &Summary) -> String {
             out.push_str(&format!("  {line}\n"));
         }
     };
+    section(
+        "grants".into(),
+        if summary.grants.is_empty() {
+            vec!["not recorded (these runs predate agent versions)".into()]
+        } else {
+            summary.grants.iter().map(Grant::line).collect()
+        },
+    );
     section(
         "hosts".into(),
         summary
@@ -610,5 +713,71 @@ mod tests {
         assert!(text.contains("\nerrors (1):\n"));
         assert!(text.contains("\ntrail problems:\n  none\n"));
         assert!(text.contains("\ncredentials withheld: 1\n"));
+        assert!(
+            text.contains("\ngrants:\n  not recorded (these runs predate agent versions)\n"),
+            "{text}"
+        );
+    }
+
+    fn component(kind: &str, name: &str, extra: Value) -> Value {
+        let mut component = json!({"digest":"sha256:ab", "kind":kind, "name":name,
+            "path":format!("{name}.wasm"), "imports":["wasi:http/outgoing-handler@0.2.6"],
+            "allowed_hosts":[], "headers":[], "dir":null, "dir_writable":false,
+            "timeout_secs":null, "max_memory_mb":512, "memory_default":true,
+            "fresh_per_call":false});
+        component
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        component
+    }
+
+    #[test]
+    fn grants_come_from_each_agent_version_once() {
+        let version = |agent: &str, definition: Value| AgentVersion {
+            id: format!("sha256:{agent}"),
+            agent: agent.into(),
+            first_seen_at: 0,
+            definition,
+        };
+        let reader = version(
+            "reader",
+            json!({"provider":component("provider", "openai", json!({
+                    "allowed_hosts":["api.openai.com"],
+                    "headers":[{"name":"authorization","hosts":["api.openai.com"]}]})),
+                "tools":[component("tool", "read_file", json!({"dir":"/notes"})),
+                    {"name":"broken"}],
+                "host_tools":["delegate", "wait"], "delegates":["helper"]}),
+        );
+        let lines: Vec<_> = grants(&[reader.clone(), reader])
+            .iter()
+            .map(Grant::line)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                r#"agent reader: provider "openai": can reach api.openai.com; gets an authorization header there; no filesystem access"#,
+                r#"agent reader: tool "read_file": no network access; reads /notes"#,
+                r#"agent reader: component "broken": unreadable in this version"#,
+                r#"agent reader: host "delegate": starts runs of helper"#,
+                r#"agent reader: host "wait": waits for the runs it delegated"#,
+            ]
+        );
+        let root = run("r", "completed");
+        let mut summary = summarize(&root, std::slice::from_ref(&root), &[], None);
+        summary.grants = grants(&[version(
+            "auditor",
+            json!({"provider":component("provider", "fixture", json!({})),
+                "tools":[], "host_tools":["audit_trail"], "delegates":[]}),
+        )]);
+        let text = render(&summary);
+        assert!(
+            text.contains(
+                "\ngrants:\n  agent auditor: provider \"fixture\": no network access; no \
+                 filesystem access\n  agent auditor: host \"audit_trail\": reads other runs' \
+                 audit trails\n\nhosts:\n"
+            ),
+            "{text}"
+        );
     }
 }

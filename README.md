@@ -356,8 +356,10 @@ appear only as counts of headers added or held back.
 
 `runs summary` is the quick check for a run nobody watched, such as a
 schedule's. The host works it out from the audit records of the run and every
-run it delegated to, with no model involved: each host a component asked for
-with how many requests were allowed and denied, the records the host denied,
+run it delegated to, with no model involved: what each component was
+allowed (its grants, from the agent version each run used, so they show even
+when its sandbox was made in an earlier run of the session), each host a
+component asked for with how many requests were allowed and denied, the records the host denied,
 actions that didn't end normally (a trap, a timeout, an interrupted turn),
 credential headers held back, and problems with the trail itself. It leaves
 out the run's error text, which for a failed turn is the agent's own message
@@ -381,6 +383,12 @@ actions: http.request 9, provider.chat 4, sandbox.create 3, tool.call 3, turn.fi
 
 alerts (1):
   denied: the host denied 1 action
+
+grants:
+  agent researcher: provider "anthropic": can reach api.anthropic.com; gets an x-api-key header there; no filesystem access
+  agent researcher: tool "web_search": can reach api.tavily.com; gets an authorization header there; no filesystem access
+  agent researcher: host "delegate": starts runs of summarizer
+  agent summarizer: provider "anthropic": can reach api.anthropic.com; gets an x-api-key header there; no filesystem access
 
 hosts:
   provider "anthropic" → "api.anthropic.com": 4 allowed, 0 denied
