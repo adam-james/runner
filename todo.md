@@ -11,14 +11,6 @@ that waits for an approval that defaults to deny, and the audit log is how you
 find out what happened. Agents are the unit of capability: no separate grant
 system; for narrower access, define a narrower agent.
 
-Now: agents for daily use first, to find out which of the above matter in
-practice; approval checkpoints (section 2, step 4) wait until one needs them.
-
-## Daily use
-
-- later: email triage (needs OAuth refresh in the host and a Gmail or JMAP read tool; read-only, no fetch, since email is the main injection route)
-- later: a daily brief with weather (and maybe news); a daily schedule needs to run a missed occurrence when the daemon wakes, since one more than a minute late is skipped
-
 ## 1. Make capabilities visible
 
 - ~~show what a tool or provider can do before it's enabled~~ done: `runner tools inspect` / `providers inspect`, and per-tool summaries in `agents list` and session banners
