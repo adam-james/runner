@@ -414,7 +414,7 @@ mod tests {
 
     fn summary(alerts: &[&str]) -> Summary {
         let root = run("completed");
-        let mut summary = crate::summary::summarize(&root, std::slice::from_ref(&root), &[], None);
+        let mut summary = crate::summary::summarize(&root, std::slice::from_ref(&root), &[]);
         summary.duration_ms = Some(1200);
         summary.alerts = alerts
             .iter()
@@ -654,8 +654,8 @@ mod tests {
         let mut note = super::note(&run("failed"), None, &summary(&[]), None).unwrap();
         assert_eq!(body(&note), "took 1.200s, no alerts");
         note.alerts = vec![Alert {
-            kind: "new_host".into(),
-            message: "tool \"t\" reached \"<a href=x>evil</a>\"".into(),
+            kind: "denied".into(),
+            message: "tool \"t\" was denied \"<a href=x>evil</a>\"".into(),
         }];
         note.delegated_not_completed = vec![RunEnd {
             run_id: "c".into(),
@@ -663,7 +663,7 @@ mod tests {
         }];
         assert_eq!(
             body(&note),
-            "new_host: tool \"t\" reached \"<a href=x>evil</a>\"\ndelegated run c failed"
+            "denied: tool \"t\" was denied \"<a href=x>evil</a>\"\ndelegated run c failed"
         );
         note.alerts[0].message = "x".repeat(400);
         let long = body(&note);
