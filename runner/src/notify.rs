@@ -12,13 +12,12 @@
 //! guest-influenced strings in alerts (hosts, tool names) stay JSON-quoted.
 //!
 //! Each notification is also posted to the desktop once, unless
-//! `[notifications] desktop = false`: macOS Notification Center through
-//! `osascript`, or `notify-send` on Linux. Its text goes to them as
-//! arguments, never spliced into a script, and is escaped for the markup a
-//! Linux notification server may render.
-use std::process::{Command, Stdio};
+//! `[notifications] desktop = false`, in-process through `notify-rust`
+//! (Notification Center on macOS, D-Bus on Linux), never by running a
+//! command. On Linux its body is escaped for the markup a notification
+//! server may render.
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -268,63 +267,44 @@ pub fn body(note: &Note) -> String {
     }
 }
 
-/// The OS's own notifications, through its command-line tool.
+/// The OS's own notifications, posted in-process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub struct SystemDesktop;
 
-/// How long the notification tool may take before it's given up on.
-const POST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Which app notifications post as on macOS. Set explicitly, since the
+/// crate's default looks one up by running an AppleScript.
+#[cfg(target_os = "macos")]
+const MACOS_APP: &str = "com.apple.Terminal";
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Desktop for SystemDesktop {
     fn post(&self, title: &str, body: &str) -> Result<()> {
-        let mut command = if cfg!(target_os = "macos") {
-            // The text is the script's arguments, never part of its source.
-            let mut command = Command::new("osascript");
-            command.args([
-                "-e",
-                "on run argv",
-                "-e",
-                "display notification (item 2 of argv) with title (item 1 of argv)",
-                "-e",
-                "end run",
-                title,
-                body,
-            ]);
-            command
-        } else if cfg!(target_os = "linux") {
-            // Servers may render a subset of HTML in the body.
-            let mut command = Command::new("notify-send");
-            command.args(["--app-name=runner", "--", title, &escape_markup(body)]);
-            command
-        } else {
-            bail!("desktop notifications aren't supported on this OS");
-        };
-        let program = command.get_program().to_string_lossy().into_owned();
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("running {program}: {e}"))?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("{program} exited with {status}");
-                }
-                return Ok(());
+        #[cfg(target_os = "macos")]
+        {
+            static APP: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+            if let Err(error) = APP
+                .get_or_init(|| notify_rust::set_application(MACOS_APP).map_err(|e| e.to_string()))
+            {
+                bail!("posting as {MACOS_APP}: {error}");
             }
-            if started.elapsed() > POST_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("{program} took longer than {}s", POST_TIMEOUT.as_secs());
-            }
-            std::thread::sleep(Duration::from_millis(20));
         }
+        // Servers may render a subset of HTML in the body.
+        #[cfg(target_os = "linux")]
+        let body = &escape_markup(body);
+        // On macOS this posts when the handle drops, and the crate keeps any
+        // error to itself.
+        notify_rust::Notification::new()
+            .appname("runner")
+            .summary(title)
+            .body(body)
+            .show()?;
+        Ok(())
     }
 }
 
 /// `text` with the characters freedesktop body markup gives meaning to
 /// escaped, so a guest-influenced host can't become a link or formatting.
+#[cfg(any(target_os = "linux", test))]
 fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")

@@ -1235,6 +1235,23 @@ async fn contain(
     None
 }
 
+/// Where the notifier posts, if `wanted`: nowhere on an OS it can't post on.
+fn desktop(wanted: bool) -> Option<Arc<dyn crate::notify::Desktop>> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        wanted.then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        if wanted {
+            tracing::info!(
+                "desktop notifications are macOS and Linux only; see `runner notifications`"
+            );
+        }
+        None
+    }
+}
+
 pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<()> {
     if concurrency == 0 {
         bail!("concurrency must be positive");
@@ -1267,9 +1284,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
-    let desktop = runtime
-        .desktop_notifications()
-        .then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>);
+    let desktop = desktop(runtime.desktop_notifications());
     let executor: Arc<dyn Executor> = Arc::new(WasmExecutor(runtime));
     let scheduler = tokio::spawn(crate::schedule::scheduler(
         db.clone(),

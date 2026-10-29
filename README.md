@@ -295,10 +295,10 @@ what looks like a system notice. A run is checked once its whole delegation
 tree has ended; delegated runs are covered by their parent's notification.
 
 The daemon also posts each notification to the desktop once: macOS
-Notification Center (through `osascript`) or, on Linux, a freedesktop
-notification server (through `notify-send`). The title and alerts go to them
-as arguments, never as part of a script, and are escaped for the markup a
-Linux server may render. When more than three are waiting at once, such as
+Notification Center (posting as Terminal) or, on Linux, a freedesktop
+notification server over D-Bus. It posts in-process through the `notify-rust`
+crate and never runs a command to do it. On Linux the alerts are escaped
+for the markup a server may render. When more than three are waiting at once, such as
 after the daemon was stopped a while, they're posted as one. If posting
 fails, say on a machine with no notification server, the daemon logs it once
 and the notification is still there to read. To turn it off:
