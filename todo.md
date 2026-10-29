@@ -11,6 +11,15 @@ that waits for an approval that defaults to deny, and the audit log is how you
 find out what happened. Agents are the unit of capability: no separate grant
 system; for narrower access, define a narrower agent.
 
+## Next
+
+- run the job search hourly in the background: a `job_search` schedule (`--cron "0 * * * *" --notify all`) whose runs add new listings to one file
+  - give it read and write tools on its own `dir` (e.g. `~/.runner/jobs`), apart from `read_file`/`write_file`'s; a read-only `dir` has to exist before the daemon mounts it
+  - one file, `listings.md`, newest first; skip listings whose URL is already in it
+  - notify when each run is done (`--notify all` already does this; nothing new needed)
+  - listings are untrusted text that later runs read back from the file; acceptable while the agent reaches only the job boards, Tavily and its own `dir`
+  - its profile and preferences go in a personal config outside the repo, since the repo is public
+
 ## 1. Make capabilities visible
 
 - ~~show what a tool or provider can do before it's enabled~~ done: `runner tools inspect` / `providers inspect`, and per-tool summaries in `agents list` and session banners
