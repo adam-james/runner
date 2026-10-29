@@ -6,7 +6,7 @@
 mod app;
 mod view;
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,6 +140,17 @@ async fn event_loop(
                         }
                     });
                 }
+                Action::Post(posts) => {
+                    // Between draws, so it can't land inside one; an OSC
+                    // sequence doesn't move the cursor. A terminal without
+                    // OSC 9 ignores it.
+                    let mut out = io::stdout();
+                    for (title, body) in posts {
+                        out.write_all(crate::notify::osc9(&title, &body).as_bytes())
+                            .ok();
+                    }
+                    out.flush().ok();
+                }
                 Action::SelectSession { session, .. } => {
                     for follower in followers.drain(..) {
                         follower.abort();
@@ -243,7 +254,7 @@ async fn poll(
             Ok(sessions) => vec![Msg::Sessions(sessions)],
             Err(error) => vec![Msg::Error(format!("{error:#}"))],
         };
-        msgs.push(match client.notifications(false).await {
+        msgs.push(match client.notifications(false, true).await {
             Ok(notifications) => Msg::Notifications(notifications),
             Err(error) => Msg::Error(format!("{error:#}")),
         });

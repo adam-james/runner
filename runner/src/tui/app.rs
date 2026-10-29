@@ -74,6 +74,8 @@ pub enum Action {
     },
     /// Mark notification `id`, or every unread one, read.
     ReadNotifications(Option<i64>),
+    /// Post these (title, body) pairs through the terminal.
+    Post(Vec<(String, String)>),
     /// Stop following the old session's runs and poll this one's, if any.
     SelectSession {
         session: Option<String>,
@@ -350,7 +352,7 @@ impl App {
                 }
                 self.status = Some((true, error));
             }
-            Msg::Notifications(notifications) => self.notifications(notifications),
+            Msg::Notifications(notifications) => return self.notifications(notifications),
             Msg::Opened(run) => return self.open_run(run),
             Msg::Notice(text) => self.status = Some((false, text)),
             Msg::Error(text) => self.status = Some((true, text)),
@@ -367,14 +369,19 @@ impl App {
     }
 
     /// Takes in a fresh notification listing, saying in the status bar when
-    /// one has arrived since the last.
-    fn notifications(&mut self, notifications: Vec<Notification>) {
+    /// one has arrived since the last, and posting it.
+    fn notifications(&mut self, notifications: Vec<Notification>) -> Vec<Action> {
         let newest = notifications.iter().map(|n| n.id).max();
+        let mut actions = Vec::new();
         if let Some(seen) = self.newest_notification {
             let arrived: Vec<_> = notifications
                 .iter()
                 .filter(|n| n.id > seen && n.read_at.is_none())
                 .collect();
+            if !arrived.is_empty() {
+                let notes: Vec<_> = arrived.iter().map(|n| &n.note).collect();
+                actions.push(Action::Post(notify::posts(&notes)));
+            }
             if self.status.is_none() {
                 self.status = match arrived.as_slice() {
                     [] => None,
@@ -394,6 +401,7 @@ impl App {
         if let Some(Popup::Notifications(index)) = &mut self.popup {
             *index = (*index).min(self.notifications.len().saturating_sub(1));
         }
+        actions
     }
 
     /// Shows the session of an opened notification's run, scrolled to it.
@@ -855,11 +863,17 @@ mod tests {
         ]));
         assert_eq!(app.unread(), 1);
         assert_eq!(app.status, None, "those already there aren't news");
-        app.update(Msg::Notifications(vec![
-            notification(3, "c", false),
-            notification(2, "b", false),
-            notification(1, "a", true),
-        ]));
+        assert_eq!(
+            app.update(Msg::Notifications(vec![
+                notification(3, "c", false),
+                notification(2, "b", false),
+                notification(1, "a", true),
+            ])),
+            vec![Action::Post(vec![(
+                "runner: run (agent default): completed".into(),
+                "took 1.200s, no alerts".into()
+            )])]
+        );
         assert_eq!(app.unread(), 2);
         assert_eq!(
             app.status,
@@ -870,7 +884,10 @@ mod tests {
         );
         // Unchanged, it isn't announced again.
         app.status = None;
-        app.update(Msg::Notifications(app.notifications.clone()));
+        assert!(
+            app.update(Msg::Notifications(app.notifications.clone()))
+                .is_empty()
+        );
         assert_eq!(app.status, None);
     }
 

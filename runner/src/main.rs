@@ -430,7 +430,7 @@ async fn main() -> Result<()> {
         Command::Schedules { command } => schedules(&client, command).await?,
         Command::Notifications { command } => match command {
             Notifications::List { all, json } => {
-                let notifications = client.notifications(!all).await?;
+                let notifications = client.notifications(!all, false).await?;
                 if json {
                     print(&notifications)?
                 } else if notifications.is_empty() {

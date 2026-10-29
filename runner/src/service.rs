@@ -127,6 +127,8 @@ pub struct Service {
     /// Each agent definition's current version, by agent name; stored when
     /// a schedule is approved for it.
     versions: Arc<std::collections::BTreeMap<String, host::version::AgentVersion>>,
+    /// When a client last listed notifications saying it posts them itself.
+    posting: Arc<crate::notify::ClientPosting>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,6 +253,9 @@ struct NotificationFilter {
     unread: bool,
     #[serde(default = "default_notification_limit")]
     limit: usize,
+    /// The client posts new notifications itself, so the daemon doesn't.
+    #[serde(default)]
+    posting: bool,
 }
 
 fn default_notification_limit() -> usize {
@@ -317,7 +322,15 @@ impl Service {
             agents: Arc::new(agents),
             components: Arc::default(),
             versions: Arc::default(),
+            posting: Arc::default(),
         }
+    }
+
+    /// Record clients that post notifications themselves in `posting`, for
+    /// the notifier.
+    pub fn with_posting(mut self, posting: Arc<crate::notify::ClientPosting>) -> Self {
+        self.posting = posting;
+        self
     }
 
     /// Serve `components` from `/v1/components`.
@@ -819,7 +832,8 @@ async fn set_schedule_notify(
 }
 
 /// Notifications, newest first: unread ones only with `?unread=true`, at
-/// most `limit` (1–1000, default 100).
+/// most `limit` (1–1000, default 100). `?posting=true` says the client
+/// posts new ones itself, so the daemon leaves them to it for a while.
 async fn list_notifications(
     State(s): State<Service>,
     Query(filter): Query<NotificationFilter>,
@@ -829,6 +843,9 @@ async fn list_notifications(
             StatusCode::BAD_REQUEST,
             "limit must be between 1 and 1000".into(),
         ));
+    }
+    if filter.posting {
+        s.posting.seen();
     }
     Ok(Json(
         s.db.blocking(move |db| db.notifications(filter.unread, filter.limit))
@@ -1280,9 +1297,11 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
         token: token.clone(),
     };
     instance.publish(&info)?;
+    let posting = Arc::new(crate::notify::ClientPosting::default());
     let service = Service::new(db.clone(), token, runtime.agents())
         .with_components(runtime.capabilities())
-        .with_versions(runtime.agent_versions());
+        .with_versions(runtime.agent_versions())
+        .with_posting(posting.clone());
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
@@ -1296,6 +1315,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let notifier = tokio::spawn(crate::notify::notifier(
         db.clone(),
         desktop,
+        posting,
         shutdown.clone(),
     ));
     let worker = worker(db, executor, concurrency, worker_stop);
