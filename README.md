@@ -60,6 +60,41 @@ across the host/provider boundary. Tools are plain
 synchronous WASI 0.2 components. Everything still builds for the
 `wasm32-wasip2` Rust target; the async parts come from the `wasip3` crate.
 
+## Local models with Ollama
+
+The Ollama provider streams from `http://localhost:11434/api/chat`, on the
+same machine as the runner daemon. Start Ollama and download a model:
+
+```bash
+ollama serve
+# In another terminal:
+ollama pull qwen3:8b
+```
+
+`./build.sh` builds the Ollama component with the other providers. The sample
+`runner.toml` includes a `local` agent; after starting the runner daemon, use
+`runner chat --agent local`. Choose a model that supports tools when enabling
+tools on that agent. Change `providers.ollama.model` to use another downloaded
+model, then restart the daemon.
+
+For a minimal configuration without cloud credentials:
+
+```toml
+[providers.ollama]
+path = "target/wasm32-wasip2/release/ollama.wasm"
+model = "qwen3:8b"
+allowed_hosts = ["localhost"]
+
+[agents.default]
+provider = "ollama"
+```
+
+No API key or injected headers are needed. The endpoint is fixed to the local
+Ollama default port, and the host still enforces `allowed_hosts`. The adapter
+supports streaming text, tool calls and results, prompt token counts, and
+reply token limits (`options.num_predict`). Ollama does not report separate
+reasoning or cache token counts through this adapter.
+
 ## Local service and CLI
 
 Runner runs as a persistent local daemon. The daemon owns execution;
