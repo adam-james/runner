@@ -60,11 +60,13 @@ In order; each step ships something usable on its own.
      - ~~listed in the TUI, with an unread count~~ done: the status bar counts unread ones and says when one arrives; Ctrl-G lists the newest 100; Enter opens the run's session scrolled to that run and marks it read; r / R mark one or all read
      - approval requests (step 4) use the same channel
 4. asynchronous approval checkpoints - what lets a background agent act
-   - tools declare side-effecting actions (send email, book, `git push`) in their WIT interface
-   - the run pauses durably (survives restarts) and the action waits in a queue, approved or denied from CLI/TUI/remote
+   - the agent's config says which tools need approval (e.g. `approve = ["send_email", "git_push"]`), part of its version; the host enforces it at the `tool.call` boundary
+     - not the tool's own WIT: a malicious tool would just not declare its side effects; a WIT declaration is at most a hint shown by `tools inspect`
+   - pause before the tool runs, never mid-call (a suspended WASM stack can't be resumed, see docs/service.md): when the model asks for an approval-gated call, the host records the pending call durably and the run ends `awaiting_approval`; approving resumes the turn from that call, and a denial or expiry hands the model a refusal as the tool result
+   - approval requests go through the notification channel (daemon, TUI Ctrl-G list, `runner notifications`), decided with `runner approvals approve|deny ID` and `/v1/approvals`
    - approvals expire, and an expired approval is a denial; never let a missed approval turn into a yes
-   - standing approvals on an agent for routine, narrow actions (e.g. post to this one channel); they're part of its version
-   - record every approve, deny and expiry in the audit log
+   - record every request, approve, deny and expiry in the audit log; summaries list pending approvals (closes step 3's last item)
+   - later: standing approvals on an agent for routine, narrow actions (e.g. post to this one channel); they're part of its version, and need matching on the call's arguments, so they wait until the basic flow works
 5. later: memory across a schedule's runs - the main way a prompt injection persists, so it waits for the above
    - taint tracking of history from sensitive tools, instead of a blanket lock
 
