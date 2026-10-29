@@ -44,6 +44,18 @@ headers = { authorization = { value = "Bearer ${TAVILY_API_KEY}", hosts = [
     "api.tavily.com",
 ] } }
 
+# Open jobs from company boards on Greenhouse, Lever and Ashby, and the latest
+# Hacker News "Who is hiring?" thread. Public APIs, no key.
+[tools.job_boards]
+path = "target/wasm32-wasip2/release/job_boards.wasm"
+allowed_hosts = [
+    "boards-api.greenhouse.io",
+    "api.lever.co",
+    "api.ashbyhq.com",
+    "hn.algolia.com",
+]
+timeout_secs = 60
+
 [tools.rust_docs]
 path = "target/wasm32-wasip2/release/rustdocs.wasm"
 allowed_hosts = ["docs.rs", "doc.rust-lang.org"]

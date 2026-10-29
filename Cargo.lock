@@ -2481,6 +2481,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "job-boards"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "html2text",
+ "serde_json",
+ "urlencoding",
+ "wit-bindgen 0.63.0",
+ "wstd",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
