@@ -316,6 +316,9 @@ holds the model's reply or the run's error, which a prompt injection could
 steer. Notifications stay until read. Runs that ended before notifications
 existed count as checked, so upgrading notifies about nothing old.
 
+The TUI lists `GET /v1/notifications` with its other polling, once a second,
+and marks one read when it's opened. It shows only the stored fields.
+
 ## Host activity logs
 
 `runner serve` writes timestamped, readable diagnostic logs to stderr. The default
