@@ -129,6 +129,7 @@ shows failed and cancelled turns, marked as not saved to the conversation.
 | Ctrl-N | new session, to run something alongside the others |
 | Ctrl-O | pick a past session (↑/↓, then Enter) |
 | Ctrl-A | start a new session with another agent |
+| Ctrl-G | [notifications](#notifications): Enter opens the run's session at that run and marks it read; r marks one read, R all |
 | ↑/↓, PgUp/PgDn | scroll the conversation (End follows new output) |
 | Tab / Shift-Tab | move between the prompt, Sessions, Runs and Conversation |
 | Esc, then c | cancel the highlighted run in the Runs pane, after a confirmation |
@@ -292,7 +293,11 @@ The host writes every notification itself, from the run's status, duration
 and alerts and its schedule's status, and never includes the model's reply or
 the run's error, so a prompt injection can't put a convincing fake message in
 what looks like a system notice. A run is checked once its whole delegation
-tree has ended; delegated runs are covered by their parent's notification. Desktop notifications and a list in the TUI come next.
+tree has ended; delegated runs are covered by their parent's notification.
+
+`runner tui` shows how many are unread in its status bar, says when a new one
+arrives, and lists the newest 100 with Ctrl-G. Enter on one opens its run's
+session, scrolled to that run, and marks it read. Desktop notifications come next.
 
 ### Audit log
 
