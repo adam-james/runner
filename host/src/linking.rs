@@ -12,7 +12,8 @@
 //! - `wasi:http` (0.2 and 0.3), through the host's allow-list hook;
 //! - `wasi:io` (0.2), `wasi:clocks` (0.2 and 0.3) and `wasi:random` (0.2),
 //!   which carry no policy;
-//! - `wasi:filesystem` (0.2), only when the config mounts a `dir`;
+//! - `wasi:filesystem` (0.2), only when the config mounts a `dir`, with each
+//!   refusal recorded (see `filesystem`);
 //! - `wasi:cli/stdin`, `stdout` and `stderr` (0.2): stdin is empty and output
 //!   is discarded (the sandbox never inherits the host's). Unlinked, a
 //!   panic's message or a stray print would trap and read as a denial.
@@ -36,7 +37,6 @@ use wasmtime::component::{Component, Linker, LinkerInstance, ResourceType, Type,
 use wasmtime::{Engine, Error, Result};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView};
 use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
-use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView};
 use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
 
 use crate::activity::bounded_name;
@@ -104,7 +104,7 @@ pub(crate) fn link(
     component: &Component,
     config: &ComponentConfig,
 ) -> Result<()> {
-    use wasmtime_wasi::p2::bindings::{cli, clocks, filesystem, random};
+    use wasmtime_wasi::p2::bindings::{cli, clocks, random};
     wasmtime_wasi_io::add_to_linker_async(linker)?;
     cli::stdin::add_to_linker::<_, WasiCli>(linker, SandboxState::cli)?;
     cli::stdout::add_to_linker::<_, WasiCli>(linker, SandboxState::cli)?;
@@ -119,8 +119,7 @@ pub(crate) fn link(
     wasmtime_wasi_http::p3::add_to_linker(linker)?;
     let linked = linked_for(config);
     if config.dir.is_some() {
-        filesystem::types::add_to_linker::<_, WasiFilesystem>(linker, SandboxState::filesystem)?;
-        filesystem::preopens::add_to_linker::<_, WasiFilesystem>(linker, SandboxState::filesystem)?;
+        crate::filesystem::add_to_linker(linker)?;
     }
     let component_type = component.component_type();
     let imports: Vec<_> = component_type.imports(engine).collect();
@@ -269,9 +268,18 @@ struct Denial {
 
 impl Denial {
     /// Whether a call is recorded: refusals and traps are, an empty answer
-    /// to a query isn't, since nothing was there to deny.
+    /// to a query isn't, since nothing was there to deny. The exception is
+    /// asking for preopened directories, which is how a guest starts any use
+    /// of a filesystem: with nothing mounted, its file operations then fail
+    /// inside the guest (`ENOENT`) and never reach the host, so this is the
+    /// only record of the attempt. libc asks once per instance.
     fn recorded(&self) -> bool {
-        !matches!(self.reply, Reply::Empty(_))
+        !matches!(self.reply, Reply::Empty(_)) || self.is_preopens_query()
+    }
+
+    fn is_preopens_query(&self) -> bool {
+        self.interface.starts_with("wasi:filesystem/preopens@")
+            && self.function == "get-directories"
     }
 
     fn answer(&self, results: &mut [Val]) -> Result<()> {
@@ -409,5 +417,15 @@ mod tests {
                 ("odd", Reply::Trap),
             ]
         );
+        // An empty answer isn't recorded, except to a guest asking for
+        // directories with none mounted.
+        let empty = |interface: &str, function: &str| Denial {
+            interface: interface.into(),
+            function: function.into(),
+            reply: Reply::Empty(Val::List(Vec::new())),
+        };
+        assert!(empty("wasi:filesystem/preopens@0.2.12", "get-directories").recorded());
+        assert!(!empty("wasi:cli/environment@0.2.12", "get-environment").recorded());
+        assert!(!empty("wasi:filesystem/preopens@0.2.12", "other").recorded());
     }
 }

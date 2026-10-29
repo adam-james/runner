@@ -322,8 +322,10 @@ itself, at the points it controls: creating a component's sandbox (and
 mounting its `dir`, the whole of its filesystem access), each tool and model
 call, each outbound request whether allowed or refused, each memory or table
 growth a limit refuses, and each use of a WASI interface the component isn't
-granted (`capability.denied`). Tool calls end `ok`, `error`, `trap`, `timeout`
-or `unknown_tool`.
+granted (`capability.denied`) or file operation its `dir` doesn't allow
+(`filesystem.denied`). Tool calls end `ok`, `error`, `trap`, `timeout` or
+`unknown_tool`. Components are named as the config names them, with the
+SHA-256 of the `.wasm` that was loaded.
 
 A component gets only the WASI its config can grant: `wasi:http` (through the
 allow-list), `wasi:io`, `wasi:clocks`, `wasi:random`, an empty stdin and
@@ -334,8 +336,19 @@ way a guest expects (`access-denied`), a query such as reading the environment
 gets an empty answer, and anything else traps. Refusals and traps are recorded
 as `capability.denied` with the interface and function, so they count as
 denials in [summaries](#audit-log) and raise alerts. The environment,
-arguments and working directory always read as empty. Components are named as the config names them, with the
-SHA-256 of the `.wasm` that was loaded.
+arguments and working directory always read as empty, and aren't recorded.
+Asking for directories with no `dir` is: it's how a guest starts using files,
+and with nothing mounted the file operations themselves fail inside the guest
+without reaching the host.
+
+With a `dir`, the filesystem is wasmtime's, confined to that directory. A path
+that leads outside it (`..`, or a symlink pointing out) or a write under a
+read-only one is refused with `not-permitted` and recorded as
+`filesystem.denied`, saying why (`outside_dir` or `read_only`) and what kind
+of operation it was (`read`, `write` or `metadata`), but not the path. Other
+errors, like a missing file, are ordinary failures and aren't recorded. An
+agent reviewing a trail through `audit_trail` gets a host-written line on what
+each kind of denial in it means.
 
 Records are metadata only. They never include prompts, tool input or
 output, request paths or bodies, header values, or error text; credentials

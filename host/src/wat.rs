@@ -239,7 +239,9 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
                 to open, and a refused operation is recorded as capability.denied"
                 .into(),
             Some(dir) => format!(
-                "wasi:filesystem: only {dir}, mounted as / ({}); nothing else on the host",
+                "wasi:filesystem: only {dir}, mounted as / ({}); nothing else on the host. A \
+                 path outside it, or a write the mount doesn't allow, is refused and recorded \
+                 as filesystem.denied",
                 if component.dir_writable {
                     "read-write"
                 } else {

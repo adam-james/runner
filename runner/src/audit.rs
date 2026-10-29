@@ -311,6 +311,21 @@ pub fn review(what: &str, records: &[Event], versions: &[AgentVersion]) -> Strin
         ));
     }
 
+    let mut kinds = std::collections::BTreeSet::new();
+    for record in records.iter().filter(|r| r.data["decision"] == "denied") {
+        let action = record.data["action"].as_str().unwrap_or("");
+        let outcome = record.data["outcome"].as_str().unwrap_or("");
+        if let Some(meaning) = denial_meaning(action, outcome) {
+            kinds.insert(format!("{action} {outcome}: {meaning}"));
+        }
+    }
+    if !kinds.is_empty() {
+        out.push_str("\nWhat these denials mean (written by the host):\n");
+        for kind in kinds {
+            out.push_str(&format!("- {kind}\n"));
+        }
+    }
+
     out.push_str("\nAll records, oldest first:\n");
     for (shown, record) in records.iter().enumerate() {
         let line = review_line(record);
@@ -326,6 +341,45 @@ pub fn review(what: &str, records: &[Event], versions: &[AgentVersion]) -> Strin
         out.push('\n');
     }
     out
+}
+
+/// What a denied record means, for a reviewer who might otherwise guess:
+/// `filesystem.denied`'s `operation` is easily read as a call the component
+/// wasn't granted, when the refusal was a path outside its `dir`.
+fn denial_meaning(action: &str, outcome: &str) -> Option<&'static str> {
+    Some(match (action, outcome) {
+        ("filesystem.denied", "outside_dir") => {
+            "the component tried to reach a path outside its mounted dir (through `..` or a \
+             symlink); the host refused, so nothing outside the dir was read or changed. The \
+             path isn't recorded; `operation` is only the kind of call (read, write or metadata)"
+        }
+        ("filesystem.denied", "read_only") => {
+            "the component tried to write under a dir mounted read-only; the host refused, so \
+             nothing was changed"
+        }
+        ("filesystem.denied", "not_permitted") => {
+            "the OS refused an operation on a file already open inside the mounted dir; not an \
+             attempt to leave the dir"
+        }
+        ("capability.denied", "refused") => {
+            "the component called a WASI interface its config doesn't grant (`interface`, \
+             `function`); the host refused it and nothing was done. `get-directories` means it \
+             tried to use a filesystem with no dir mounted"
+        }
+        ("capability.denied", "trap") => {
+            "the component called a WASI function its config doesn't grant, one with no way to \
+             say no, so the call trapped and the component stopped; nothing was done"
+        }
+        ("http.request", "not_allowed_host") => {
+            "an outbound request to a host not on the component's allow-list; refused before \
+             anything was sent"
+        }
+        ("tool.call", "unknown_tool") => "the model called a tool this agent doesn't have",
+        (action, "limit_exceeded") if action.starts_with("limit.") => {
+            "the component asked to grow its memory or tables past its cap; refused"
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -459,6 +513,27 @@ mod tests {
             "{notable}"
         );
         assert!(!notable.contains(r#""v":"#) && !notable.contains("port"));
+        assert!(
+            text.contains(
+                "\nWhat these denials mean (written by the host):\n\
+                 - http.request not_allowed_host: an outbound request to a host not on"
+            ),
+            "{text}"
+        );
+        // A refused path says it was outside the dir, not an ungranted call.
+        let mut escaped = complete();
+        escaped[1] = json!({"seq":2, "ts_ms":1012, "action":"filesystem.denied",
+            "component":{"kind":"tool","name":"read_file","digest":"sha256:ab"},
+            "decision":"denied", "outcome":"outside_dir", "operation":"metadata"});
+        let text = review("run r", &trail(&escaped), &[]);
+        assert!(
+            text.contains(
+                "- filesystem.denied outside_dir: the component tried to reach a path \
+                outside its mounted dir"
+            ),
+            "{text}"
+        );
+        assert!(!review("run r", &trail(&complete()[..1]), &[]).contains("What these denials"));
         assert_eq!(
             text.split("\nAll records, oldest first:\n")
                 .nth(1)
