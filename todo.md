@@ -18,7 +18,7 @@ system; for narrower access, define a narrower agent.
   - done: include each tool's `describe()` text as a bounded, quoted, untrusted claim; execute it in a separate sandbox without network, credentials or files
 - security audit logging alongside debug logs, surfaced as `runner runs audit RUN_ID` and `runner sessions audit SESSION_ID`
   - done: host-made, versioned, sequenced, metadata-only records for sandboxes, tool/model calls, outbound requests, limit refusals and traps; SQLite storage; gap detection; fail closed when a turn's log is full (see README "Audit log")
-  - next: retention beyond the run, a separate audit-read token (alerts are done, and capability linking replaces recording per-file access; see section 2, step 3)
+  - next: a separate audit-read token (alerts are done, and capability linking replaces recording per-file access; see section 2, step 3)
   - threat model: malicious guest components; trust the runner and host to enforce policy and record activity
   - add structured, versioned events with event IDs, sequence numbers, actor/run/session identity, component version, action, policy decision, and outcome
   - record activity at host-controlled boundaries so guests cannot forge, suppress, or bypass records; bound and escape guest-controlled metadata
@@ -28,7 +28,6 @@ system; for narrower access, define a narrower agent.
   - keep audit records metadata-only: omit prompts, credentials, tool payloads, and raw errors
 - ~~add an agent that can audit security~~ done: `security_auditor` in runner.toml
 - ~~add an audit agent that reviews what runs actually did, from their audit trails~~ done: `run_auditor` in runner.toml and the host `audit_trail` tool (`read_audit_trails`)
-  - next: run it automatically when a background run's summary flags something (see section 2)
 - ~~docs: say loudly that keys never enter the sandbox~~ done: README "API keys never enter the sandbox"
 
 ## 2. Background agents you can trust
@@ -46,24 +45,20 @@ In order; each step ships something usable on its own.
 3. after-run summaries, alerts and notifications - the audit log becomes the primary interface
    - ~~host-made summary of every background run from its audit records, no model involved~~ done: `runner runs summary` / `GET /v1/runs/{id}/summary`, over the run's whole delegation tree: hosts reached, denials, errors, withheld credentials, trail problems; leaves out the run's error text
      - next: pending approvals, once step 4 exists
-     - next: store each background run's summary when it finishes, for notifications and for when audit retention prunes its records
-   - ~~alerts on denials, trail gaps, and a host the schedule has never reached before~~ done: a summary's `alerts`, computed with it; a schedule's first run sets its host baseline, and trail alerts wait until the whole tree has ended
-     - next: keep a table of each schedule's known hosts if comparing against every earlier run's audit records gets slow
+   - ~~alerts on denials and trail gaps~~ done: a summary's `alerts`, computed with it; trail alerts wait until the whole tree has ended
+     - dropped: an alert for a host the schedule had never reached before; `allowed_hosts` are exact names fixed in the pinned agent version, so a host outside them is already a denial and one inside them was approved
    - ~~link only the WASI a component needs~~ done (part 1): `host/src/linking.rs` links `wasi:http` (0.2 and 0.3, through the allow-list hook), `wasi:io`, `wasi:clocks`, `wasi:random`, stdin/stdout/stderr (empty and discarded; unlinked, a panic's message would trap and read as a denial) and `wasi:filesystem` only with a `dir`; everything else a component imports gets a host stub: a call that can fail is refused with `access-denied` (or `not-permitted`), a list or option query answers empty and isn't recorded (so reading an empty environment isn't an alert), and anything else traps; refusals and traps are recorded as `capability.denied`, so they're denials in summaries and raise alerts; `tools inspect` and `tools wat` list what isn't linked
      - ~~wrap only what stays granted~~ done (part 2): `host/src/filesystem.rs` wraps wasmtime's `wasi:filesystem` for a component with a `dir`; a `not-permitted` result is recorded as `filesystem.denied` with why (`outside_dir` for an escape via `..` or a symlink, `read_only` for a write under a read-only dir) and the kind of operation (`read`/`write`/`metadata`, not the WIT function, which a reviewer read as an ungranted call), never the path; other errors (a missing file, an OS `access` error) aren't recorded; a component with no `dir` asking for preopened directories is recorded as `capability.denied` (its file operations then fail in the guest, unseen); `audit_trail` reviews explain each kind of denial they contain
      - ~~show each component's grants in every run's summary~~ done (part 3): `runs summary` and `audit_trail` reviews list what each component of each agent version in the run's tree was allowed (hosts, headers by name, `dir`), in plain words from the version's snapshot rather than the trail, since sandboxes are reused across a session's turns (only the first run's trail has `sandbox.create`)
      - ~~test that a component's environment is empty~~ done: `wasi:cli/environment` isn't linked, and the fixture probe checks it reads no env vars
-   - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
+   - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert
      - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks every top-level run once its tree has ended, scheduled or not, assuming nobody watched; level `all|problems|never` (problems: the run or a delegated run didn't complete, or an alert), per schedule (`schedules add --notify`) or per run (`runner run --notify`), default `problems`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
      - ~~delivered as desktop notifications~~ done: the notifier posts each once (macOS only, to Notification Center, in-process through `notify-rust`, posting as Terminal, with a sound; no subprocess), more than three waiting as one, a failure logged once and not retried; `[notifications] desktop = false` turns it off, `sound` picks the sound or `""` for none
        - posting as the terminal the daemon was started from (so a click brings it forward) stopped banners showing, when tried with the sound in 3d8a65e; the sound alone is harmless (it only sets `soundName`), so the likely cause is posting as another app's bundle ID through the deprecated `NSUserNotification` API. Left out; the TUI's OSC 9 post (below) brings the right window forward instead
      - ~~the TUI posts through its terminal too~~ done: OSC 9 (`ESC ] 9 ; text BEL`) for each unread one that arrives while it's open, more than three as one, control characters dropped; it lists with `?posting=true`, and for 5s after that the daemon marks waiting ones posted without posting
-       - next: check on a Mac that a banner shows in Ghostty and clicking it focuses the tab
-       - later: tmux passthrough (`ESC P tmux; … ESC \`), and a way to turn it off (`[notifications] desktop = false` only stops the daemon's post)
+       - done: checked on a Mac that a banner shows in Ghostty and clicking it focuses the tab
      - ~~listed in the TUI, with an unread count~~ done: the status bar counts unread ones and says when one arrives; Ctrl-G lists the newest 100; Enter opens the run's session scrolled to that run and marks it read; r / R mark one or all read
      - approval requests (step 4) use the same channel
-   - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule
-   - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later
 4. asynchronous approval checkpoints - what lets a background agent act
    - tools declare side-effecting actions (send email, book, `git push`) in their WIT interface
    - the run pauses durably (survives restarts) and the action waits in a queue, approved or denied from CLI/TUI/remote

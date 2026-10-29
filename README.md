@@ -428,9 +428,6 @@ A summary leads with its alerts, what needs a person's attention:
 - `trail`: the audit trail is incomplete (see trail problems), so the rest of
   the summary may be too. Raised once every run in the tree has ended, since
   one still running always looks unfinished.
-- `new_host`: a scheduled run made an allowed request to a host that none of
-  its schedule's earlier runs, or the runs they delegated to, reached. A
-  schedule's first run sets the baseline, so it raises none.
 
 ```
 run 4c1e… (agent researcher, schedule brief): completed

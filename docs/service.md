@@ -204,10 +204,10 @@ separate grant system. Each milestone ships something usable on its own;
 3. **Run summaries, alerts, and notifications:** the host summarizes every background run
    from its audit records, without a model: hosts reached, denials, errors,
    trail gaps, and pending approvals. Summaries are done, served on demand
-   (`GET /v1/runs/{id}/summary`); pending approvals join them with step 4. Denials, gaps, and hosts a schedule has
-   never reached before raise alerts (done, in the summary), and only flagged runs go to the
-   `run_auditor` agent. Audit records, and the agent versions they reference,
-   are kept longer than their runs, since background runs are reviewed later.
+   (`GET /v1/runs/{id}/summary`); pending approvals join them with step 4. Denials and gaps raise
+   alerts (done, in the summary). Audit records, and the agent versions they
+   reference, are kept with their runs, so a summary can be recomputed whenever
+   a background run is reviewed.
    The user is notified in the foreground when a background run finishes,
    fails, or raises an alert, as a desktop notification and in the TUI; each
    schedule chooses every finish, only failures and alerts, or never.

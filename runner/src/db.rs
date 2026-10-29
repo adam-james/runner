@@ -984,42 +984,8 @@ impl Database {
         Ok(Some((runs, records)))
     }
 
-    /// The hosts that runs of `schedule` before run `id`, or any run they
-    /// delegated to, made an allowed request to: what the schedule is known
-    /// to reach. `None` if no run of it came before `id`, so there's nothing
-    /// to compare with.
-    pub fn schedule_hosts_before(
-        &self,
-        schedule: &str,
-        id: &str,
-    ) -> Result<Option<std::collections::BTreeSet<String>>> {
-        let conn = self.0.lock().unwrap();
-        let earlier: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE schedule_id=?1
-                 AND rowid < (SELECT rowid FROM runs WHERE id=?2))",
-            params![schedule, id],
-            |r| r.get(0),
-        )?;
-        if !earlier {
-            return Ok(None);
-        }
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT json_extract(a.data, '$.host') FROM audit_events a
-             JOIN runs r ON r.id=a.run_id JOIN runs root ON root.id=r.root_run_id
-             WHERE root.schedule_id=?1 AND root.rowid < (SELECT rowid FROM runs WHERE id=?2)
-               AND json_extract(a.data, '$.action')='http.request'
-               AND json_extract(a.data, '$.decision')='allowed'
-               AND json_extract(a.data, '$.host') IS NOT NULL",
-        )?;
-        Ok(Some(
-            stmt.query_map(params![schedule, id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<_>>()?,
-        ))
-    }
-
-    /// Run `id`'s summary, from its tree's audit records and, for a
-    /// scheduled run, the hosts its schedule's earlier runs reached. `None`
-    /// if there's no such run.
+    /// Run `id`'s summary, from its tree's audit records. `None` if there's
+    /// no such run.
     pub fn summary(&self, id: &str) -> Result<Option<crate::summary::Summary>> {
         let Some((runs, records)) = self.tree_audit(id)? else {
             return Ok(None);
@@ -1028,11 +994,7 @@ impl Database {
             .iter()
             .find(|run| run.id == id)
             .expect("tree has its root");
-        let known_hosts = match &run.schedule_id {
-            Some(schedule) => self.schedule_hosts_before(schedule, id)?,
-            None => None,
-        };
-        let mut summary = crate::summary::summarize(run, &runs, &records, known_hosts.as_ref());
+        let mut summary = crate::summary::summarize(run, &runs, &records);
         summary.grants = crate::summary::grants(&self.versions_in(&records)?);
         Ok(Some(summary))
     }
