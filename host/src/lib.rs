@@ -74,20 +74,28 @@ struct RunnerConfig {
 #[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotificationsConfig {
-    /// Post each notification to the desktop: macOS Notification Center,
-    /// or a freedesktop notification server on Linux.
+    /// Post each notification to macOS Notification Center.
     #[serde(default = "desktop_default")]
     desktop: bool,
+    /// The sound they play: `default`, a sound's name (e.g. `Glass`), or
+    /// `""` for none.
+    #[serde(default = "sound_default")]
+    sound: String,
 }
 
 fn desktop_default() -> bool {
     true
 }
 
+fn sound_default() -> String {
+    "default".into()
+}
+
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             desktop: desktop_default(),
+            sound: sound_default(),
         }
     }
 }
@@ -1533,6 +1541,11 @@ impl Runtime {
         self.config.notifications.desktop
     }
 
+    /// The sound desktop notifications play, or `None` for silence.
+    pub fn notification_sound(&self) -> Option<&str> {
+        Some(self.config.notifications.sound.as_str()).filter(|sound| !sound.is_empty())
+    }
+
     fn component(&self, path: &str) -> Result<Component> {
         self.components
             .get(path)
@@ -2536,9 +2549,14 @@ mod tests {
                 .notifications
                 .desktop
         );
-        let error = config("[notifications]\nsound = true").err().unwrap();
+        assert_eq!(config("").unwrap().notifications.sound, "default");
+        let silent = config("[notifications]\nsound = \"\"")
+            .unwrap()
+            .notifications;
+        assert_eq!(silent.sound, "");
+        let error = config("[notifications]\nbadge = true").err().unwrap();
         assert!(
-            error.to_string().contains("unknown field `sound`"),
+            error.to_string().contains("unknown field `badge`"),
             "{error}"
         );
     }
