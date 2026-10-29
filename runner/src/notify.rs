@@ -266,9 +266,12 @@ pub fn body(note: &Note) -> String {
     }
 }
 
-/// macOS Notification Center, posted in-process.
+/// macOS Notification Center, posted in-process, playing `sound`
+/// (`default` or a sound's name) if any.
 #[cfg(target_os = "macos")]
-pub struct SystemDesktop;
+pub struct SystemDesktop {
+    pub sound: Option<String>,
+}
 
 /// Which app notifications post as. Set explicitly, since the crate's
 /// default looks one up by running an AppleScript.
@@ -284,13 +287,16 @@ impl Desktop for SystemDesktop {
         {
             bail!("posting as {MACOS_APP}: {error}");
         }
+        let mut notification = notify_rust::Notification::new();
+        notification.appname("runner").summary(title).body(body);
+        match self.sound.as_deref() {
+            Some("default") => notification.sound_name("NSUserNotificationDefaultSoundName"),
+            Some(sound) => notification.sound_name(sound),
+            None => &mut notification,
+        };
         // This posts when the handle drops, and the crate keeps any error
         // to itself.
-        notify_rust::Notification::new()
-            .appname("runner")
-            .summary(title)
-            .body(body)
-            .show()?;
+        notification.show()?;
         Ok(())
     }
 }

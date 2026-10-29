@@ -325,7 +325,8 @@ post is logged once until posting works again. Notifications from before
 desktop posting existed count as posted. Posting is macOS only for now, to
 Notification Center, in-process through the `notify-rust` crate (posting as
 Terminal, set explicitly so the crate doesn't look an app up with
-AppleScript); no command is run. The crate doesn't report a failed post, so
+AppleScript); no command is run. `sound` is `default` (the default), a
+sound's name, or `""` for none. The crate doesn't report a failed post, so
 nothing is logged then. On other OSes nothing is posted or marked posted.
 
 The TUI lists `GET /v1/notifications` with its other polling, once a second,
