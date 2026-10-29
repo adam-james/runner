@@ -51,10 +51,6 @@ In order; each step ships something usable on its own.
      - next: keep a table of each schedule's known hosts if comparing against every earlier run's audit records gets slow
    - ~~link only the WASI a component needs~~ done (part 1): `host/src/linking.rs` links `wasi:http` (0.2 and 0.3, through the allow-list hook), `wasi:io`, `wasi:clocks`, `wasi:random`, stdin/stdout/stderr (empty and discarded; unlinked, a panic's message would trap and read as a denial) and `wasi:filesystem` only with a `dir`; everything else a component imports gets a host stub: a call that can fail is refused with `access-denied` (or `not-permitted`), a list or option query answers empty and isn't recorded (so reading an empty environment isn't an alert), and anything else traps; refusals and traps are recorded as `capability.denied`, so they're denials in summaries and raise alerts; `tools inspect` and `tools wat` list what isn't linked
      - ~~wrap only what stays granted~~ done (part 2): `host/src/filesystem.rs` wraps wasmtime's `wasi:filesystem` for a component with a `dir`; a `not-permitted` result is recorded as `filesystem.denied` with why (`outside_dir` for an escape via `..` or a symlink, `read_only` for a write under a read-only dir) and the kind of operation (`read`/`write`/`metadata`, not the WIT function, which a reviewer read as an ungranted call), never the path; other errors (a missing file, an OS `access` error) aren't recorded; a component with no `dir` asking for preopened directories is recorded as `capability.denied` (its file operations then fail in the guest, unseen); `audit_trail` reviews explain each kind of denial they contain
-     - ~~investigate a `dir` that fails to mount~~ done: the directory didn't exist; a read-only `dir` isn't created (on purpose: an empty read-only mount hides a typo), but the reason never reached anyone: `sandbox.create` ended `interrupted` and the client saw "agent execution failed"
-       - next: check each component's `dir` when the daemon starts and refuse to start with the reason, like a missing env var
-       - next: log why a component failed to load on the daemon's stderr (host-made errors: paths, not guest output)
-       - next: record the reason in the trail, e.g. `sandbox.create` with `outcome: "dir_missing"`, instead of `interrupted`
      - ~~show each component's grants in every run's summary~~ done (part 3): `runs summary` and `audit_trail` reviews list what each component of each agent version in the run's tree was allowed (hosts, headers by name, `dir`), in plain words from the version's snapshot rather than the trail, since sandboxes are reused across a session's turns (only the first run's trail has `sandbox.create`)
      - ~~test that a component's environment is empty~~ done: `wasi:cli/environment` isn't linked, and the fixture probe checks it reads no env vars
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
@@ -95,6 +91,10 @@ In order; each step ships something usable on its own.
 ## Housekeeping
 
 - move runner code to host
+- report a `dir` that fails to mount: a missing read-only `dir` isn't created (on purpose: an empty read-only mount hides a typo), but the reason reaches no one: `sandbox.create` ends `interrupted` and the client sees "agent execution failed"
+  - check each component's `dir` when the daemon starts and refuse to start with the reason, like a missing env var
+  - log why a component failed to load on the daemon's stderr (host-made errors: paths, not guest output)
+  - record the reason in the trail, e.g. `sandbox.create` with `outcome: "dir_missing"`, instead of `interrupted`
 - OAuth/login
 - encrypted store for API keys - nice to have, not a differentiator
 - prune bundled demo tools (sports, weather) in favor of a few genuinely useful ones (files, web, python, git, http fetch)
