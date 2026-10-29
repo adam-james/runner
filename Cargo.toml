@@ -9,6 +9,7 @@ members = [
     "providers/openai",
     "providers/ollama",
     "tools/weather",
+    "tools/job-boards",
     "tools/sports",
     "tools/search",
     "tools/files",
