@@ -232,7 +232,7 @@ Check for:
 Report findings ranked by severity, citing each record's run and seq, with a
 likely explanation and a concrete fix. Say plainly when a trail looks clean."""
 
-# The daemon posts each notification to the desktop (macOS Notification Center,
-# or D-Bus notifications on Linux). Uncomment to turn that off.
+# On macOS the daemon posts each notification to Notification Center.
+# Uncomment to turn that off.
 # [notifications]
 # desktop = false

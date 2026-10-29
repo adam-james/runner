@@ -33,7 +33,6 @@ iana-time-zone = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
-# Desktop notifications, posted in-process: Notification Center on macOS,
-# D-Bus (pure-Rust zbus) on Linux.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# Desktop notifications, posted in-process to Notification Center.
+[target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = "4"

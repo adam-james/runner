@@ -322,11 +322,11 @@ read, and marks it posted (`delivered_at`) whether or not posting worked: it
 stays stored either way, and a desktop that can't show notifications would
 only fail again. More than three waiting at once are posted as one. A failed
 post is logged once until posting works again. Notifications from before
-desktop posting existed count as posted. Posting is in-process, through the
-`notify-rust` crate: Notification Center on macOS (posting as Terminal, set
-explicitly so the crate doesn't look an app up with AppleScript) or the
-freedesktop D-Bus interface on Linux; no command is run. On macOS the crate
-doesn't report a failed post, so nothing is logged there.
+desktop posting existed count as posted. Posting is macOS only for now, to
+Notification Center, in-process through the `notify-rust` crate (posting as
+Terminal, set explicitly so the crate doesn't look an app up with
+AppleScript); no command is run. The crate doesn't report a failed post, so
+nothing is logged then. On other OSes nothing is posted or marked posted.
 
 The TUI lists `GET /v1/notifications` with its other polling, once a second,
 and marks one read when it's opened. It shows only the stored fields.

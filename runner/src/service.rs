@@ -1235,18 +1235,16 @@ async fn contain(
     None
 }
 
-/// Where the notifier posts, if `wanted`: nowhere on an OS it can't post on.
+/// Where the notifier posts, if `wanted`: nowhere but macOS for now.
 fn desktop(wanted: bool) -> Option<Arc<dyn crate::notify::Desktop>> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         wanted.then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     {
         if wanted {
-            tracing::info!(
-                "desktop notifications are macOS and Linux only; see `runner notifications`"
-            );
+            tracing::info!("desktop notifications are macOS only; see `runner notifications`");
         }
         None
     }

@@ -12,10 +12,9 @@
 //! guest-influenced strings in alerts (hosts, tool names) stay JSON-quoted.
 //!
 //! Each notification is also posted to the desktop once, unless
-//! `[notifications] desktop = false`, in-process through `notify-rust`
-//! (Notification Center on macOS, D-Bus on Linux), never by running a
-//! command. On Linux its body is escaped for the markup a notification
-//! server may render.
+//! `[notifications] desktop = false`, on macOS only: to Notification
+//! Center, in-process through `notify-rust`, never by running a command.
+//! Its text is plain strings, with no script or markup to escape from.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -267,32 +266,26 @@ pub fn body(note: &Note) -> String {
     }
 }
 
-/// The OS's own notifications, posted in-process.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// macOS Notification Center, posted in-process.
+#[cfg(target_os = "macos")]
 pub struct SystemDesktop;
 
-/// Which app notifications post as on macOS. Set explicitly, since the
-/// crate's default looks one up by running an AppleScript.
+/// Which app notifications post as. Set explicitly, since the crate's
+/// default looks one up by running an AppleScript.
 #[cfg(target_os = "macos")]
 const MACOS_APP: &str = "com.apple.Terminal";
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 impl Desktop for SystemDesktop {
     fn post(&self, title: &str, body: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        static APP: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        if let Err(error) =
+            APP.get_or_init(|| notify_rust::set_application(MACOS_APP).map_err(|e| e.to_string()))
         {
-            static APP: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-            if let Err(error) = APP
-                .get_or_init(|| notify_rust::set_application(MACOS_APP).map_err(|e| e.to_string()))
-            {
-                bail!("posting as {MACOS_APP}: {error}");
-            }
+            bail!("posting as {MACOS_APP}: {error}");
         }
-        // Servers may render a subset of HTML in the body.
-        #[cfg(target_os = "linux")]
-        let body = &escape_markup(body);
-        // On macOS this posts when the handle drops, and the crate keeps any
-        // error to itself.
+        // This posts when the handle drops, and the crate keeps any error
+        // to itself.
         notify_rust::Notification::new()
             .appname("runner")
             .summary(title)
@@ -300,15 +293,6 @@ impl Desktop for SystemDesktop {
             .show()?;
         Ok(())
     }
-}
-
-/// `text` with the characters freedesktop body markup gives meaning to
-/// escaped, so a guest-influenced host can't become a link or formatting.
-#[cfg(any(target_os = "linux", test))]
-fn escape_markup(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// One pass of `notifier`. Returns the notifications stored.
@@ -581,10 +565,6 @@ mod tests {
         assert_eq!(
             body(&note),
             "new_host: tool \"t\" reached \"<a href=x>evil</a>\"\ndelegated run c failed"
-        );
-        assert_eq!(
-            escape_markup(&body(&note)),
-            "new_host: tool \"t\" reached \"&lt;a href=x&gt;evil&lt;/a&gt;\"\ndelegated run c failed"
         );
         note.alerts[0].message = "x".repeat(400);
         let long = body(&note);
