@@ -137,7 +137,7 @@ directory; a descriptor left by a crash is replaced at the next startup.
 | `POST /v1/schedules/{id}/approve` | Pin an active or paused schedule to its agents' current versions and make it active: `{"schedule", "changes": [{"agent", "from", "to", "fields"}]}` |
 | `DELETE /v1/schedules/{id}` | Delete it; cancels its occurrence if queued; returns it |
 | `POST /v1/schedules/{id}/notify` | `{"notify": "all" \| "problems" \| "never"}`: which of its runs notify; returns schedule. Creating a schedule takes `notify` too (default `problems`) |
-| `GET /v1/notifications` | Newest first, at most `limit` (1–1000, default 100); `?unread=true` for unread only: `[{"id", "run_id", "created_at", "read_at", "schedule_id", "agent", "status", "duration_ms", "alerts", "schedule_status"}]`, with `schedule_id` and `schedule_status` null for a run outside a schedule |
+| `GET /v1/notifications` | Newest first, at most `limit` (1–1000, default 100); `?unread=true` for unread only; `?posting=true` says the client posts new ones itself (below): `[{"id", "run_id", "created_at", "read_at", "schedule_id", "agent", "status", "duration_ms", "alerts", "schedule_status"}]`, with `schedule_id` and `schedule_status` null for a run outside a schedule |
 | `POST /v1/notifications/{id}/read` | Mark it read: `{"marked": 1}`, or 0 if it already was; 404 if there's none |
 | `POST /v1/notifications/read` | Mark every unread one read: `{"marked": n}` |
 
@@ -331,6 +331,19 @@ nothing is logged then. On other OSes nothing is posted or marked posted.
 
 The TUI lists `GET /v1/notifications` with its other polling, once a second,
 and marks one read when it's opened. It shows only the stored fields.
+
+The TUI also posts each unread notification that arrives while it's open
+through its terminal, as OSC 9 (`ESC ] 9 ; text BEL`), with the same title
+and body as the daemon's post on one line; more than three at once are
+posted as one. A click goes to the terminal's own window and tab, where
+supported (Ghostty, iTerm2, kitty, WezTerm; any OS), and other terminals
+ignore it. Control characters are dropped from the text, so nothing in it
+can end the sequence. It's written between draws, not inside one. Inside
+tmux it's swallowed unless passed through. The TUI lists with
+`?posting=true`, and for five seconds after a listing like that the notifier
+marks waiting notifications posted without posting them, so one
+notification isn't two banners. A notification stored just as the last TUI
+quits may then not be posted by either; it stays stored to read.
 
 ## Host activity logs
 

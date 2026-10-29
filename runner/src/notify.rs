@@ -15,8 +15,13 @@
 //! `[notifications] desktop = false`, on macOS only: to Notification
 //! Center, in-process through `notify-rust`, never by running a command.
 //! Its text is plain strings, with no script or markup to escape from.
+//!
+//! `runner tui` also posts new ones through its terminal, with OSC 9, so a
+//! click goes to its own window and tab. While a TUI is doing that, the
+//! daemon marks notifications posted without posting them, so one
+//! notification isn't two banners.
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -27,6 +32,11 @@ use crate::summary::{Alert, RunEnd, Summary};
 
 /// How often ended runs are looked for.
 const TICK: Duration = Duration::from_secs(1);
+
+/// How long after a client last said it posts notifications itself the
+/// daemon leaves posting to it. The TUI says so on every listing, once a
+/// second.
+const CLIENT_POSTS_FOR: Duration = Duration::from_secs(5);
 
 /// When runs notify: `all` of them, only `problems` (a run that didn't
 /// complete, i.e. failed, was interrupted or was cancelled, or one it
@@ -163,6 +173,7 @@ pub fn render(notifications: &[Notification]) -> String {
 pub async fn notifier(
     db: Database,
     desktop: Option<Arc<dyn Desktop>>,
+    posting: Arc<ClientPosting>,
     shutdown: CancellationToken,
 ) {
     let mut tick = tokio::time::interval(TICK);
@@ -184,6 +195,12 @@ pub async fn notifier(
                     Err(_) => tracing::error!("could not check ended runs for notifications"),
                 }
                 let Some(desktop) = desktop.clone() else { continue };
+                if posting.active() {
+                    if db.blocking(|db| hand_off(&db)).await.is_err() {
+                        tracing::error!("could not mark notifications posted by a client");
+                    }
+                    continue;
+                }
                 match db.blocking(move |db| deliver(&db, desktop.as_ref())).await {
                     Ok(None) => failing = false,
                     Ok(Some(error)) => {
@@ -205,6 +222,25 @@ pub trait Desktop: Send + Sync {
     fn post(&self, title: &str, body: &str) -> Result<()>;
 }
 
+/// When a client, i.e. the TUI, last said it posts notifications itself.
+#[derive(Default)]
+pub struct ClientPosting(std::sync::Mutex<Option<Instant>>);
+
+impl ClientPosting {
+    /// A client says it's posting.
+    pub fn seen(&self) {
+        *self.0.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Whether a client said so within `CLIENT_POSTS_FOR`.
+    pub fn active(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < CLIENT_POSTS_FOR)
+    }
+}
+
 /// More notifications than this waiting at once, e.g. after the daemon
 /// was stopped a while, are posted as one.
 pub const MAX_POSTED: usize = 3;
@@ -219,25 +255,54 @@ const MAX_BODY: usize = 300;
 pub fn deliver(db: &Database, desktop: &dyn Desktop) -> Result<Option<anyhow::Error>> {
     let waiting = db.undelivered()?;
     let ids: Vec<i64> = waiting.iter().map(|n| n.id).collect();
-    let unread: Vec<_> = waiting.iter().filter(|n| n.read_at.is_none()).collect();
+    let unread: Vec<_> = waiting
+        .iter()
+        .filter(|n| n.read_at.is_none())
+        .map(|n| &n.note)
+        .collect();
     let mut failure = None;
-    let mut post = |title: &str, body: &str| {
-        if let Err(error) = desktop.post(title, body) {
+    for (title, body) in posts(&unread) {
+        if let Err(error) = desktop.post(&title, &body) {
             failure = Some(error);
-        }
-    };
-    if unread.len() > MAX_POSTED {
-        post(
-            &format!("runner: {} new notifications", unread.len()),
-            "Run `runner notifications` to see them.",
-        );
-    } else {
-        for n in unread {
-            post(&format!("runner: {}", title(&n.note)), &body(&n.note));
         }
     }
     db.mark_delivered(&ids)?;
     Ok(failure)
+}
+
+/// Marks each notification not yet posted as posted, without posting it:
+/// a client is posting them itself.
+pub fn hand_off(db: &Database) -> Result<()> {
+    let ids: Vec<i64> = db.undelivered()?.iter().map(|n| n.id).collect();
+    db.mark_delivered(&ids)
+}
+
+/// The (title, body) each of `notes` is posted with, or one for them all
+/// if there are more than `MAX_POSTED`.
+pub fn posts(notes: &[&Note]) -> Vec<(String, String)> {
+    if notes.len() > MAX_POSTED {
+        return vec![(
+            format!("runner: {} new notifications", notes.len()),
+            "Run `runner notifications` to see them.".into(),
+        )];
+    }
+    notes
+        .iter()
+        .map(|note| (format!("runner: {}", title(note)), body(note)))
+        .collect()
+}
+
+/// A post as an OSC 9 terminal notification (`ESC ] 9 ; text BEL`), its
+/// lines joined with ` · `. Control characters are dropped, so nothing in
+/// the text can end the sequence or start another.
+pub fn osc9(title: &str, body: &str) -> String {
+    let text = format!("{title}\n{body}")
+        .lines()
+        .map(|line| line.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("\x1b]9;{text}\x07")
 }
 
 /// A notification's alerts and delegated runs that didn't complete, a line
@@ -538,6 +603,34 @@ mod tests {
                 "Run `runner notifications` to see them.".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn notifications_a_client_posts_are_marked_posted_without_posting() {
+        let (_dir, db, _) = notified(2);
+        hand_off(&db).unwrap();
+        let desktop = FakeDesktop::default();
+        deliver(&db, &desktop).unwrap();
+        assert!(desktop.take().is_empty());
+
+        let posting = ClientPosting::default();
+        assert!(!posting.active());
+        posting.seen();
+        assert!(posting.active());
+    }
+
+    #[test]
+    fn terminal_posts_are_one_line_with_no_control_characters() {
+        assert_eq!(
+            osc9(
+                "runner: run (agent a): failed",
+                "denied: \"x\"\ntrail_gap: y"
+            ),
+            "\x1b]9;runner: run (agent a): failed · denied: \"x\" · trail_gap: y\x07"
+        );
+        // An ESC, BEL or C1 terminator in the text can't end the sequence.
+        let text = osc9("t\x07\x1b]9;fake\x1b\\", "b\u{9c}\r\n\n");
+        assert_eq!(text, "\x1b]9;t]9;fake\\ · b\x07");
     }
 
     #[test]

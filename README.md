@@ -344,7 +344,10 @@ sound = "Glass"   # a macOS sound's name, "default", or "" for none
 ```
 
 `runner tui` shows how many are unread in its status bar, says when a new one
-arrives, and lists the newest 100 with Ctrl-G. Enter on one opens its run's
+arrives, and lists the newest 100 with Ctrl-G. It also posts each new one
+through its terminal (OSC 9), so in Ghostty, iTerm2, kitty or WezTerm,
+clicking it goes to that window and tab; other terminals ignore it. While a
+TUI is open the daemon leaves posting to it, so you don't get two banners. Enter on one opens its run's
 session, scrolled to that run, and marks it read.
 
 ### Audit log

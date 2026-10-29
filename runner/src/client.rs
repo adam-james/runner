@@ -233,11 +233,12 @@ impl Client {
         .await
     }
 
-    /// Notifications, newest first; only unread ones if `unread`.
-    pub async fn notifications(&self, unread: bool) -> Result<Vec<Notification>> {
+    /// Notifications, newest first; only unread ones if `unread`. With
+    /// `posting`, the caller posts new ones itself, so the daemon doesn't.
+    pub async fn notifications(&self, unread: bool, posting: bool) -> Result<Vec<Notification>> {
         self.json(
             Method::GET,
-            &format!("/v1/notifications?unread={unread}"),
+            &format!("/v1/notifications?unread={unread}&posting={posting}"),
             None,
         )
         .await

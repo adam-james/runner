@@ -91,6 +91,7 @@ struct Harness {
     _dir: tempfile::TempDir,
     db: Database,
     executor: Arc<FakeExecutor>,
+    posting: Arc<runner::notify::ClientPosting>,
     client: Client,
     url: String,
     stop: CancellationToken,
@@ -112,6 +113,7 @@ impl Harness {
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let posting = Arc::new(runner::notify::ClientPosting::default());
         let service = Service::new(
             db.clone(),
             "test-token".into(),
@@ -128,7 +130,8 @@ impl Harness {
                     tool_access: Default::default(),
                 })
                 .into(),
-        );
+        )
+        .with_posting(posting.clone());
         let http = tokio::spawn(async move {
             axum::serve(listener, service.router()).await.unwrap();
         });
@@ -136,6 +139,7 @@ impl Harness {
             _dir: dir,
             db,
             executor,
+            posting,
             client: Client::builder().no_proxy().build().unwrap(),
             url,
             stop,
@@ -2085,6 +2089,14 @@ async fn notifications_are_listed_newest_first_until_read() {
         list("/v1/notifications?limit=0").await.0,
         StatusCode::BAD_REQUEST
     );
+    // A client that posts them itself says so, and the notifier leaves
+    // posting to it.
+    assert!(!h.posting.active());
+    assert_eq!(
+        list("/v1/notifications?posting=true").await.0,
+        StatusCode::OK
+    );
+    assert!(h.posting.active());
     let (status, _) = h
         .api(
             reqwest::Method::POST,
