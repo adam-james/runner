@@ -232,7 +232,9 @@ Check for:
 Report findings ranked by severity, citing each record's run and seq, with a
 likely explanation and a concrete fix. Say plainly when a trail looks clean."""
 
-# On macOS the daemon posts each notification to Notification Center.
-# Uncomment to turn that off.
+# On macOS the daemon posts each notification to Notification Center, with
+# a sound, as the terminal it was started from. Uncomment to change that.
 # [notifications]
 # desktop = false
+# app = "com.mitchellh.ghostty"   # bundle ID to post as; a click brings it forward
+# sound = ""                      # "default", a sound's name, or "" for none

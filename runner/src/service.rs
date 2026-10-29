@@ -1235,17 +1235,25 @@ async fn contain(
     None
 }
 
-/// Where the notifier posts, if `wanted`: nowhere but macOS for now.
-fn desktop(wanted: bool) -> Option<Arc<dyn crate::notify::Desktop>> {
+/// Where the notifier posts, if desktop notifications are on: nowhere but
+/// macOS for now.
+fn desktop(runtime: &host::Runtime) -> Option<Arc<dyn crate::notify::Desktop>> {
+    if !runtime.desktop_notifications() {
+        return None;
+    }
     #[cfg(target_os = "macos")]
     {
-        wanted.then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>)
+        let app =
+            crate::notify::desktop_app(runtime.notification_app(), |name| std::env::var(name).ok());
+        tracing::info!(app = ?app, "posting desktop notifications");
+        Some(Arc::new(crate::notify::SystemDesktop {
+            app,
+            sound: runtime.notification_sound().map(String::from),
+        }))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if wanted {
-            tracing::info!("desktop notifications are macOS only; see `runner notifications`");
-        }
+        tracing::info!("desktop notifications are macOS only; see `runner notifications`");
         None
     }
 }
@@ -1282,7 +1290,7 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
-    let desktop = desktop(runtime.desktop_notifications());
+    let desktop = desktop(&runtime);
     let executor: Arc<dyn Executor> = Arc::new(WasmExecutor(runtime));
     let scheduler = tokio::spawn(crate::schedule::scheduler(
         db.clone(),

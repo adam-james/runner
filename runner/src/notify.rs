@@ -266,31 +266,57 @@ pub fn body(note: &Note) -> String {
     }
 }
 
-/// macOS Notification Center, posted in-process.
-#[cfg(target_os = "macos")]
-pub struct SystemDesktop;
+/// The app notifications post as, which a click brings forward: the
+/// configured one, else the terminal the daemon was started from (macOS
+/// gives an app's processes its bundle ID in `__CFBundleIdentifier`, and
+/// terminals name themselves in `TERM_PROGRAM`), else Terminal. Always set
+/// explicitly, since the crate's default looks one up by running an
+/// AppleScript.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn desktop_app(configured: Option<&str>, env: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(app) = configured {
+        return app.to_string();
+    }
+    if let Some(app) = env("__CFBundleIdentifier").filter(|app| !app.is_empty()) {
+        return app;
+    }
+    let known = match env("TERM_PROGRAM").as_deref() {
+        Some("ghostty") => "com.mitchellh.ghostty",
+        Some("iTerm.app") => "com.googlecode.iterm2",
+        Some("WezTerm") => "com.github.wez.wezterm",
+        _ => "com.apple.Terminal",
+    };
+    known.to_string()
+}
 
-/// Which app notifications post as. Set explicitly, since the crate's
-/// default looks one up by running an AppleScript.
+/// macOS Notification Center, posted in-process as `app` (a bundle ID),
+/// playing `sound` (`default` or a sound's name) if any.
 #[cfg(target_os = "macos")]
-const MACOS_APP: &str = "com.apple.Terminal";
+pub struct SystemDesktop {
+    pub app: String,
+    pub sound: Option<String>,
+}
 
 #[cfg(target_os = "macos")]
 impl Desktop for SystemDesktop {
     fn post(&self, title: &str, body: &str) -> Result<()> {
+        // The crate can only set the app once per process.
         static APP: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
         if let Err(error) =
-            APP.get_or_init(|| notify_rust::set_application(MACOS_APP).map_err(|e| e.to_string()))
+            APP.get_or_init(|| notify_rust::set_application(&self.app).map_err(|e| e.to_string()))
         {
-            bail!("posting as {MACOS_APP}: {error}");
+            bail!("posting as {}: {error}", self.app);
         }
+        let mut notification = notify_rust::Notification::new();
+        notification.appname("runner").summary(title).body(body);
+        match self.sound.as_deref() {
+            Some("default") => notification.sound_name("NSUserNotificationDefaultSoundName"),
+            Some(sound) => notification.sound_name(sound),
+            None => &mut notification,
+        };
         // This posts when the handle drops, and the crate keeps any error
         // to itself.
-        notify_rust::Notification::new()
-            .appname("runner")
-            .summary(title)
-            .body(body)
-            .show()?;
+        notification.show()?;
         Ok(())
     }
 }
@@ -570,5 +596,30 @@ mod tests {
         let long = body(&note);
         assert_eq!(long.chars().count(), MAX_BODY + 1);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn desktop_notifications_post_as_the_daemons_terminal() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let ghostty = env(&[
+            ("__CFBundleIdentifier", "com.mitchellh.ghostty"),
+            ("TERM_PROGRAM", "ghostty"),
+        ]);
+        assert_eq!(desktop_app(None, ghostty), "com.mitchellh.ghostty");
+        assert_eq!(
+            desktop_app(Some("com.example.app"), ghostty),
+            "com.example.app"
+        );
+        assert_eq!(
+            desktop_app(None, env(&[("TERM_PROGRAM", "iTerm.app")])),
+            "com.googlecode.iterm2"
+        );
+        assert_eq!(desktop_app(None, env(&[])), "com.apple.Terminal");
     }
 }
