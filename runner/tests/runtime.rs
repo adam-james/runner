@@ -432,6 +432,17 @@ async fn audit_trail_reads_other_runs_but_never_its_own() {
         )),
         "{text}"
     );
+    // In plain words too, in the review and the run's summary.
+    let grant = format!(
+        r#"agent default: tool "fixture": no network access; reads {}"#,
+        fixture.dir.path().join("tools").display()
+    );
+    assert!(text.contains(&format!("\n- {grant}\n")), "{text}");
+    let summary = db.summary(&reviewed.id).unwrap().unwrap();
+    let lines: Vec<_> = summary.grants.iter().map(|g| g.line()).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with(r#"agent default: provider "fixture": "#));
+    assert_eq!(lines[1], grant);
 
     // Its own session is refused, and the call is audited as a host tool's.
     let session = db.create_session(None, "auditor".into()).unwrap().id;

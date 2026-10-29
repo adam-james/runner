@@ -296,6 +296,15 @@ pub fn review(what: &str, records: &[Event], versions: &[AgentVersion]) -> Strin
             "definition":version.definition});
         out.push_str(&format!("{line}\n"));
     }
+    let grants: Vec<_> = crate::summary::grants(versions)
+        .iter()
+        .map(crate::summary::Grant::line)
+        .collect();
+    section(
+        &mut out,
+        "What each component was allowed (from those versions)",
+        &grants,
+    );
     section(&mut out, "Network and filesystem access", &access(records));
 
     let notable: Vec<_> = records.iter().filter(|r| notable(&r.data)).collect();

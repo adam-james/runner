@@ -983,12 +983,18 @@ impl Database {
             Some(schedule) => self.schedule_hosts_before(schedule, id)?,
             None => None,
         };
-        Ok(Some(crate::summary::summarize(
-            run,
-            &runs,
-            &records,
-            known_hosts.as_ref(),
-        )))
+        let mut summary = crate::summary::summarize(run, &runs, &records, known_hosts.as_ref());
+        summary.grants = crate::summary::grants(&self.versions_in(&records)?);
+        Ok(Some(summary))
+    }
+
+    /// The agent versions `records`' turns name, once each, oldest first.
+    /// A version a record names but the database doesn't have is skipped.
+    pub fn versions_in(&self, records: &[Event]) -> Result<Vec<AgentVersion>> {
+        crate::audit::versions(records)
+            .iter()
+            .filter_map(|id| self.agent_version(id).transpose())
+            .collect()
     }
 
     /// Whether any run in `session_id` belongs to the delegation tree rooted
