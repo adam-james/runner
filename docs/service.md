@@ -328,6 +328,9 @@ explicitly so the crate doesn't look an app up with AppleScript) or the
 freedesktop D-Bus interface on Linux; no command is run. On macOS the crate
 doesn't report a failed post, so nothing is logged there.
 
+The TUI lists `GET /v1/notifications` with its other polling, once a second,
+and marks one read when it's opened. It shows only the stored fields.
+
 ## Host activity logs
 
 `runner serve` writes timestamped, readable diagnostic logs to stderr. The default

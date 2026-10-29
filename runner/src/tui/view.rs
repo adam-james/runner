@@ -11,7 +11,8 @@ use ratatui::widgets::{
 };
 
 use super::app::{App, Block, Focus, Outcome, Popup, Turn};
-use crate::db::{Run, Session};
+use crate::db::{Notification, Run, Session};
+use crate::notify;
 use crate::ui::{agent_details, size};
 
 const SIDEBAR_WIDTH: u16 = 32;
@@ -23,6 +24,10 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl-N", "new session, to run something alongside this one"),
     ("Ctrl-O", "pick a past session (↑/↓, Enter)"),
     ("Ctrl-A", "new session with another agent"),
+    (
+        "Ctrl-G",
+        "notifications: Enter opens the run, r read, R all read",
+    ),
     ("↑/↓ PgUp/PgDn", "scroll the conversation"),
     ("Drag to select", "copy with your terminal’s usual shortcut"),
     ("Paste", "use your terminal’s usual shortcut in the prompt"),
@@ -89,16 +94,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
                 .iter()
                 .find(|agent| agent.name == app.agent)
                 .map_or_else(|| format!("agent {}", app.agent), agent_details);
-            Line::from(vec![
+            let mut spans = Vec::new();
+            match app.unread() {
+                0 => {}
+                1 => spans.push("● 1 unread notification · ^G  ".yellow()),
+                n => spans.push(format!("● {n} unread notifications · ^G  ").yellow()),
+            }
+            spans.extend([
                 details.dim(),
-                "  ·  ^N new · ^O sessions · ^A agent · ? help".dim(),
-            ])
+                "  ·  ^N new · ^O sessions · ^A agent · ^G notifications · ? help".dim(),
+            ]);
+            Line::from(spans)
         }
     };
     frame.render_widget(Paragraph::new(bar), status);
 
     if let Some(popup) = &app.popup {
-        draw_popup(frame, app, popup);
+        draw_popup(frame, app, popup, now);
     }
 }
 
@@ -205,9 +217,14 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect, now: i64) {
 
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     let mut lines = Vec::new();
+    // Where the revealed run's lines start.
+    let mut revealed = None;
     for (index, turn) in app.turns.iter().enumerate() {
         if index > 0 {
             lines.push(Line::default());
+        }
+        if app.reveal.as_ref() == Some(&turn.run.id) {
+            revealed = Some(lines.len());
         }
         turn_lines(turn, now, &mut lines);
     }
@@ -219,10 +236,18 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
         };
         lines.push(Line::from(hint.dim()));
     }
+    // Rows above the revealed run, wrapped as they'll be drawn.
+    let above = revealed.map(|start| {
+        Paragraph::new(lines[..start].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width.saturating_sub(2))
+            .min(u16::MAX as usize) as u16
+    });
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let height = area.height.saturating_sub(2) as usize;
     let total = paragraph.line_count(area.width.saturating_sub(2));
     let max = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+
     // `scroll` counts from the bottom, so while scrolled up, new lines would
     // push what's being read off the top; scroll up by as many to hold it.
     // Only for the same pane size: a resize rewraps everything anyway.
@@ -234,6 +259,10 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     // Clamped here, where the height is known, so scrolling back down never
     // has to work through lines past the top.
     app.scroll = app.scroll.min(max);
+    if let Some(above) = above {
+        // The revealed run at the top, or as near as the conversation's end allows.
+        app.scroll = max.saturating_sub(above);
+    }
     let session = app.session.as_deref().unwrap_or("new");
     let mut title = format!(" Conversation · session {session} ");
     if app.scroll > 0 {
@@ -369,7 +398,9 @@ fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize,
     (lines, (row, col))
 }
 
-fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup) {
+fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup, now: i64) {
+    // The highlighted item's first line and line count, kept in view.
+    let mut highlighted = (0, 0);
     let (title, lines): (&str, Vec<Line>) = match popup {
         Popup::Help => (
             " Keys ",
@@ -402,10 +433,38 @@ fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup) {
                 Line::from("y cancels it · any other key keeps it running".dim()),
             ],
         ),
+        Popup::Notifications(selected) => {
+            let mut lines = Vec::new();
+            for (index, n) in app.notifications.iter().enumerate() {
+                let item = notification_lines(n, index == *selected, now);
+                if index == *selected {
+                    highlighted = (lines.len(), item.len());
+                }
+                lines.extend(item);
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(
+                    "No notifications. Runs leave one here when they end.".dim(),
+                ));
+            }
+            (
+                " Notifications · Enter opens the run · r read · R all read · Esc ",
+                lines,
+            )
+        }
     };
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(76);
-    let height = (lines.len() as u16 + 2).min(area.height);
+    let rows = |lines: &[Line<'static>]| {
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width.saturating_sub(2))
+    };
+    let height = (rows(&lines) as u16 + 2).min(area.height);
+    let visible = height.saturating_sub(2) as usize;
+    let (start, len) = highlighted;
+    let (start, end) = (rows(&lines[..start]), rows(&lines[..start + len]));
+    let top = end.saturating_sub(visible).min(start);
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -414,13 +473,52 @@ fn draw_popup(frame: &mut Frame, app: &App, popup: &Popup) {
     };
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Border::bordered()
-                .title(title)
-                .border_style(Style::new().cyan()),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top as u16, 0))
+            .block(
+                Border::bordered()
+                    .title(title)
+                    .border_style(Style::new().cyan()),
+            ),
         rect,
     );
+}
+
+/// A notification in the list: unread or not, how long ago, its title, then
+/// its run, alerts and delegated runs that didn't complete. All host-written.
+fn notification_lines(n: &Notification, selected: bool, now: i64) -> Vec<Line<'static>> {
+    let unread = n.read_at.is_none();
+    let head = format!(
+        "{} {} {:>3}  {}",
+        if selected { "▸" } else { " " },
+        if unread { "●" } else { " " },
+        age(now - n.created_at),
+        notify::title(&n.note),
+    );
+    let head = match (selected, unread) {
+        (true, _) => head.reversed(),
+        (false, true) => head.bold(),
+        (false, false) => head.dim(),
+    };
+    let mut lines = vec![Line::from(head)];
+    let mut detail = format!("        run {}", n.run_id);
+    if let Some(ms) = n.note.duration_ms {
+        detail.push_str(&format!(" · took {}", elapsed(ms as i64)));
+    }
+    lines.push(Line::from(detail.dim()));
+    for alert in &n.note.alerts {
+        lines.push(Line::from(vec![
+            format!("        {}: ", alert.kind).yellow(),
+            alert.message.clone().into(),
+        ]));
+    }
+    for end in &n.note.delegated_not_completed {
+        lines.push(Line::from(
+            format!("        delegated run {} {}", end.run_id, end.status).red(),
+        ));
+    }
+    lines
 }
 
 /// A run ID's first eight characters, enough to tell runs apart in a list.
@@ -433,7 +531,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
-    use super::super::app::Msg;
+    use super::super::app::{Msg, Popup};
     use super::*;
     use crate::db::Event;
 
@@ -598,6 +696,86 @@ mod tests {
         screen(&mut app, 0);
         stream(&mut app, "\nthe newest line");
         assert!(screen(&mut app, 0).contains("the newest line"));
+    }
+
+    #[test]
+    fn notifications_show_unread_count_and_alerts() {
+        let note = |alerts| crate::notify::Note {
+            schedule_id: None,
+            agent: "reader".into(),
+            status: "completed".into(),
+            duration_ms: Some(3_200),
+            alerts,
+            delegated_not_completed: vec![],
+            schedule_status: None,
+        };
+        let mut app = App::new(vec![], "default".into(), Some("trip".into()));
+        app.update(Msg::Notifications(vec![
+            Notification {
+                id: 2,
+                run_id: "run-0002".into(),
+                created_at: 0,
+                read_at: None,
+                note: note(vec![crate::summary::Alert {
+                    kind: "denied".into(),
+                    message: r#"a request to "evil.example" was refused"#.into(),
+                }]),
+            },
+            Notification {
+                id: 1,
+                run_id: "run-0001".into(),
+                created_at: 0,
+                read_at: Some(1),
+                note: note(vec![]),
+            },
+        ]));
+        let screen_text = screen(&mut app, 300_000);
+        assert!(
+            screen_text.contains("● 1 unread notification · ^G"),
+            "{screen_text}"
+        );
+        app.popup = Some(Popup::Notifications(0));
+        let screen_text = screen(&mut app, 300_000);
+        for expected in [
+            "▸ ●  5m  run (agent reader): completed, 1 alert",
+            "run run-0002 · took 3.2s",
+            r#"denied: a request to "evil.example" was refused"#,
+            "│     5m  run (agent reader): completed   ",
+            "run run-0001 · took 3.2s",
+        ] {
+            assert!(
+                screen_text.contains(expected),
+                "missing {expected:?} in\n{screen_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_opened_run_is_scrolled_to_until_the_user_scrolls() {
+        let mut app = App::new(vec![], "default".into(), Some("trip".into()));
+        let runs: Vec<_> = (0..40)
+            .map(|i| run(&format!("r{i:02}"), &format!("prompt {i}"), "completed"))
+            .collect();
+        app.update(Msg::Runs("trip".into(), runs));
+        app.reveal = Some("r10".into());
+        let top_row = |screen: &str| screen.lines().nth(1).unwrap().to_string();
+        assert!(top_row(&screen(&mut app, 0)).contains("> prompt 10"));
+        // Earlier runs' events loading don't move it off the top.
+        app.update(Msg::History {
+            generation: 0,
+            run_id: "r03".into(),
+            events: vec![Event {
+                id: 1,
+                run_id: "r03".into(),
+                data: json!({"kind":"text","text":"one\ntwo\nthree"}),
+            }],
+        });
+        assert!(top_row(&screen(&mut app, 0)).contains("> prompt 10"));
+        // Near the end, it goes as far as the conversation does.
+        app.reveal = Some("r39".into());
+        let bottom = screen(&mut app, 0);
+        assert!(bottom.contains("> prompt 39") && !top_row(&bottom).contains("prompt 39"));
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]

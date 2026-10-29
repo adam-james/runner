@@ -5,7 +5,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
-use crate::db::{Event, Run, Session};
+use crate::db::{Event, Notification, Run, Session};
+use crate::notify;
 use crate::ui::{ARGS_LIMIT, delegation_label, name, token_usage_line, tool_call, truncate};
 
 /// How far PgUp/PgDn scroll the conversation.
@@ -47,6 +48,10 @@ pub enum Msg {
         prompt: String,
         error: String,
     },
+    /// The newest notifications, read or not.
+    Notifications(Vec<Notification>),
+    /// The run an opened notification is about.
+    Opened(Run),
     Notice(String),
     Error(String),
 }
@@ -61,6 +66,14 @@ pub enum Action {
         generation: u64,
     },
     Cancel(String),
+    /// Mark the notification read if it isn't, and look up its run.
+    OpenNotification {
+        id: i64,
+        run_id: String,
+        unread: bool,
+    },
+    /// Mark notification `id`, or every unread one, read.
+    ReadNotifications(Option<i64>),
     /// Stop following the old session's runs and poll this one's, if any.
     SelectSession {
         session: Option<String>,
@@ -100,6 +113,8 @@ pub enum Popup {
     /// The agent picker, with the highlighted agent's index.
     Agents(usize),
     ConfirmCancel(String),
+    /// The notifications, with the highlighted one's index.
+    Notifications(usize),
 }
 
 #[derive(Debug, PartialEq)]
@@ -218,6 +233,15 @@ pub struct App {
     pub popup: Option<Popup>,
     /// A notice, or an error if `true`, shown in the status bar until the next key.
     pub status: Option<(bool, String)>,
+    /// The newest notifications, newest first, as last listed.
+    pub notifications: Vec<Notification>,
+    /// A run to scroll the conversation to, from an opened notification,
+    /// until the user scrolls. It stays set so the view holds it in place
+    /// while earlier runs' events load.
+    pub reveal: Option<String>,
+    /// The newest notification seen, to say when another arrives; `None`
+    /// until the first listing, so those already there don't.
+    newest_notification: Option<i64>,
     /// A new session's first prompt is being submitted.
     creating: bool,
     /// Bumped on every session switch, so messages for the old session's
@@ -242,6 +266,9 @@ impl App {
             layout: (0, 0, 0),
             popup: None,
             status: None,
+            notifications: Vec::new(),
+            reveal: None,
+            newest_notification: None,
             creating: false,
             generation: 0,
         }
@@ -323,10 +350,65 @@ impl App {
                 }
                 self.status = Some((true, error));
             }
+            Msg::Notifications(notifications) => self.notifications(notifications),
+            Msg::Opened(run) => return self.open_run(run),
             Msg::Notice(text) => self.status = Some((false, text)),
             Msg::Error(text) => self.status = Some((true, text)),
         }
         Vec::new()
+    }
+
+    /// Unread notifications among those listed.
+    pub fn unread(&self) -> usize {
+        self.notifications
+            .iter()
+            .filter(|n| n.read_at.is_none())
+            .count()
+    }
+
+    /// Takes in a fresh notification listing, saying in the status bar when
+    /// one has arrived since the last.
+    fn notifications(&mut self, notifications: Vec<Notification>) {
+        let newest = notifications.iter().map(|n| n.id).max();
+        if let Some(seen) = self.newest_notification {
+            let arrived: Vec<_> = notifications
+                .iter()
+                .filter(|n| n.id > seen && n.read_at.is_none())
+                .collect();
+            if self.status.is_none() {
+                self.status = match arrived.as_slice() {
+                    [] => None,
+                    [one] => Some((
+                        false,
+                        format!("notification: {} · ^G to see", notify::title(&one.note)),
+                    )),
+                    many => Some((
+                        false,
+                        format!("{} new notifications · ^G to see", many.len()),
+                    )),
+                };
+            }
+        }
+        self.newest_notification = newest.max(self.newest_notification).or(Some(0));
+        self.notifications = notifications;
+        if let Some(Popup::Notifications(index)) = &mut self.popup {
+            *index = (*index).min(self.notifications.len().saturating_sub(1));
+        }
+    }
+
+    /// Shows the session of an opened notification's run, scrolled to it.
+    fn open_run(&mut self, run: Run) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if self.session.as_ref() != Some(&run.session_id) {
+            actions.push(self.select(Some(run.session_id.clone())));
+        }
+        self.focus = Focus::Runs;
+        self.scroll = 0;
+        if let Some(index) = self.turns.iter().position(|t| t.run.id == run.id) {
+            self.run_cursor = index;
+        }
+        self.reveal = Some(run.id);
+        actions
     }
 
     fn turn(&mut self, generation: u64, run_id: &str) -> Option<&mut Turn> {
@@ -381,6 +463,14 @@ impl App {
                 .position(|run| run.id == turn.run.id)
                 .unwrap_or(usize::MAX)
         });
+        if let Some(index) = self
+            .reveal
+            .as_ref()
+            .and_then(|id| self.turns.iter().position(|turn| &turn.run.id == id))
+            && self.focus == Focus::Runs
+        {
+            self.run_cursor = index;
+        }
         self.run_cursor = self.run_cursor.min(self.turns.len().saturating_sub(1));
         actions
     }
@@ -400,6 +490,7 @@ impl App {
         self.turns.clear();
         self.run_cursor = 0;
         self.scroll = 0;
+        self.reveal = None;
         self.focus = Focus::Input;
         self.creating = false;
         self.generation += 1;
@@ -418,8 +509,19 @@ impl App {
         if let Some(popup) = self.popup.take() {
             return self.popup_key(popup, key);
         }
+        let scrolls = match key.code {
+            KeyCode::PageUp | KeyCode::PageDown => true,
+            KeyCode::Home | KeyCode::End => self.focus != Focus::Input,
+            KeyCode::Up | KeyCode::Down => matches!(self.focus, Focus::Input | Focus::Conversation),
+            _ => false,
+        };
+        if scrolls {
+            // Scrolling takes the conversation back from a revealed run.
+            self.reveal = None;
+        }
         match key.code {
             KeyCode::Char('n') if ctrl => return vec![self.select(None)],
+            KeyCode::Char('g') if ctrl => self.popup = Some(Popup::Notifications(0)),
             KeyCode::Char('a') if ctrl => self.open_agents(),
             KeyCode::Char('o') if ctrl => self.focus_sessions(),
             KeyCode::Tab => self.cycle_focus(1),
@@ -604,6 +706,52 @@ impl App {
                     return vec![Action::Cancel(run_id)];
                 }
             }
+            Popup::Notifications(index) => return self.notifications_key(index, key),
+        }
+        Vec::new()
+    }
+
+    fn notifications_key(&mut self, index: usize, key: KeyEvent) -> Vec<Action> {
+        let keep = |app: &mut Self, index| app.popup = Some(Popup::Notifications(index));
+        match key.code {
+            KeyCode::Up => keep(self, index.saturating_sub(1)),
+            KeyCode::Down => keep(
+                self,
+                (index + 1).min(self.notifications.len().saturating_sub(1)),
+            ),
+            KeyCode::Enter => {
+                if let Some(n) = self.notifications.get_mut(index) {
+                    let unread = n.read_at.is_none();
+                    // Shown read straight away; the next listing confirms it.
+                    n.read_at.get_or_insert(crate::db::now());
+                    return vec![Action::OpenNotification {
+                        id: n.id,
+                        run_id: n.run_id.clone(),
+                        unread,
+                    }];
+                }
+            }
+            KeyCode::Char('r') => {
+                keep(self, index);
+                if let Some(n) = self.notifications.get_mut(index)
+                    && n.read_at.is_none()
+                {
+                    n.read_at = Some(crate::db::now());
+                    return vec![Action::ReadNotifications(Some(n.id))];
+                }
+            }
+            KeyCode::Char('R') => {
+                keep(self, index);
+                if self.unread() > 0 {
+                    let now = crate::db::now();
+                    for n in &mut self.notifications {
+                        n.read_at.get_or_insert(now);
+                    }
+                    return vec![Action::ReadNotifications(None)];
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {}
+            _ => keep(self, index),
         }
         Vec::new()
     }
@@ -678,6 +826,142 @@ mod tests {
         for c in text.chars() {
             app.update(press(KeyCode::Char(c)));
         }
+    }
+
+    fn notification(id: i64, run_id: &str, read: bool) -> Notification {
+        Notification {
+            id,
+            run_id: run_id.into(),
+            created_at: 0,
+            read_at: read.then_some(1),
+            note: notify::Note {
+                schedule_id: None,
+                agent: "default".into(),
+                status: "completed".into(),
+                duration_ms: Some(1200),
+                alerts: vec![],
+                delegated_not_completed: vec![],
+                schedule_status: None,
+            },
+        }
+    }
+
+    #[test]
+    fn notifications_count_unread_and_say_when_one_arrives() {
+        let mut app = app(Some("s"));
+        app.update(Msg::Notifications(vec![
+            notification(2, "b", false),
+            notification(1, "a", true),
+        ]));
+        assert_eq!(app.unread(), 1);
+        assert_eq!(app.status, None, "those already there aren't news");
+        app.update(Msg::Notifications(vec![
+            notification(3, "c", false),
+            notification(2, "b", false),
+            notification(1, "a", true),
+        ]));
+        assert_eq!(app.unread(), 2);
+        assert_eq!(
+            app.status,
+            Some((
+                false,
+                "notification: run (agent default): completed · ^G to see".into()
+            ))
+        );
+        // Unchanged, it isn't announced again.
+        app.status = None;
+        app.update(Msg::Notifications(app.notifications.clone()));
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn opening_a_notification_marks_it_read_and_shows_its_run() {
+        let mut app = app(Some("s"));
+        app.update(Msg::Notifications(vec![
+            notification(2, "b", false),
+            notification(1, "a", true),
+        ]));
+        app.update(ctrl('g'));
+        assert_eq!(app.popup, Some(Popup::Notifications(0)));
+        app.update(press(KeyCode::Down));
+        app.update(press(KeyCode::Up));
+        assert_eq!(
+            app.update(press(KeyCode::Enter)),
+            vec![Action::OpenNotification {
+                id: 2,
+                run_id: "b".into(),
+                unread: true
+            }]
+        );
+        assert!(app.popup.is_none());
+        assert_eq!(app.unread(), 0, "shown read before the daemon confirms it");
+
+        let mut opened = run("b", "completed");
+        opened.session_id = "t".into();
+        assert_eq!(
+            app.update(Msg::Opened(opened)),
+            vec![Action::SelectSession {
+                session: Some("t".into()),
+                generation: 1
+            }]
+        );
+        assert_eq!(app.focus, Focus::Runs);
+        assert_eq!(app.reveal.as_deref(), Some("b"));
+        let mut later = run("c", "completed");
+        later.session_id = "t".into();
+        app.update(Msg::Runs(
+            "t".into(),
+            vec![run("a", "completed"), run("b", "completed"), later],
+        ));
+        assert_eq!(app.run_cursor, 1);
+        // Moving through the runs keeps it; scrolling the conversation doesn't.
+        app.update(press(KeyCode::Down));
+        assert_eq!(app.reveal.as_deref(), Some("b"));
+        app.update(press(KeyCode::PageUp));
+        assert_eq!(app.reveal, None);
+
+        // An already-read one opens without marking it again.
+        app.update(ctrl('g'));
+        app.update(press(KeyCode::Down));
+        assert_eq!(
+            app.update(press(KeyCode::Enter)),
+            vec![Action::OpenNotification {
+                id: 1,
+                run_id: "a".into(),
+                unread: false
+            }]
+        );
+    }
+
+    #[test]
+    fn notifications_mark_read_one_at_a_time_or_all() {
+        let mut app = app(Some("s"));
+        app.update(Msg::Notifications(vec![
+            notification(3, "c", false),
+            notification(2, "b", false),
+            notification(1, "a", false),
+        ]));
+        app.update(ctrl('g'));
+        app.update(press(KeyCode::Down));
+        assert_eq!(
+            app.update(press(KeyCode::Char('r'))),
+            vec![Action::ReadNotifications(Some(2))]
+        );
+        assert_eq!(app.popup, Some(Popup::Notifications(1)));
+        assert!(app.update(press(KeyCode::Char('r'))).is_empty());
+        assert_eq!(
+            app.update(press(KeyCode::Char('R'))),
+            vec![Action::ReadNotifications(None)]
+        );
+        assert_eq!(app.unread(), 0);
+        assert!(app.update(press(KeyCode::Char('R'))).is_empty());
+        app.update(press(KeyCode::Esc));
+        assert!(app.popup.is_none());
+        // Ctrl-G works from the prompt box, without typing a g.
+        assert_eq!(app.focus, Focus::Input);
+        app.update(ctrl('g'));
+        assert!(app.input.is_empty());
+        assert!(app.popup.is_some());
     }
 
     #[test]

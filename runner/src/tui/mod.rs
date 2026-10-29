@@ -121,6 +121,25 @@ async fn event_loop(
                         send.send(msg).ok();
                     });
                 }
+                Action::OpenNotification { id, run_id, unread } => {
+                    tokio::spawn(async move {
+                        if unread && let Err(error) = client.read_notifications(Some(id)).await {
+                            send.send(Msg::Error(format!("{error:#}"))).ok();
+                        }
+                        let msg = match client.run(&run_id).await {
+                            Ok(run) => Msg::Opened(run),
+                            Err(error) => Msg::Error(format!("{error:#}")),
+                        };
+                        send.send(msg).ok();
+                    });
+                }
+                Action::ReadNotifications(id) => {
+                    tokio::spawn(async move {
+                        if let Err(error) = client.read_notifications(id).await {
+                            send.send(Msg::Error(format!("{error:#}"))).ok();
+                        }
+                    });
+                }
                 Action::SelectSession { session, .. } => {
                     for follower in followers.drain(..) {
                         follower.abort();
@@ -211,8 +230,8 @@ async fn tick(send: mpsc::UnboundedSender<Msg>) {
     }
 }
 
-/// Lists the sessions and the selected session's runs every `POLL`, and
-/// straight away when the selection changes.
+/// Lists the sessions, the notifications and the selected session's runs
+/// every `POLL`, and straight away when the selection changes.
 async fn poll(
     client: Arc<Client>,
     mut selection: watch::Receiver<Option<String>>,
@@ -224,6 +243,10 @@ async fn poll(
             Ok(sessions) => vec![Msg::Sessions(sessions)],
             Err(error) => vec![Msg::Error(format!("{error:#}"))],
         };
+        msgs.push(match client.notifications(false).await {
+            Ok(notifications) => Msg::Notifications(notifications),
+            Err(error) => Msg::Error(format!("{error:#}")),
+        });
         if let Some(session) = session {
             msgs.push(match client.runs(Some(&session)).await {
                 Ok(runs) => Msg::Runs(session, runs),
