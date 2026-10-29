@@ -15,6 +15,9 @@ const MAX_BOARDS: usize = 30;
 const MAX_OUTPUT: usize = 30_000;
 /// Characters of a Who's Hiring post's text, after its first line.
 const MAX_POST_TEXT: usize = 1_000;
+/// A line width html2text never reaches, so a post's first line, its
+/// title, isn't wrapped.
+const UNWRAPPED: usize = 100_000;
 
 impl Guest for JobBoards {
     fn describe() -> ToolDescription {
@@ -186,7 +189,9 @@ fn boards(value: &Value) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-/// Greenhouse's `GET /v1/boards/{board}/jobs`.
+/// Greenhouse's `GET /v1/boards/{board}/jobs`. Without `content=true`,
+/// which adds every job's full description, it has no departments; a
+/// board's `metadata` fields, such as "Location Type", stand in.
 fn greenhouse(board: &str, data: &Value) -> Vec<Listing> {
     jobs(&data["jobs"])
         .map(|job| Listing {
@@ -195,11 +200,11 @@ fn greenhouse(board: &str, data: &Value) -> Vec<Listing> {
             details: [text(&job["location"]["name"])]
                 .into_iter()
                 .chain(
-                    job["departments"]
+                    job["metadata"]
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .map(|d| text(&d["name"])),
+                        .map(|m| text(&m["value"]).filter(|v| v.len() <= 60)),
                 )
                 .flatten()
                 .collect(),
@@ -293,7 +298,7 @@ async fn hn(query: &str, since: Option<i64>) -> anyhow::Result<String> {
         urlencoding::encode(query)
     );
     if let Some(since) = since {
-        url.push_str(&format!("&numericFilters=created_at_i>{since}"));
+        url.push_str(&format!("&numericFilters=created_at_i%3E{since}"));
     }
     let comments = get_json(&url).await?;
     let mut listings = hn_posts(id, &comments);
@@ -324,7 +329,7 @@ fn hn_posts(id: u64, comments: &Value) -> Vec<Listing> {
         .filter_map(|hit| {
             let html = hit["comment_text"].as_str()?;
             let body = html2text::config::plain()
-                .string_from_read(html.as_bytes(), 100)
+                .string_from_read(html.as_bytes(), UNWRAPPED)
                 .ok()?;
             let body = clean(&body);
             let mut lines = body.trim().splitn(2, '\n');
@@ -404,7 +409,12 @@ fn entry(listing: &Listing) -> String {
     if let Some(salary) = &listing.salary {
         line.push(salary.clone());
     }
-    let mut out = format!("\n- {}: {}\n", listing.company, listing.title);
+    // A Who's Hiring title already starts with the company.
+    let mut out = if listing.title.starts_with(&listing.company) {
+        format!("\n- {}\n", listing.title)
+    } else {
+        format!("\n- {}: {}\n", listing.company, listing.title)
+    };
     if !line.is_empty() {
         out.push_str(&format!("  {}\n", line.join(" · ")));
     }
@@ -505,16 +515,22 @@ fn date(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// GETs `url` as JSON, trying once more after a 502, 503 or 504: Lever
+/// can time out building a large board it hasn't cached.
 async fn get_json(url: &str) -> anyhow::Result<Value> {
-    let request = Request::get(url).body(Body::empty())?;
-    let response = Client::new().send(request).await?;
-    let status = response.status();
-    let mut body = response.into_body();
-    let bytes = body.contents().await?;
-    match status.as_u16() {
-        200..=299 => Ok(serde_json::from_slice(bytes)?),
-        404 => anyhow::bail!("not found (404); check the board name"),
-        code => anyhow::bail!("returned {code}"),
+    let mut retried = false;
+    loop {
+        let request = Request::get(url).body(Body::empty())?;
+        let response = Client::new().send(request).await?;
+        let status = response.status();
+        let mut body = response.into_body();
+        let bytes = body.contents().await?;
+        match status.as_u16() {
+            200..=299 => return Ok(serde_json::from_slice(bytes)?),
+            404 => anyhow::bail!("not found (404); check the board name"),
+            502..=504 if !retried => retried = true,
+            code => anyhow::bail!("returned {code}"),
+        }
     }
 }
 
@@ -564,7 +580,10 @@ mod tests {
             "company_name": "Acme",
             "absolute_url": "https://boards.greenhouse.io/acme/jobs/1",
             "location": {"name": "Remote, US"},
-            "departments": [{"name": "Engineering"}],
+            "metadata": [
+                {"name": "Location Type", "value": "Remote", "value_type": "single_select"},
+                {"name": "Notes", "value": null, "value_type": "short_text"},
+            ],
             "first_published": "2026-10-20T08:00:00-04:00",
             "updated_at": "2026-10-25T08:00:00-04:00",
         }]});
@@ -573,7 +592,7 @@ mod tests {
             [Listing {
                 company: "Acme".into(),
                 title: "Software Engineer, Infrastructure".into(),
-                details: vec!["Remote, US".into(), "Engineering".into()],
+                details: vec!["Remote, US".into(), "Remote".into()],
                 posted: parse_time("2026-10-20T12:00:00Z"),
                 url: "https://boards.greenhouse.io/acme/jobs/1".into(),
                 ..Default::default()
@@ -639,6 +658,11 @@ mod tests {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].company, "Acme");
         assert_eq!(posts[0].title, "Acme | Rust Engineer | Remote (US)");
+        assert!(entry(&posts[0]).starts_with("\n- Acme | Rust Engineer | Remote (US)\n"));
+        let long = format!("{}Remote", "Acme | Rust Engineer | ".repeat(10));
+        let comments_long = json!({"hits": [{"objectID": "12", "parent_id": 2,
+            "created_at_i": 0, "comment_text": format!("{long}<p>More")}]});
+        assert_eq!(hn_posts(2, &comments_long)[0].title, long);
         assert_eq!(posts[0].url, "https://news.ycombinator.com/item?id=10");
         let text = posts[0].text.as_deref().unwrap();
         assert!(text.contains("We build things."), "{text}");
