@@ -222,21 +222,78 @@ async fn real_components_stream_save_resume_and_enforce_capabilities() {
         .iter()
         .filter(|e| e["kind"] == "audit" && e["action"] == "filesystem.denied")
         .collect();
-    assert_eq!(refused.len(), 3, "{refused:?}");
-    for record in &refused {
-        assert_eq!(
+    let refusals: Vec<_> = refused
+        .iter()
+        .map(|record| {
+            assert_eq!(record["decision"], "denied");
             (
-                record["operation"].as_str(),
-                record["decision"].as_str(),
-                record["outcome"].as_str()
-            ),
-            (Some("open-at"), Some("denied"), Some("not_permitted"))
-        );
-    }
+                record["operation"].as_str().unwrap(),
+                record["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refusals,
+        [
+            ("read", "outside_dir"),
+            ("read", "outside_dir"),
+            ("write", "read_only"),
+        ],
+        "{refused:?}"
+    );
     let text = serde_json::to_string(&refused).unwrap();
     for path in ["passwd", "escape", "changed.txt"] {
         assert!(!text.contains(path), "{text}");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires WASM fixture build"]
+async fn a_tool_with_no_dir_asking_for_files_is_recorded() {
+    let fixture = Fixture::new();
+    // The fixture tool again, with nothing mounted.
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    let tool = config
+        .lines()
+        .skip_while(|line| *line != "[tools.fixture]")
+        .nth(1)
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        &fixture.config,
+        format!("{config}\n[tools.nodir]\n{tool}\n[agents.nodir]\nprovider = \"fixture\"\ntools = [\"nodir\"]\n"),
+    )
+    .unwrap();
+    let runtime = fixture.runtime().await;
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = events.clone();
+    let sink: host::EventSink = Arc::new(move |value| captured.lock().unwrap().push(value));
+    runtime
+        .run_turn("nodir", "nodir", "named-tool:nodir:read-allowed", sink)
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    // With nothing mounted the read fails inside the guest, so asking for
+    // directories is the only sign it tried.
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "audit" && e["decision"] == "denied")
+        .collect();
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(
+        (
+            denied[0]["action"].as_str(),
+            denied[0]["interface"].as_str(),
+            denied[0]["function"].as_str(),
+            denied[0]["outcome"].as_str(),
+        ),
+        (
+            Some("capability.denied"),
+            Some("wasi:filesystem/preopens@0.2.12"),
+            Some("get-directories"),
+            Some("refused"),
+        )
+    );
 }
 
 async fn wait(db: &Database, id: &str, state: &str) -> Run {

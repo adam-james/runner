@@ -574,6 +574,9 @@ struct SandboxState {
     table: ResourceTable,
     hooks: SandboxHooks,
     limits: AuditedLimits,
+    /// Whether the mounted `dir` is writable, for telling which way a
+    /// refused file operation broke the mount.
+    dir_writable: bool,
 }
 
 /// A store's memory and table caps, recording each time one turns down a
@@ -762,6 +765,7 @@ fn sandbox_store(
             limits: limits.build(),
             audit: audit.clone(),
         },
+        dir_writable: config.dir_writable,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);

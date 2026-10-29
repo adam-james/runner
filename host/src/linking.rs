@@ -268,9 +268,18 @@ struct Denial {
 
 impl Denial {
     /// Whether a call is recorded: refusals and traps are, an empty answer
-    /// to a query isn't, since nothing was there to deny.
+    /// to a query isn't, since nothing was there to deny. The exception is
+    /// asking for preopened directories, which is how a guest starts any use
+    /// of a filesystem: with nothing mounted, its file operations then fail
+    /// inside the guest (`ENOENT`) and never reach the host, so this is the
+    /// only record of the attempt. libc asks once per instance.
     fn recorded(&self) -> bool {
-        !matches!(self.reply, Reply::Empty(_))
+        !matches!(self.reply, Reply::Empty(_)) || self.is_preopens_query()
+    }
+
+    fn is_preopens_query(&self) -> bool {
+        self.interface.starts_with("wasi:filesystem/preopens@")
+            && self.function == "get-directories"
     }
 
     fn answer(&self, results: &mut [Val]) -> Result<()> {
@@ -408,5 +417,15 @@ mod tests {
                 ("odd", Reply::Trap),
             ]
         );
+        // An empty answer isn't recorded, except to a guest asking for
+        // directories with none mounted.
+        let empty = |interface: &str, function: &str| Denial {
+            interface: interface.into(),
+            function: function.into(),
+            reply: Reply::Empty(Val::List(Vec::new())),
+        };
+        assert!(empty("wasi:filesystem/preopens@0.2.12", "get-directories").recorded());
+        assert!(!empty("wasi:cli/environment@0.2.12", "get-environment").recorded());
+        assert!(!empty("wasi:filesystem/preopens@0.2.12", "other").recorded());
     }
 }

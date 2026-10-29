@@ -336,13 +336,19 @@ way a guest expects (`access-denied`), a query such as reading the environment
 gets an empty answer, and anything else traps. Refusals and traps are recorded
 as `capability.denied` with the interface and function, so they count as
 denials in [summaries](#audit-log) and raise alerts. The environment,
-arguments and working directory always read as empty.
+arguments and working directory always read as empty, and aren't recorded.
+Asking for directories with no `dir` is: it's how a guest starts using files,
+and with nothing mounted the file operations themselves fail inside the guest
+without reaching the host.
 
 With a `dir`, the filesystem is wasmtime's, confined to that directory. A path
 that leads outside it (`..`, or a symlink pointing out) or a write under a
 read-only one is refused with `not-permitted` and recorded as
-`filesystem.denied`, with the operation (e.g. `open-at`) but not the path.
-Other errors, like a missing file, are ordinary failures and aren't recorded.
+`filesystem.denied`, saying why (`outside_dir` or `read_only`) and what kind
+of operation it was (`read`, `write` or `metadata`), but not the path. Other
+errors, like a missing file, are ordinary failures and aren't recorded. An
+agent reviewing a trail through `audit_trail` gets a host-written line on what
+each kind of denial in it means.
 
 Records are metadata only. They never include prompts, tool input or
 output, request paths or bodies, header values, or error text; credentials
