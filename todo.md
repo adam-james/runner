@@ -59,7 +59,7 @@ In order; each step ships something usable on its own.
        - posting as the terminal the daemon was started from (so a click brings it forward) stopped banners showing, when tried with the sound in 3d8a65e; the sound alone is harmless (it only sets `soundName`), so the likely cause is posting as another app's bundle ID through the deprecated `NSUserNotification` API. Left out; the TUI's OSC 9 post (below) brings the right window forward instead
      - ~~the TUI posts through its terminal too~~ done: OSC 9 (`ESC ] 9 ; text BEL`) for each unread one that arrives while it's open, more than three as one, control characters dropped; it lists with `?posting=true`, and for 5s after that the daemon marks waiting ones posted without posting
        - next: check on a Mac that a banner shows in Ghostty and clicking it focuses the tab
-       - later: tmux passthrough (`ESC P tmux; … ESC \\`), and a way to turn it off (`[notifications] desktop = false` only stops the daemon's post)
+       - later: tmux passthrough (`ESC P tmux; … ESC \`), and a way to turn it off (`[notifications] desktop = false` only stops the daemon's post)
      - ~~listed in the TUI, with an unread count~~ done: the status bar counts unread ones and says when one arrives; Ctrl-G lists the newest 100; Enter opens the run's session scrolled to that run and marks it read; r / R mark one or all read
      - approval requests (step 4) use the same channel
    - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule
