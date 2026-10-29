@@ -16,11 +16,6 @@ practice; approval checkpoints (section 2, step 4) wait until one needs them.
 
 ## Daily use
 
-- job search: an agent to chat with that finds listings
-  - ~~a `job_boards` tool~~ done: Greenhouse, Lever and Ashby boards by name, and the latest HN "Who is hiring?" thread's top-level posts (via `hn.algolia.com`); filters by words and `posted_within_days`, newest first, bounded output; four exact `allowed_hosts`, no key
-    - checked against the live APIs; Lever is slow (or a 502) on a large board it hasn't cached, so a 502-504 is retried once
-  - ~~a `job_search` agent~~ done: `runner chat --agent job_search`, with `job_boards` and `web_search`, which finds companies and their board names (no files, no schedule)
-  - later, if chatting isn't enough: a schedule that saves new listings to a file and notifies only when it found some (needs a host `notify` tool)
 - later: email triage (needs OAuth refresh in the host and a Gmail or JMAP read tool; read-only, no fetch, since email is the main injection route)
 - later: a daily brief with weather (and maybe news); a daily schedule needs to run a missed occurrence when the daemon wakes, since one more than a minute late is skipped
 
