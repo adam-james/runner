@@ -1608,6 +1608,37 @@ fn a_version_6_database_gains_schedules_and_keeps_its_agent_versions() {
 }
 
 #[test]
+fn a_version_9_databases_notifications_count_as_posted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let db = Database::open(&path).unwrap();
+    let run = db
+        .submit(None, "default".into(), "before".into(), 60)
+        .unwrap();
+    let note: runner::notify::Note = serde_json::from_value(json!({"schedule_id":null,
+        "agent":"default", "status":"failed", "duration_ms":null, "alerts":[],
+        "schedule_status":null}))
+    .unwrap();
+    db.record_notification(&run.id, Some(note))
+        .unwrap()
+        .unwrap();
+    drop(db);
+    // What a daemon from before desktop notifications left behind.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP INDEX undelivered_notifications;
+         ALTER TABLE notifications DROP COLUMN delivered_at;
+         PRAGMA user_version=9;",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Database::open(&path).unwrap();
+    // Upgrading doesn't post every old notification at once.
+    assert!(db.undelivered().unwrap().is_empty());
+    assert_eq!(db.notifications(true, 10).unwrap().len(), 1);
+}
+
+#[test]
 fn a_version_7_database_keeps_its_one_off_schedules() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");

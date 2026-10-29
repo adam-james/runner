@@ -316,6 +316,14 @@ holds the model's reply or the run's error, which a prompt injection could
 steer. Notifications stay until read. Runs that ended before notifications
 existed count as checked, so upgrading notifies about nothing old.
 
+After checking, the notifier posts each notification it hasn't yet to the
+desktop (unless `[notifications] desktop = false`), skipping ones already
+read, and marks it posted (`delivered_at`) whether or not posting worked: it
+stays stored either way, and a desktop that can't show notifications would
+only fail again. More than three waiting at once are posted as one. A failed
+post is logged once until posting works again. Notifications from before
+desktop posting existed count as posted.
+
 ## Host activity logs
 
 `runner serve` writes timestamped, readable diagnostic logs to stderr. The default

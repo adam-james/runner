@@ -292,7 +292,23 @@ The host writes every notification itself, from the run's status, duration
 and alerts and its schedule's status, and never includes the model's reply or
 the run's error, so a prompt injection can't put a convincing fake message in
 what looks like a system notice. A run is checked once its whole delegation
-tree has ended; delegated runs are covered by their parent's notification. Desktop notifications and a list in the TUI come next.
+tree has ended; delegated runs are covered by their parent's notification.
+
+The daemon also posts each notification to the desktop once: macOS
+Notification Center (through `osascript`) or, on Linux, a freedesktop
+notification server (through `notify-send`). The title and alerts go to them
+as arguments, never as part of a script, and are escaped for the markup a
+Linux server may render. When more than three are waiting at once, such as
+after the daemon was stopped a while, they're posted as one. If posting
+fails, say on a machine with no notification server, the daemon logs it once
+and the notification is still there to read. To turn it off:
+
+```toml
+[notifications]
+desktop = false
+```
+
+A list in the TUI comes next.
 
 ### Audit log
 

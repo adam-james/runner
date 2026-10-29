@@ -1267,13 +1267,20 @@ pub async fn serve(config: &str, data_dir: &Path, concurrency: usize) -> Result<
     let shutdown = CancellationToken::new();
     let worker_stop = shutdown.clone();
     let http_stop = shutdown.clone();
+    let desktop = runtime
+        .desktop_notifications()
+        .then(|| Arc::new(crate::notify::SystemDesktop) as Arc<dyn crate::notify::Desktop>);
     let executor: Arc<dyn Executor> = Arc::new(WasmExecutor(runtime));
     let scheduler = tokio::spawn(crate::schedule::scheduler(
         db.clone(),
         executor.clone(),
         shutdown.clone(),
     ));
-    let notifier = tokio::spawn(crate::notify::notifier(db.clone(), shutdown.clone()));
+    let notifier = tokio::spawn(crate::notify::notifier(
+        db.clone(),
+        desktop,
+        shutdown.clone(),
+    ));
     let worker = worker(db, executor, concurrency, worker_stop);
     let http =
         axum::serve(listener, service.router()).with_graceful_shutdown(http_stop.cancelled_owned());

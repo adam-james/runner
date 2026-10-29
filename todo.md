@@ -55,7 +55,8 @@ In order; each step ships something usable on its own.
      - ~~test that a component's environment is empty~~ done: `wasi:cli/environment` isn't linked, and the fixture probe checks it reads no env vars
    - notifications: tell the user in the foreground when a background task finishes, fails or raises an alert (before `run_auditor`, so alerts reach someone)
      - ~~durable notification records, host-written only, with a per-schedule level~~ done: the daemon's notifier checks every top-level run once its tree has ended, scheduled or not, assuming nobody watched; level `all|problems|never` (problems: the run or a delegated run didn't complete, or an alert), per schedule (`schedules add --notify`) or per run (`runner run --notify`), default `problems`; `runner notifications`, `/v1/notifications`; status, duration, alerts and schedule status, never the model's reply or the run's error
-     - next: delivered as desktop notifications (macOS Notification Center, freedesktop on Linux) and listed in the TUI; opening one shows the run
+     - ~~delivered as desktop notifications~~ done: the notifier posts each once (macOS Notification Center via `osascript`, `notify-send` on Linux; text as arguments, markup escaped), more than three waiting as one, a failure logged once and not retried; `[notifications] desktop = false` turns it off
+     - next: listed in the TUI, with an unread count; opening one shows the run and marks it read
      - approval requests (step 4) use the same channel
    - `run_auditor` only when the summary flags something: advisory, never clears an alert, not in notification text, opt-in per schedule
    - audit retention beyond the run, and for the agent versions runs reference, since background runs are reviewed later

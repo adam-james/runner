@@ -94,8 +94,8 @@ enum Command {
         #[command(subcommand)]
         command: Schedules,
     },
-    /// What scheduled runs did once they ended, kept by the daemon until
-    /// read; host-written, never the model's reply.
+    /// What runs did once they ended, kept by the daemon until read and
+    /// posted to the desktop; host-written, never the model's reply.
     Notifications {
         #[command(subcommand)]
         command: Notifications,

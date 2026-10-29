@@ -10,7 +10,15 @@
 //! run's error: a prompt injection could otherwise put a convincing fake
 //! message in what looks like a trusted system notice. The few
 //! guest-influenced strings in alerts (hosts, tool names) stay JSON-quoted.
-use std::time::Duration;
+//!
+//! Each notification is also posted to the desktop once, unless
+//! `[notifications] desktop = false`: macOS Notification Center through
+//! `osascript`, or `notify-send` on Linux. Its text goes to them as
+//! arguments, never spliced into a script, and is escaped for the markup a
+//! Linux notification server may render.
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -151,10 +159,18 @@ pub fn render(notifications: &[Notification]) -> String {
 }
 
 /// Checks each top-level run once its tree has ended and stores the
-/// notification its level wants, until `shutdown`. Runs that ended while
-/// the daemon was stopped are checked when it starts.
-pub async fn notifier(db: Database, shutdown: CancellationToken) {
+/// notification its level wants, then posts new ones to `desktop`, if
+/// there is one, until `shutdown`. Runs that ended while the daemon was
+/// stopped are checked when it starts.
+pub async fn notifier(
+    db: Database,
+    desktop: Option<Arc<dyn Desktop>>,
+    shutdown: CancellationToken,
+) {
     let mut tick = tokio::time::interval(TICK);
+    // Whether the last post failed, so a desktop that can't show
+    // notifications is logged about once rather than on every one.
+    let mut failing = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -169,9 +185,150 @@ pub async fn notifier(db: Database, shutdown: CancellationToken) {
                     // Transient (e.g. SQLITE_BUSY); unchecked runs stay unchecked.
                     Err(_) => tracing::error!("could not check ended runs for notifications"),
                 }
+                let Some(desktop) = desktop.clone() else { continue };
+                match db.blocking(move |db| deliver(&db, desktop.as_ref())).await {
+                    Ok(None) => failing = false,
+                    Ok(Some(error)) => {
+                        if !failing {
+                            tracing::warn!(error = %error, "could not post a desktop \
+                                notification; it's still stored (runner notifications)");
+                        }
+                        failing = true;
+                    }
+                    Err(_) => tracing::error!("could not read notifications to post"),
+                }
             }
         }
     }
+}
+
+/// Where desktop notifications are posted.
+pub trait Desktop: Send + Sync {
+    fn post(&self, title: &str, body: &str) -> Result<()>;
+}
+
+/// More notifications than this waiting at once, e.g. after the daemon
+/// was stopped a while, are posted as one.
+pub const MAX_POSTED: usize = 3;
+
+/// The longest a notification's body gets, in characters.
+const MAX_BODY: usize = 300;
+
+/// Posts each notification not yet posted to `desktop`, unless it's already
+/// been read, and marks it posted. A failed post is marked too: it's still
+/// stored, and retrying a desktop that can't show notifications would only
+/// fail again. Returns the last failure, if any.
+pub fn deliver(db: &Database, desktop: &dyn Desktop) -> Result<Option<anyhow::Error>> {
+    let waiting = db.undelivered()?;
+    let ids: Vec<i64> = waiting.iter().map(|n| n.id).collect();
+    let unread: Vec<_> = waiting.iter().filter(|n| n.read_at.is_none()).collect();
+    let mut failure = None;
+    let mut post = |title: &str, body: &str| {
+        if let Err(error) = desktop.post(title, body) {
+            failure = Some(error);
+        }
+    };
+    if unread.len() > MAX_POSTED {
+        post(
+            &format!("runner: {} new notifications", unread.len()),
+            "Run `runner notifications` to see them.",
+        );
+    } else {
+        for n in unread {
+            post(&format!("runner: {}", title(&n.note)), &body(&n.note));
+        }
+    }
+    db.mark_delivered(&ids)?;
+    Ok(failure)
+}
+
+/// A notification's alerts and delegated runs that didn't complete, a line
+/// each, cut to `MAX_BODY` characters; or its duration if it has neither.
+pub fn body(note: &Note) -> String {
+    let mut lines: Vec<String> = note
+        .alerts
+        .iter()
+        .map(|alert| format!("{}: {}", alert.kind, alert.message))
+        .collect();
+    lines.extend(
+        note.delegated_not_completed
+            .iter()
+            .map(|end| format!("delegated run {} {}", end.run_id, end.status)),
+    );
+    if lines.is_empty() {
+        lines.push(match note.duration_ms {
+            Some(ms) => format!("took {}.{:03}s, no alerts", ms / 1000, ms % 1000),
+            None => "no alerts".into(),
+        });
+    }
+    let body = lines.join("\n");
+    match body.char_indices().nth(MAX_BODY) {
+        Some((cut, _)) => format!("{}…", &body[..cut]),
+        None => body,
+    }
+}
+
+/// The OS's own notifications, through its command-line tool.
+pub struct SystemDesktop;
+
+/// How long the notification tool may take before it's given up on.
+const POST_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl Desktop for SystemDesktop {
+    fn post(&self, title: &str, body: &str) -> Result<()> {
+        let mut command = if cfg!(target_os = "macos") {
+            // The text is the script's arguments, never part of its source.
+            let mut command = Command::new("osascript");
+            command.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+                title,
+                body,
+            ]);
+            command
+        } else if cfg!(target_os = "linux") {
+            // Servers may render a subset of HTML in the body.
+            let mut command = Command::new("notify-send");
+            command.args(["--app-name=runner", "--", title, &escape_markup(body)]);
+            command
+        } else {
+            bail!("desktop notifications aren't supported on this OS");
+        };
+        let program = command.get_program().to_string_lossy().into_owned();
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("running {program}: {e}"))?;
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    bail!("{program} exited with {status}");
+                }
+                return Ok(());
+            }
+            if started.elapsed() > POST_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{program} took longer than {}s", POST_TIMEOUT.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// `text` with the characters freedesktop body markup gives meaning to
+/// escaped, so a guest-influenced host can't become a link or formatting.
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// One pass of `notifier`. Returns the notifications stored.
@@ -330,5 +487,128 @@ mod tests {
         tree.not_completed[0].run_id = "r".into();
         let own = super::note(&run("failed"), None, &tree, None).unwrap();
         assert!(own.delegated_not_completed.is_empty());
+    }
+
+    /// Records each post, failing them all if `fail` is set.
+    #[derive(Default)]
+    struct FakeDesktop {
+        posts: std::sync::Mutex<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    impl Desktop for FakeDesktop {
+        fn post(&self, title: &str, body: &str) -> Result<()> {
+            self.posts.lock().unwrap().push((title.into(), body.into()));
+            if self.fail {
+                bail!("no notification server");
+            }
+            Ok(())
+        }
+    }
+
+    impl FakeDesktop {
+        fn take(&self) -> Vec<(String, String)> {
+            std::mem::take(&mut self.posts.lock().unwrap())
+        }
+    }
+
+    /// `n` notifications in a fresh database, each for a failed run that
+    /// raised one alert.
+    fn notified(n: usize) -> (tempfile::TempDir, Database, Vec<Notification>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("state.sqlite3")).unwrap();
+        let stored = (0..n)
+            .map(|_| {
+                let run = db.submit(None, "default".into(), "p".into(), 60).unwrap();
+                let note = super::note(&run_with(&run.id), None, &summary(&["denied"]), None);
+                db.record_notification(&run.id, note).unwrap().unwrap()
+            })
+            .collect();
+        (dir, db, stored)
+    }
+
+    fn run_with(id: &str) -> Run {
+        Run {
+            id: id.into(),
+            schedule_id: None,
+            ..run("failed")
+        }
+    }
+
+    #[test]
+    fn each_notification_is_posted_to_the_desktop_once() {
+        let (_dir, db, _) = notified(2);
+        let desktop = FakeDesktop::default();
+        assert!(deliver(&db, &desktop).unwrap().is_none());
+        let post = (
+            "runner: run (agent researcher): failed, 1 alert".to_string(),
+            "denied: denied happened".to_string(),
+        );
+        assert_eq!(desktop.take(), [post.clone(), post]);
+        deliver(&db, &desktop).unwrap();
+        assert!(desktop.take().is_empty());
+
+        // One already read isn't posted.
+        let (_dir, db, stored_read) = notified(1);
+        db.mark_read(Some(stored_read[0].id)).unwrap();
+        deliver(&db, &desktop).unwrap();
+        assert!(desktop.take().is_empty());
+        assert!(db.undelivered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn many_waiting_notifications_are_posted_as_one() {
+        let (_dir, db, _) = notified(MAX_POSTED + 1);
+        let desktop = FakeDesktop::default();
+        deliver(&db, &desktop).unwrap();
+        assert_eq!(
+            desktop.take(),
+            [(
+                format!("runner: {} new notifications", MAX_POSTED + 1),
+                "Run `runner notifications` to see them.".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_failed_post_is_reported_and_not_retried() {
+        let (_dir, db, _) = notified(1);
+        let desktop = FakeDesktop {
+            fail: true,
+            ..Default::default()
+        };
+        let error = deliver(&db, &desktop).unwrap().unwrap();
+        assert_eq!(error.to_string(), "no notification server");
+        assert_eq!(desktop.take().len(), 1);
+        assert!(deliver(&db, &desktop).unwrap().is_none());
+        assert!(desktop.take().is_empty());
+        // It's still there to read.
+        assert_eq!(db.notifications(true, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_body_lists_alerts_is_cut_short_and_escapes_markup() {
+        let mut note = super::note(&run("failed"), None, &summary(&[]), None).unwrap();
+        assert_eq!(body(&note), "took 1.200s, no alerts");
+        note.alerts = vec![Alert {
+            kind: "new_host".into(),
+            message: "tool \"t\" reached \"<a href=x>evil</a>\"".into(),
+        }];
+        note.delegated_not_completed = vec![RunEnd {
+            run_id: "c".into(),
+            status: "failed".into(),
+        }];
+        assert_eq!(
+            body(&note),
+            "new_host: tool \"t\" reached \"<a href=x>evil</a>\"\ndelegated run c failed"
+        );
+        assert_eq!(
+            escape_markup(&body(&note)),
+            "new_host: tool \"t\" reached \"&lt;a href=x&gt;evil&lt;/a&gt;\"\ndelegated run c failed"
+        );
+        note.alerts[0].message = "x".repeat(400);
+        let long = body(&note);
+        assert_eq!(long.chars().count(), MAX_BODY + 1);
+        assert!(long.ends_with('…'));
     }
 }
