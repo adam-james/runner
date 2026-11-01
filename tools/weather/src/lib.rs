@@ -36,7 +36,7 @@ impl Guest for Weather {
                     "units": {
                         "type": "string",
                         "enum": ["celsius", "fahrenheit"],
-                        "description": "Temperature units. Defaults to celsius.",
+                        "description": "Temperature units. Defaults to fahrenheit.",
                     },
                 },
                 "required": ["location"],
@@ -63,7 +63,7 @@ async fn run(input_json: String) -> anyhow::Result<String> {
         },
     };
     let unit = match &input["units"] {
-        serde_json::Value::Null => Unit::Celsius,
+        serde_json::Value::Null => Unit::Fahrenheit,
         value => match value.as_str() {
             Some("celsius") => Unit::Celsius,
             Some("fahrenheit") => Unit::Fahrenheit,
