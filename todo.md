@@ -13,12 +13,9 @@ system; for narrower access, define a narrower agent.
 
 ## Next
 
-- run the job search hourly in the background: a `job_search` schedule (`--cron "0 * * * *" --notify all`) whose runs add new listings to one file
-  - give it read and write tools on its own `dir` (e.g. `~/.runner/jobs`), apart from `read_file`/`write_file`'s; a read-only `dir` has to exist before the daemon mounts it
-  - one file, `listings.md`, newest first; skip listings whose URL is already in it
-  - notify when each run is done (`--notify all` already does this; nothing new needed)
-  - listings are untrusted text that later runs read back from the file; acceptable while the agent reaches only the job boards, Tavily and its own `dir`
-  - its profile and preferences go in a personal config outside the repo, since the repo is public
+- ~~run the job search daily in the background~~ done: `job_search_daily` in runner.example.toml, with `jobs_read`/`jobs_write`/`jobs_edit` on its own `~/.runner/jobs`; it adds new listings to `/listings.md`, newest first, skipping URLs already there; schedule it with `--cron "0 9,17 * * *" --notify all` (a run the daemon is down for is skipped, not made up); your profile goes in its `system_prompt` in your gitignored `runner.toml`
+  - not yet run against the live APIs; check the first few runs' files and `runs summary`
+  - later: each run reads the whole file to find duplicate URLs, so its cost grows with the file; a tool that appends only listings whose URL isn't there yet would keep that flat and stop a run from rewriting old entries
 
 ## 1. Make capabilities visible
 
