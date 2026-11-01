@@ -10,6 +10,12 @@ cargo build --locked --release --target wasm32-wasip2 --workspace \
 cargo build --locked --release -p runner
 cargo run --locked --release -p build-python
 
+# runner.toml is gitignored so local changes stay local; start it from the example.
+if [[ ! -e runner.toml ]]; then
+    cp runner.example.toml runner.toml
+    printf '\nCreated runner.toml from runner.example.toml.\n'
+fi
+
 printf '\nBuild complete. Run these commands from the repository root:\n\n'
 printf '  cd %q\n' "$PWD"
 cat <<'INSTRUCTIONS'
