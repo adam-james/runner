@@ -572,6 +572,9 @@ Fixtures are test components and should not be included in normal configs.
   text file (creating parent directories), and `edit_file` replaces an
   exact piece of one. Both need a `dir` with `dir_writable`. See
   [Files](#files).
+- `tools/save-listings/` — `save_listings`: saves job listings to
+  `/listings.md` under its `dir`, newest first, skipping any whose URL is
+  already there. See [Saving job listings](#saving-job-listings).
 - `tools/rustdocs/` — `rust_docs`: a crate's docs, or one item's, from
   docs.rs (doc.rust-lang.org for `std`, `core` and `alloc`), as text. See
   [Rust docs](#rust-docs).
@@ -886,6 +889,36 @@ fails. Either tool can change or overwrite anything in `dir`, and nothing
 limits how much is written, so point them at a directory you'd be fine
 with the model rewriting, not your home directory. `..` and symlinks still
 can't reach outside it.
+
+### Saving job listings
+
+`save_listings` gives a job search somewhere to keep what it finds without
+reading or editing a file:
+
+```toml
+[tools.save_listings]
+path = "target/wasm32-wasip2/release/save_listings.wasm"
+dir = "${HOME}/.runner/jobs"
+dir_writable = true
+```
+
+It takes a list of listings (title, URL and company, with location and
+posting date if known) and adds each as one line of `/listings.md`, newest
+first, under a `# Job listings` heading:
+
+```
+- [Backend Engineer](https://jobs.lever.co/acme/1) at Acme, Remote, posted 2026-10-30, found 2026-11-01
+```
+
+A listing whose URL is already in the file (ignoring a `#fragment` or a
+trailing slash) is skipped, so the model doesn't need to read the file, and
+listings from earlier runs, which are text written by strangers, never come
+back into its context. The tool writes only that file, never changes an
+existing entry, and replaces the file in one rename, so a run cut off
+mid-write can't leave it half written. URLs must be plain `http(s)` links,
+and fields are put on one line with link characters escaped, so a listing
+can't add lines of its own or point its link somewhere else. At most 100
+listings per call, each field cut at 200 characters.
 
 ## Rust docs
 

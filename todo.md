@@ -13,9 +13,9 @@ system; for narrower access, define a narrower agent.
 
 ## Next
 
-- ~~run the job search daily in the background~~ done: `job_search_daily` in runner.example.toml, with `jobs_read`/`jobs_write`/`jobs_edit` on its own `~/.runner/jobs`; it adds new listings to `/listings.md`, newest first, skipping URLs already there; schedule it with `--cron "0 9,17 * * *" --notify all` (a run the daemon is down for is skipped, not made up); your profile goes in its `system_prompt` in your gitignored `runner.toml`
+- ~~run the job search daily in the background~~ done: `job_search_daily` in runner.example.toml, with `save_listings` on its own `~/.runner/jobs`, which adds new listings to `/listings.md`, newest first, skipping URLs already there; schedule it with `--cron "0 9,17 * * *" --notify all` (a run the daemon is down for is skipped, not made up); your profile goes in its `system_prompt` in your gitignored `runner.toml`
   - not yet run against the live APIs; check the first few runs' files and `runs summary`
-  - later: each run reads the whole file to find duplicate URLs, so its cost grows with the file; a tool that appends only listings whose URL isn't there yet would keep that flat and stop a run from rewriting old entries
+  - ~~a tool that appends only listings whose URL isn't there yet~~ done: `save_listings` (tools/save-listings); runs no longer read the file, so its cost stays flat and earlier listings aren't read back
 
 ## 1. Make capabilities visible
 
