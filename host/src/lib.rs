@@ -2468,7 +2468,7 @@ mod tests {
 
     #[test]
     fn example_config_has_valid_named_tools_and_agents() {
-        let config: RunnerConfig = toml::from_str(include_str!("../../runner.toml")).unwrap();
+        let config: RunnerConfig = toml::from_str(include_str!("../../runner.example.toml")).unwrap();
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");
