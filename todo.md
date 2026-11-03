@@ -12,7 +12,6 @@ system; for narrower access, define a narrower agent.
 
 ## 1. Use other people's tools safely
 
-- run existing MCP servers under runner's network/filesystem policy (sandboxed stdio, or compiled to components) - biggest adoption lever
 - component registry: signed, content-addressed components with capability manifests
   - `runner tools add <source>` shows a permission prompt before install
   - settle the manifest format early; it shapes the WIT interfaces
