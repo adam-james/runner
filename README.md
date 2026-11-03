@@ -938,6 +938,59 @@ A new tool is a new `[tools.<name>]` table pointing at its own component, with
 its own allow-list — the host's code never changes. A new provider is a
 new component exporting `provider-api` — the host's code never changes.
 
+### Installing a tool from a URL
+
+`runner tools add` downloads a tool someone else built, pinned by its SHA-256,
+and shows what it would be allowed to do before adding it:
+
+```bash
+runner tools add forecast https://example.com/releases/v1/forecast.wasm \
+  --sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+```
+
+1. It downloads the component (HTTPS, or plain HTTP to `localhost`; redirects
+   must stay on HTTPS) and refuses it unless its SHA-256 matches `--sha256`.
+2. It downloads the manifest: by default the same URL with `.wasm` replaced by
+   `.manifest.toml`, or `--manifest URL`.
+3. It saves the component as `~/.runner/components/sha256-<hex>.wasm`
+   (`--store DIR` to change that) and prints what the manifest asks for, next
+   to what the component actually imports and what the host enforces — what
+   `runner tools wat` prints — plus the tool's own `describe()` text, quoted
+   as an untrusted claim. Warnings point out requests that don't add up, like
+   hosts for a component that doesn't import `wasi:http`, or a writable `dir`.
+4. It asks before changing anything (`--yes` to skip; without a terminal it
+   refuses unless `--yes` is given). A no removes the downloaded file.
+5. It appends `[tools.<name>]` to the config (`--config`, default
+   `runner.toml`), keeping your comments and layout, with `path` set to the
+   saved file and `sha256` to its digest. It isn't added to any agent: put it
+   in an agent's `tools` to use it, then restart the daemon.
+
+The digest proves you got the bytes you asked for, not who made them; there
+are no signatures yet. The manifest isn't covered by the digest, which is why
+it's shown for review rather than trusted. A manifest has the same fields as a
+`[tools.<name>]` table, without `path` and `sha256`, and nothing else:
+
+```toml
+allowed_hosts = ["api.example.com"]
+timeout_secs = 30
+max_memory_mb = 128
+fresh_per_call = false
+dir = "${HOME}/.runner/example"   # optional; dir_writable = true to allow changes
+
+[headers.authorization]
+value = "Bearer ${EXAMPLE_API_KEY}"  # must name an env var, never hold a key
+hosts = ["api.example.com"]
+```
+
+Comments in a manifest aren't copied into your config. The prompt lists the
+env vars its headers and `dir` reference, which must be set where the daemon
+runs.
+
+`sha256` works on any `[tools.<name>]` or `[providers.<name>]` table, not just
+installed ones: if it's set, the daemon (and `runner tools wat`) refuses to
+start when the file's digest doesn't match, before compiling it, so a component
+replaced on disk can't silently change what runs.
+
 ## Verify the sandboxing
 
 ```bash

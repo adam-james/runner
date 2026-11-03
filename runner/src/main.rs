@@ -143,6 +143,31 @@ enum Tools {
         #[arg(long, default_value = "structure")]
         detail: host::wat::Detail,
     },
+    /// Download a tool component pinned by its SHA-256, show what its
+    /// manifest asks to be allowed, and on confirmation add it to the
+    /// config as `[tools.NAME]`. No daemon needed; restart it to load the
+    /// tool, and add it to an agent's `tools` to use it.
+    Add {
+        /// The tool's name in the config, and what the model calls it.
+        name: String,
+        /// Where the component is: https://, or http:// to localhost.
+        url: String,
+        /// The component's expected SHA-256, as hex or `sha256:<hex>`.
+        #[arg(long)]
+        sha256: String,
+        /// The manifest's URL; by default the component's, with `.wasm`
+        /// replaced by `.manifest.toml`.
+        #[arg(long)]
+        manifest: Option<String>,
+        #[arg(long, default_value = "runner.toml")]
+        config: PathBuf,
+        /// Where installed components are kept, named by digest.
+        #[arg(long, default_value_os_t = runner::install::default_store())]
+        store: PathBuf,
+        /// Add it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -322,6 +347,30 @@ async fn main() -> Result<()> {
         print!("{}", host::wat::print(&config, kind, &name, detail).await?);
         return Ok(());
     }
+    if let Command::Tools {
+        command:
+            Tools::Add {
+                name,
+                url,
+                sha256,
+                manifest,
+                config,
+                store,
+                yes,
+            },
+    } = args.command
+    {
+        return runner::install::add(runner::install::Add {
+            name,
+            url,
+            sha256,
+            manifest,
+            config,
+            store,
+            yes,
+        })
+        .await;
+    }
     let client = Client::connect(&args.data_dir)?;
     // Register before printing headers. Retain this future so a signal arriving
     // during API requests or replay stays pending until the next exit point.
@@ -334,7 +383,7 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Serve { .. }
         | Command::Tools {
-            command: Tools::Wat { .. },
+            command: Tools::Wat { .. } | Tools::Add { .. },
         } => unreachable!(),
         Command::Run {
             prompt,

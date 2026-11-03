@@ -13,8 +13,9 @@ system; for narrower access, define a narrower agent.
 ## 1. Use other people's tools safely
 
 - component registry: signed, content-addressed components with capability manifests
-  - `runner tools add <source>` shows a permission prompt before install
-  - settle the manifest format early; it shapes the WIT interfaces
+  - ~~`runner tools add <source>` shows a permission prompt before install~~ done: from a URL pinned by `--sha256`, with a `.manifest.toml` next to it (README "Installing a tool from a URL"); components kept by digest in `~/.runner/components`, and a config `sha256` refuses a changed file at load
+  - signatures: who made a component, not just which bytes; the manifest could be signed with it
+  - a hosted registry or OCI images, if fetching by URL isn't enough
 - a tool to write tools: agent writes a tool, it compiles to a component, runs with no network/filesystem by default, and goes live only after its permissions are approved
 
 ## 2. Portability and determinism
