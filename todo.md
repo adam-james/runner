@@ -6,9 +6,8 @@ and can only reach what its config allows. Make that visible, enforceable, and
 the reason to pick runner.
 
 Focus: background agents that are secure and auditable. Nobody is watching a
-background run, so what it may do is fixed before it starts, anything beyond
-that waits for an approval that defaults to deny, and the audit log is how you
-find out what happened. Agents are the unit of capability: no separate grant
+background run, so what it may do is fixed before it starts, and the audit log
+is how you find out what happened. Agents are the unit of capability: no separate grant
 system; for narrower access, define a narrower agent.
 
 ## 1. Make capabilities visible
@@ -47,8 +46,7 @@ system; for narrower access, define a narrower agent.
 - OAuth/login
 - encrypted store for API keys - nice to have, not a differentiator
 - prune bundled demo tools (sports, weather) in favor of a few genuinely useful ones (files, web, python, git, http fetch)
-- are there APIs for booking flights and other useful things like that? (pairs with approval checkpoints)
-- wasm shell
+- are there APIs for booking flights and other useful things like that?- wasm shell
 - switch build target to wasm32-wasip3 once Rust 1.100 ships it on stable (~late Nov 2026)
 - migrate tools to WASI 0.3 http (off wstd) - wait for a p3 wstd or a need for streaming tool output / parallel tool calls
 
