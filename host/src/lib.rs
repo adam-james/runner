@@ -3,6 +3,7 @@ mod audit;
 pub mod delegation;
 mod filesystem;
 pub mod inspect;
+pub mod install;
 mod linking;
 pub mod trails;
 mod transcript;
@@ -300,6 +301,10 @@ struct ProviderConfig {
 #[derive(Clone, serde::Deserialize)]
 struct ComponentConfig {
     path: String,
+    /// The component file's expected digest, `sha256:<hex>`. If set, the
+    /// daemon refuses to start when the file's bytes don't match, so a file
+    /// replaced on disk can't silently change what runs.
+    sha256: Option<String>,
     #[serde(default)]
     allowed_hosts: Vec<String>,
     /// Headers the host adds to this component's outbound HTTPS requests,
@@ -1424,10 +1429,15 @@ impl Runtime {
             // Compiled from the same bytes that are hashed, so the digest
             // names exactly the code that runs.
             let bytes = std::fs::read(path).map_err(|e| Error::msg(context(&e)))?;
+            let digest = audit::digest(&bytes);
+            // Before compiling, so bytes that don't match a pin never run.
+            for component in sandboxed_components(&config).filter(|c| &c.path == path) {
+                check_sha256(component, &digest)?;
+            }
             let component = Component::new(&engine, &bytes)
                 .map_err(|e| e.context(format!("loading component {path}")))?;
             components.insert(path.clone(), component);
-            digests.insert(path.clone(), audit::digest(&bytes));
+            digests.insert(path.clone(), digest);
         }
         let capabilities: Vec<_> = config
             .providers
@@ -1746,6 +1756,18 @@ fn agent_versions(
         .collect()
 }
 
+/// Fails if `component` pins a digest that `actual` doesn't match.
+fn check_sha256(component: &ComponentConfig, actual: &str) -> Result<()> {
+    match &component.sha256 {
+        Some(expected) if !expected.eq_ignore_ascii_case(actual) => bail!(
+            "component {} is {actual}, but its config pins sha256 = \"{expected}\"; \
+             the file changed since it was installed",
+            component.path
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Every sandboxed component `config` declares: providers and tools.
 fn sandboxed_components(config: &RunnerConfig) -> impl Iterator<Item = &ComponentConfig> {
     config
@@ -1840,11 +1862,19 @@ mod tests {
         SandboxHooks::new(&config)
     }
 
+    /// Held by the tests that send requests through `SandboxHooks`. Run at
+    /// the same time, the one without a log subscriber can register
+    /// `send_request`'s span and events while the other's subscriber is
+    /// being installed, and tracing then caches them as disabled, so the
+    /// logging test sees them missing.
+    static OUTBOUND_HTTP_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn outbound_http_logs_policy_headers_errors_and_interruption_without_payloads() {
         use http_body_util::BodyExt;
         use std::io::{Read, Write};
         let capture = activity::tests::Capture::default();
+        let _serial = OUTBOUND_HTTP_TESTS.lock().await;
         let _subscriber = tracing::subscriber::set_default(capture.subscriber());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1932,6 +1962,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_http_is_audited_without_payloads_and_refused_once_the_log_is_full() {
+        let _serial = OUTBOUND_HTTP_TESTS.lock().await;
         use http_body_util::BodyExt;
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2189,6 +2220,32 @@ mod tests {
             err.contains(&format!("loading component {corrupt_path}")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_pinned_digest_must_match_the_file() {
+        let pinned = |sha256: &str| -> ComponentConfig {
+            toml::from_str(&format!("path = \"t.wasm\"\nsha256 = \"{sha256}\"")).unwrap()
+        };
+        let actual = audit::digest(b"component");
+        assert!(check_sha256(&pinned(&actual), &actual).is_ok());
+        assert!(
+            check_sha256(
+                &pinned(&actual.to_uppercase().replace("SHA256", "sha256")),
+                &actual
+            )
+            .is_ok()
+        );
+        let error = check_sha256(&pinned(&audit::digest(b"other")), &actual)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("the file changed since it was installed"),
+            "{error}"
+        );
+        let unpinned: ComponentConfig = toml::from_str("path = \"t.wasm\"").unwrap();
+        assert!(check_sha256(&unpinned, &actual).is_ok());
     }
 
     #[test]
@@ -2468,7 +2525,8 @@ mod tests {
 
     #[test]
     fn example_config_has_valid_named_tools_and_agents() {
-        let config: RunnerConfig = toml::from_str(include_str!("../../runner.example.toml")).unwrap();
+        let config: RunnerConfig =
+            toml::from_str(include_str!("../../runner.example.toml")).unwrap();
         let agents = resolve_agents(&config).unwrap();
         assert_eq!(agents["researcher"].provider_name, "openai");
         assert_eq!(agents["researcher"].model(), "gpt-5-mini");

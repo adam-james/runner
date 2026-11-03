@@ -2,6 +2,7 @@ pub mod audit;
 pub mod client;
 pub mod db;
 pub mod delegation;
+pub mod install;
 pub mod notify;
 pub mod schedule;
 pub mod service;

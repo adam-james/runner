@@ -82,7 +82,7 @@ fn find<'a>(config: &'a RunnerConfig, kind: Kind, name: &str) -> Option<&'a Comp
     }
 }
 
-async fn describe(
+pub(crate) async fn describe(
     component: &ComponentConfig,
     kind: Kind,
     name: &str,
@@ -93,6 +93,7 @@ async fn describe(
     let (mut out, bytes, structure) = tokio::task::spawn_blocking(move || -> Result<_> {
         let bytes = std::fs::read(&component.path)
             .map_err(|e| Error::msg(format!("reading component {}: {e}", component.path)))?;
+        crate::check_sha256(&component, &crate::audit::digest(&bytes))?;
         let mut out = capabilities(&component, kind, &name, bytes.len());
         out.push_str(&enforcement(&component, kind, &imports(&bytes)?));
         let structure = match detail {
@@ -314,7 +315,7 @@ fn enforcement(component: &ComponentConfig, kind: Kind, imports: &[String]) -> S
 }
 
 /// The outer component's import names.
-fn imports(bytes: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn imports(bytes: &[u8]) -> Result<Vec<String>> {
     let mut depth = 0usize;
     let mut names = Vec::new();
     for payload in Parser::new(0).parse_all(bytes) {
