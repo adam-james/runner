@@ -13,3 +13,7 @@
 - wasm shell
 - switch build target to wasm32-wasip3 once Rust 1.100 ships it on stable (~late Nov 2026)
 - migrate tools to WASI 0.3 http (off wstd) - wait for a p3 wstd or a need for streaming tool output / parallel tool calls
+- deferred: dynamic agent definitions for delegation - an agent that creates specialists at runtime is the opposite of auditable; static delegation between config-defined agents fits the focus. Revisit with these constraints:
+  - restrict choices to host-approved providers/models, tools, and delegation targets; a guest cannot expand its delegation authority
+  - define lifetime, ownership, quotas, persistence/restart behavior, and whether definitions can be reused across turns
+- deferred: agent to agent communication
