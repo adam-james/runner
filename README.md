@@ -244,8 +244,7 @@ leaves the conversation as it was. Local background work requires the machine to
 be awake and the daemon running.
 
 See [service architecture and roadmap](docs/service.md) for the API and the
-next milestones: run summaries, alerts and notifications, asynchronous
-approvals, and desktop clients.
+roadmap.
 
 ### Schedules
 

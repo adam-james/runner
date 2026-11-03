@@ -99,8 +99,7 @@ On shutdown, active executions stop and become interrupted. On restart, the
 service also marks any remaining running records interrupted, preserving queued
 work. Interrupted work is never replayed automatically. This provides durable
 submission, not exactly-once external side effects or resumption of a suspended
-WASM stack. Runs and events are retained until the data directory is removed;
-retention management is a later addition.
+WASM stack. Runs and events are retained until the data directory is removed.
 
 Sessions are registered in SQLite when created; a transcript is written for a
 session after its first completed turn. Each data directory has its own sessions
@@ -176,13 +175,12 @@ directory.
 ## Roadmap
 
 The focus is background agents that are secure and auditable: nobody watches
-a background run, so what it may do is fixed before it starts, anything beyond
-that waits for an approval that defaults to deny, and the audit log is how you
-find out what happened. Agents are the unit of capability; there's no
+a background run, so what it may do is fixed before it starts, and the audit
+log is how you find out what happened. Agents are the unit of capability; there's no
 separate grant system. Each milestone ships something usable on its own;
 [todo.md](../todo.md) tracks the details.
 
-1. **Agent versions:** at the start of each run, the host snapshots the
+1. **Agent versions:** done. At the start of each run, the host snapshots the
    resolved agent definition: provider and model, each tool's allowed hosts,
    header names and the hosts they go to (never values), directory, limits,
    and component digest, plus delegates, flags, and a hash of the system
@@ -203,8 +201,8 @@ separate grant system. Each milestone ships something usable on its own;
    approved again.
 3. **Run summaries, alerts, and notifications:** the host summarizes every background run
    from its audit records, without a model: hosts reached, denials, errors,
-   trail gaps, and pending approvals. Summaries are done, served on demand
-   (`GET /v1/runs/{id}/summary`); pending approvals join them with step 4. Denials and gaps raise
+   and trail gaps. Summaries are done, served on demand
+   (`GET /v1/runs/{id}/summary`). Denials and gaps raise
    alerts (done, in the summary). Audit records, and the agent versions they
    reference, are kept with their runs, so a summary can be recomputed whenever
    a background run is reviewed.
@@ -214,15 +212,9 @@ separate grant system. Each milestone ships something usable on its own;
    Notifications are durable records, so none are lost while no client is
    connected, and their text is written by the host (task, outcome, duration,
    flags), never taken from the model's reply, which a prompt injection could
-   steer. Approval requests use the same channel.
-4. **Asynchronous approvals:** tools declare side-effecting actions in their
-   WIT interface. Such an action pauses its run durably, surviving restarts,
-   until it's approved or denied from the CLI, TUI, or a remote client.
-   Approvals expire, and an expired approval is a denial. Agents may hold
-   standing approvals for routine, narrow actions, as part of their version.
-   Every approval, denial, and expiry is audited.
-5. **Desktop:** use the same API for sessions, live output, run trees,
-   cancellation, schedules, summaries, notifications, and approvals. Desktop
+   steer.
+4. **Desktop:** use the same API for sessions, live output, run trees,
+   cancellation, schedules, summaries, and notifications. Desktop
    and CLI share a daemon. Choose the UI framework when implementation starts;
    it does not determine the runtime.
 
@@ -231,8 +223,7 @@ definitions created at runtime), since a background agent that defines new
 agents is hard to audit; static delegation fits the focus (see
 [delegation](delegation.md)). If revisited, host-approved models, tools, and
 targets bound their authority, and lifetime, quotas, and persistence are
-defined before implementation. Memory across a schedule's runs waits for the
-milestones above, since it's how a prompt injection would persist.
+defined before implementation.
 
 Remote serving, multi-user authorization, automatic retries, durable stack
 checkpoints, and distributed workers are outside these milestones.

@@ -121,5 +121,5 @@ record metadata, not delegation prompts or child answers.
 
 Delegation is a service capability. Standalone `host::Runtime::run_turn` returns
 the completed transcript for its caller to commit; a delegation call without service context returns an
-explicit unavailable error. Dynamic definitions and per-task overrides remain
-on the TODO list.
+explicit unavailable error. Dynamic definitions and per-task overrides are
+deferred; see [housekeeping.md](../housekeeping.md).
