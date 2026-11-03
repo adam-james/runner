@@ -11,10 +11,6 @@ that waits for an approval that defaults to deny, and the audit log is how you
 find out what happened. Agents are the unit of capability: no separate grant
 system; for narrower access, define a narrower agent.
 
-## Next
-
-- check `job_search_daily` against the live APIs: it hasn't run there yet; look at the first few runs' `/listings.md` and `runs summary`
-
 ## 1. Make capabilities visible
 
 - a separate audit-read token
